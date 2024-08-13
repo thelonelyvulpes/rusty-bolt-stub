@@ -1,4 +1,4 @@
-mod parser;
+mod scanner;
 
 fn main() {
     let input = "!: BOLT 5.5";

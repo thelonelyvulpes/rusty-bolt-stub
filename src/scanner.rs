@@ -8,8 +8,8 @@ use nom::multi::many1;
 use nom::sequence::preceded;
 use nom::IResult;
 
-pub fn parse_script(input: &'static str, name: &str) -> Result<Script, Error> {
-    let (input, bangs) = parse_bangs(input)?;
+pub fn scan_script(input: &'static str, name: &str) -> Result<Script, Error> {
+    let (input, bangs) = scan_bang_lines(input)?;
 
     let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
     if input.is_empty() && bangs.iter().any(|x| matches!(x, BangLine::Version(_))) {
@@ -17,10 +17,10 @@ pub fn parse_script(input: &'static str, name: &str) -> Result<Script, Error> {
             name: name.into(),
             bang_lines: bangs,
             body: Block::BlockList(vec![]),
-        })
+        });
     };
 
-    let (input, body) = parse_tree(input)?;
+    let (input, body) = scan_tree(input)?;
     let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
     if !input.is_empty() {
         return Err(Error::msg("Trailing input"));
@@ -33,12 +33,12 @@ pub fn parse_script(input: &'static str, name: &str) -> Result<Script, Error> {
     })
 }
 
-fn parse_tree(input: &str) -> IResult<&str, Block> {
-    let (input, blocks) = many1(parse_block)(input)?;
+fn scan_tree(input: &str) -> IResult<&str, Block> {
+    let (input, blocks) = many1(scan_block)(input)?;
     Ok((input, Block::BlockList(blocks)))
 }
 
-fn parse_block(input: &str) -> IResult<&str, Block> {
+fn scan_block(input: &str) -> IResult<&str, Block> {
     let (input, _) = multispace0(input)?;
     alt((client, server, auto))(input)
 }
@@ -84,14 +84,28 @@ fn auto(input: &str) -> IResult<&str, Block> {
     ))
 }
 
-fn parse_bangs(input: &str) -> IResult<&str, Vec<BangLine>> {
-    let (input, bangs) = many1(parse_bang)(input)?;
-
-    Ok((input, bangs))
+fn optional(input: &str) -> IResult<&str, Block> {
+    let (input, (message, args)) = prefixed_line("*:")(input)?;
+    Ok((
+        input,
+        Block::Repeat0(Box::new(Block::AutoMessage(
+            message.into(),
+            args.map(Into::into),
+        ))),
+    ))
 }
 
-fn parse_bang(input: &str) -> IResult<&str, BangLine> {
-    alt((parse_version, parse_allow_restart, parse_concurrent))(input)
+fn scan_bang_lines(input: &str) -> IResult<&str, Vec<BangLine>> {
+    many1(scan_bang_line)(input)
+}
+
+fn scan_bang_line(input: &str) -> IResult<&str, BangLine> {
+    alt((
+        bolt_version_bang_line,
+        allow_restart_bang_line,
+        allow_concurrent_bang_line,
+        auto_bang_line,
+    ))(input)
 }
 
 fn rest_of_line(input: &str) -> IResult<&str, &str> {
@@ -106,8 +120,8 @@ fn rest_of_line(input: &str) -> IResult<&str, &str> {
     Ok((input, line))
 }
 
-fn parse_version(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = bang_line("BOLT", input)?;
+fn bolt_version_bang_line(input: &str) -> IResult<&str, BangLine> {
+    let (input, _) = bang_line("BOLT")(input)?;
     let (input, _) = space1(input)?;
     let (input, major) = map_res(digit1, |s: &str| s.parse::<u8>())(input)?;
     let (input, _) = tag(".")(input)?;
@@ -123,27 +137,27 @@ fn parse_version(input: &str) -> IResult<&str, BangLine> {
     }
 }
 
-fn bang_line<'a>(expect: &'static str, input: &'a str) -> IResult<&'a str, ()> {
-    let (input, _) = tag("!:")(input)?;
-    let (input, _) = space0(input)?;
-    let (input, _) = tag(expect)(input)?;
-    Ok((input, ()))
+fn bang_line<'a>(expect: &'static str) -> impl FnMut(&str) -> IResult<&str, ()> {
+    move |input: &str| -> IResult<&str, ()> {
+        let (input, _) = tag("!:")(input)?;
+        let (input, _) = space0(input)?;
+        let (input, _) = tag(expect)(input)?;
+        Ok((input, ()))
+    }
 }
 
-fn parse_allow_restart(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = bang_line("ALLOW RESTART", input)?;
-    let (input, _) = end_of_line(input)?;
+fn allow_restart_bang_line(input: &str) -> IResult<&str, BangLine> {
+    let (input, _) = preceded(bang_line("ALLOW RESTART"), end_of_line)(input)?;
     Ok((input, BangLine::AllowRestart))
 }
 
-fn parse_concurrent(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = bang_line("ALLOW CONCURRENT", input)?;
-    let (input, _) = end_of_line(input)?;
+fn allow_concurrent_bang_line(input: &str) -> IResult<&str, BangLine> {
+    let (input, _) = preceded(bang_line("ALLOW CONCURRENT"), end_of_line)(input)?;
     Ok((input, BangLine::Concurrent))
 }
 
-fn parse_auto(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = bang_line("AUTO", input)?;
+fn auto_bang_line(input: &str) -> IResult<&str, BangLine> {
+    let (input, _) = bang_line("AUTO")(input)?;
     let (input, _) = space1(input)?;
     let (input, message) = alpha1(input)?;
     let (input, _) = end_of_line(input)?;
@@ -158,25 +172,21 @@ fn end_of_line(input: &str) -> IResult<&str, ()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{parser, BangLine, BoltVersion};
+    use crate::{scanner, BangLine, BoltVersion};
 
     use rstest::rstest;
 
     #[test]
     fn test_parse_minimal_script() {
         let input = "!: BOLT 5.5\n";
-        let result = dbg!(parser::parse_script(input, "test.script"));
-
+        let result = dbg!(scanner::scan_script(input, "test.script"));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_parse_multiple_bangs() {
         let input = "!: BOLT 5.4\n!: ALLOW RESTART\n!: ALLOW CONCURRENT\r\n";
-        let result = dbg!(parser::parse_script(input, "test.script"));
-
-        assert!(result.is_ok());
-
+        let result = dbg!(scanner::scan_script(input, "test.script"));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
         assert_eq!(
@@ -190,39 +200,51 @@ mod tests {
     #[test]
     fn test_parse_concurrent_ok() {
         let input = "!: ALLOW CONCURRENT\n";
-        let result = parser::parse_concurrent(input);
-        assert!(result.is_ok());
+        let result = scanner::allow_concurrent_bang_line(input);
         let (rem, bang) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(bang, BangLine::Concurrent);
     }
 
+    #[test]
+    fn test_rest_of_line_trims() {
+        let input = "ALLOW CONCURRENT\t\r\n";
+        let result = scanner::rest_of_line(input);
+        let (rem, taken) = result.unwrap();
+        assert_eq!(rem, "\r\n");
+        assert_eq!(taken, "ALLOW CONCURRENT");
+    }
+
     #[rstest]
-    #[case("\r\n")]
-    #[case("\n")]
+    #[case::crlf("\r\n")]
+    #[case::lf("\n")]
     fn test_rest_of_line(#[case] eol: &str) {
         let input = format!("ALLOW CONCURRENT{eol}");
-        let result = parser::rest_of_line(input.as_str());
+        let result = scanner::rest_of_line(input.as_str());
         let (rem, taken) = result.unwrap();
         assert_eq!(rem, eol);
         assert_eq!(taken, "ALLOW CONCURRENT");
     }
 
-    #[test]
-    fn test_client_message_sans_args() {
-        let input = "C: RUN  ";
-        let result = parser::client(input);
-        assert!(result.is_ok());
+    #[rstest]
+    #[case::no_space("C:RUN")]
+    #[case::clean("C: RUN")]
+    #[case::trailing("C: RUN  ")]
+    #[case::messy("C:   RUN  ")]
+    fn test_client_message_with_no_args(#[case] input: &str) {
+        let result = scanner::client(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(block, crate::Block::ClientMessage("RUN".into(), None));
     }
 
-    #[test]
-    fn test_client_message_con_args() {
-        let input = "C: RUN  foo bar ";
-        let result = parser::client(input);
-        assert!(result.is_ok());
+    #[rstest]
+    #[case::no_space("C:RUN foo bar")]
+    #[case::no_space("C: RUN foo bar")]
+    #[case::trailing("C: RUN foo bar  ")]
+    #[case::messy("C:  RUN   foo bar  ")]
+    fn test_client_message_con_args(#[case] input: &str) {
+        let result = scanner::client(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(
