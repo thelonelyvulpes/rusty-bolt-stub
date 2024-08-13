@@ -55,9 +55,10 @@ impl BoltVersion {
 struct Script {
     name: String,
     bang_lines: Vec<BangLine>,
+    body: Block,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 enum Block {
     BlockList(Vec<Block>),
     AltBlock(Vec<Block>),
@@ -71,14 +72,14 @@ enum Block {
     Condition(CompositeConditionBlock),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct CompositeConditionBlock {
     if_: Box<ConditionBranch>,
     elif_: Vec<ConditionBranch>,
     else_: Option<Box<Block>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct ConditionBranch {
     condition: String,
     body: Block,

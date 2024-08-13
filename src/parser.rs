@@ -2,40 +2,72 @@ use crate::{BangLine, Block, BoltVersion, Script};
 use anyhow::Error;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while};
-use nom::character::complete::{digit1, multispace0, space0, space1};
-use nom::character::streaming::alpha1;
+use nom::character::complete::{digit1, multispace0, space0, space1, alpha1};
 use nom::combinator::{eof, map_res, opt};
 use nom::IResult;
+use nom::multi::many1;
 use nom::sequence::{preceded, terminated};
 
 pub fn parse_script(input: &'static str, name: &str) -> Result<Script, Error> {
     let (input, bangs) = parse_bangs(input)?;
 
-    let (input, tree) = parse_tree(input)?;
+    let (input, body) = parse_tree(input)?;
+    let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
+    if !input.is_empty() {
+        return Err(Error::msg("Trailing input"));
+    }
 
     Ok(Script {
         name: name.into(),
         bang_lines: bangs,
+        body,
     })
 }
 
 fn parse_tree(input: &str) -> IResult<&str, Block> {
+    let (input, blocks) =  many1(parse_block)(input)?;
+    Ok((input, Block::BlockList(blocks)))
+}
+
+fn parse_block(input: &str) -> IResult<&str, Block> {
     let (input, _) = multispace0(input)?;
-    // let (input, _) = alt((client))(input)?;
-    Ok((input, Block::BlockList(vec![])))
+    alt((client, server, auto))(input)
+}
+
+fn prefixed_line(prefix: &'static str) -> impl FnMut(&str) -> IResult<&str, (&str, Option<&str>)> {
+    move |mut input: &str| -> IResult<&str, (&str, Option<&str>)> {
+        let (input, _) = tag(prefix)(input)?;
+        let (input, _) = space0(input)?;
+        let (input, message) = alpha1(input)?;
+        let (input, args) = opt(preceded(space1, rest_of_line))(input)?;
+        let (input, args) = match args {
+            None => {
+                let (input, _) = space0(input)?;
+                (input, None)
+            },
+            Some(args) => (input, Some(args)),
+        };
+        Ok((input, (message, args)))
+    }
 }
 
 fn client(input: &str) -> IResult<&str, Block> {
-    let (input, _) = tag("C:")(input)?;
-    let (input, _) = space0(input)?;
-    let (input, message) = alpha1(input)?;
-    let (input, follow) = opt(preceded(space1, rest_of_line))(input)?;
+    let (input, (message, args)) = prefixed_line("C:")(input)?;
+    Ok((input, Block::ClientMessage(message.into(), args.map(Into::into))))
+}
 
-    Ok((input, Block::BlockList(vec![])))
+fn server(input: &str) -> IResult<&str, Block> {
+    let (input, (message, args)) = prefixed_line("S:")(input)?;
+    Ok((input, Block::ServerMessage(message.into(), args.map(Into::into))))
+}
+
+fn auto(input: &str) -> IResult<&str, Block> {
+    let (input, (message, args)) = prefixed_line("A:")(input)?;
+    Ok((input, Block::AutoMessage(message.into(), args.map(Into::into))))
 }
 
 fn parse_bangs(input: &str) -> IResult<&str, Vec<BangLine>> {
-    let (input, bangs) = nom::multi::many1(parse_bang)(input)?;
+    let (input, bangs) = many1(parse_bang)(input)?;
 
     Ok((input, bangs))
 }
@@ -45,7 +77,15 @@ fn parse_bang(input: &str) -> IResult<&str, BangLine> {
 }
 
 fn rest_of_line(input: &str) -> IResult<&str, &str> {
-   take_while(|c: char| c != '\n' && c != '\r')(input)
+    let (input, mut line) = take_while(|c: char| c != '\n' && c != '\r')(input)?;
+    line = line.trim();
+    if line.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error {
+            input,
+            code: nom::error::ErrorKind::Complete,
+        }));
+    }
+    Ok((input, line))
 }
 
 fn parse_version(input: &str) -> IResult<&str, BangLine> {
@@ -102,9 +142,11 @@ fn end_of_line(input: &str) -> IResult<&str, ()> {
 mod tests {
     use crate::{parser, BangLine, BoltVersion};
 
+    use rstest::rstest;
+
     #[test]
-    fn test_parse_script() {
-        let input = "!: BOLT 5.4";
+    fn test_parse_minimal_script() {
+        let input = "!: BOLT 5.4\n";
         let result = dbg!(parser::parse_script(input, "test.script"));
 
         assert!(result.is_ok());
@@ -137,14 +179,34 @@ mod tests {
         assert_eq!(bang, BangLine::Concurrent);
     }
 
+    #[rstest]
+    #[case("\r\n")]
+    #[case("\n")]
+    fn test_rest_of_line(#[case] eol: &str) {
+        let input = format!("ALLOW CONCURRENT{eol}");
+        let result = parser::rest_of_line(input.as_str());
+        let (rem, taken) = result.unwrap();
+        assert_eq!(rem, eol);
+        assert_eq!(taken, "ALLOW CONCURRENT");
+    }
 
     #[test]
-    fn test_rest_of_line() {
-        let input = "ALLOW CONCURRENT\r\n";
-        let result = parser::rest_of_line(input);
+    fn test_client_message_sans_args() {
+        let input = "C: RUN  ";
+        let result = parser::client(input);
         assert!(result.is_ok());
-        let (rem, taken) = result.unwrap();
+        let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(taken, "ALLOW CONCURRENT");
+        assert_eq!(block, crate::Block::ClientMessage("RUN".into(), None));
+    }
+
+    #[test]
+    fn test_client_message_con_args() {
+        let input = "C: RUN  foo bar ";
+        let result = parser::client(input);
+        assert!(result.is_ok());
+        let (rem, block) = result.unwrap();
+        assert_eq!(rem, "");
+        assert_eq!(block, crate::Block::ClientMessage("RUN".into(), Some("foo bar".into())));
     }
 }
