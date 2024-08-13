@@ -1,15 +1,24 @@
 use crate::{BangLine, Block, BoltVersion, Script};
 use anyhow::Error;
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_until, take_while};
-use nom::character::complete::{digit1, multispace0, space0, space1, alpha1};
+use nom::bytes::complete::{tag, take_while};
+use nom::character::complete::{alpha1, digit1, multispace0, space0, space1};
 use nom::combinator::{eof, map_res, opt};
-use nom::IResult;
 use nom::multi::many1;
-use nom::sequence::{preceded, terminated};
+use nom::sequence::preceded;
+use nom::IResult;
 
 pub fn parse_script(input: &'static str, name: &str) -> Result<Script, Error> {
     let (input, bangs) = parse_bangs(input)?;
+
+    let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
+    if input.is_empty() && bangs.iter().any(|x| matches!(x, BangLine::Version(_))) {
+        return Ok(Script {
+            name: name.into(),
+            bang_lines: bangs,
+            body: Block::BlockList(vec![]),
+        })
+    };
 
     let (input, body) = parse_tree(input)?;
     let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
@@ -25,7 +34,7 @@ pub fn parse_script(input: &'static str, name: &str) -> Result<Script, Error> {
 }
 
 fn parse_tree(input: &str) -> IResult<&str, Block> {
-    let (input, blocks) =  many1(parse_block)(input)?;
+    let (input, blocks) = many1(parse_block)(input)?;
     Ok((input, Block::BlockList(blocks)))
 }
 
@@ -35,7 +44,7 @@ fn parse_block(input: &str) -> IResult<&str, Block> {
 }
 
 fn prefixed_line(prefix: &'static str) -> impl FnMut(&str) -> IResult<&str, (&str, Option<&str>)> {
-    move |mut input: &str| -> IResult<&str, (&str, Option<&str>)> {
+    move |input: &str| -> IResult<&str, (&str, Option<&str>)> {
         let (input, _) = tag(prefix)(input)?;
         let (input, _) = space0(input)?;
         let (input, message) = alpha1(input)?;
@@ -44,7 +53,7 @@ fn prefixed_line(prefix: &'static str) -> impl FnMut(&str) -> IResult<&str, (&st
             None => {
                 let (input, _) = space0(input)?;
                 (input, None)
-            },
+            }
             Some(args) => (input, Some(args)),
         };
         Ok((input, (message, args)))
@@ -53,17 +62,26 @@ fn prefixed_line(prefix: &'static str) -> impl FnMut(&str) -> IResult<&str, (&st
 
 fn client(input: &str) -> IResult<&str, Block> {
     let (input, (message, args)) = prefixed_line("C:")(input)?;
-    Ok((input, Block::ClientMessage(message.into(), args.map(Into::into))))
+    Ok((
+        input,
+        Block::ClientMessage(message.into(), args.map(Into::into)),
+    ))
 }
 
 fn server(input: &str) -> IResult<&str, Block> {
     let (input, (message, args)) = prefixed_line("S:")(input)?;
-    Ok((input, Block::ServerMessage(message.into(), args.map(Into::into))))
+    Ok((
+        input,
+        Block::ServerMessage(message.into(), args.map(Into::into)),
+    ))
 }
 
 fn auto(input: &str) -> IResult<&str, Block> {
     let (input, (message, args)) = prefixed_line("A:")(input)?;
-    Ok((input, Block::AutoMessage(message.into(), args.map(Into::into))))
+    Ok((
+        input,
+        Block::AutoMessage(message.into(), args.map(Into::into)),
+    ))
 }
 
 fn parse_bangs(input: &str) -> IResult<&str, Vec<BangLine>> {
@@ -146,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_script() {
-        let input = "!: BOLT 5.4\n";
+        let input = "!: BOLT 5.5\n";
         let result = dbg!(parser::parse_script(input, "test.script"));
 
         assert!(result.is_ok());
@@ -207,6 +225,9 @@ mod tests {
         assert!(result.is_ok());
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(block, crate::Block::ClientMessage("RUN".into(), Some("foo bar".into())));
+        assert_eq!(
+            block,
+            crate::Block::ClientMessage("RUN".into(), Some("foo bar".into()))
+        );
     }
 }
