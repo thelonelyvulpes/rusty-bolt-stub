@@ -3,11 +3,12 @@ use anyhow::{anyhow, Error};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{alpha1, multispace0, multispace1, space0, space1, u8};
-use nom::combinator::{eof, map, opt, value};
+use nom::combinator::{cond, eof, map, opt, value};
 use nom::error::{context, FromExternalError, ParseError, VerboseError};
 use nom::multi::many1;
-use nom::sequence::{preceded, separated_pair, terminated};
+use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom_supreme::error::ErrorTree;
+use nom_supreme::ParserExt;
 
 type PError<I> = ErrorTree<I>;
 type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
@@ -56,25 +57,19 @@ fn scan_block(input: &str) -> IResult<Block> {
     ))(input)
 }
 
-fn prefixed_line(
+fn prefixed_line<'a>(
     prefix: Option<&'static str>,
-) -> impl FnMut(&str) -> IResult<(&str, Option<&str>)> {
-    move |input: &str| -> IResult<(&str, Option<&str>)> {
-        let input = match prefix {
-            Some(prefix) => terminated(tag(prefix), space0)(input)?.0,
-            None => input,
-        };
-        let (input, message) = alpha1(input)?;
-        let (input, args) = opt(preceded(space1, rest_of_line))(input)?;
-        let (input, args) = match args {
-            None => {
-                let (input, _) = space0(input)?;
-                (input, None)
-            }
-            Some(args) => (input, Some(args)),
-        };
-        Ok((input, (message, args)))
-    }
+) -> impl FnMut(&'a str) -> IResult<(&'a str, Option<&'a str>)> {
+    preceded(
+        cond(
+            prefix.is_some(),
+            terminated(tag(prefix.unwrap_or("")), space0),
+        ),
+        pair(
+            alpha1,
+            terminated(opt(preceded(space1, rest_of_line)), space0),
+        ),
+    )
 }
 
 fn client(input: &str) -> IResult<Block> {
