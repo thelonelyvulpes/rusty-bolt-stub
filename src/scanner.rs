@@ -2,10 +2,10 @@ use crate::{BangLine, Block, BoltVersion, Script};
 use anyhow::Error;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
-use nom::character::complete::{alpha1, digit1, multispace0, space0, space1};
-use nom::combinator::{eof, map_res, opt};
+use nom::character::complete::{alpha1, digit1, multispace0, multispace1, space0, space1};
+use nom::combinator::{consumed, eof, map, map_res, opt, recognize};
 use nom::multi::many1;
-use nom::sequence::preceded;
+use nom::sequence::{pair, preceded, separated_pair};
 use nom::IResult;
 
 pub fn scan_script(input: &'static str, name: &str) -> Result<Script, Error> {
@@ -121,29 +121,22 @@ fn rest_of_line(input: &str) -> IResult<&str, &str> {
 }
 
 fn bolt_version_bang_line(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = bang_line("BOLT")(input)?;
-    let (input, _) = space1(input)?;
-    let (input, major) = map_res(digit1, |s: &str| s.parse::<u8>())(input)?;
-    let (input, _) = tag(".")(input)?;
-    let (input, minor) = map_res(digit1, |s: &str| s.parse::<u8>())(input)?;
-    let (input, _) = end_of_line(input)?;
-
-    match BoltVersion::match_valid_version(major, minor) {
-        Some(version) => Ok((input, BangLine::Version(version))),
-        None => Err(nom::Err::Error(nom::error::Error {
-            input,
-            code: nom::error::ErrorKind::Permutation,
-        })),
-    }
+    preceded(
+        bang_line("BOLT"),
+        preceded(
+            space1,
+            map_res(separated_pair(digit1, tag("."), digit1), |(a, b): (&str, &str)| {
+                match BoltVersion::match_valid_version(a.parse::<u8>().map_err(|_|nom::error::Error::new(a, nom::error::ErrorKind::Digit))?, b.parse::<u8>().map_err(|_|nom::error::Error::new(b, nom::error::ErrorKind::Digit))?) {
+                    Some(version) => Ok(BangLine::Version(version)),
+                    None => Err(nom::error::Error::new(input, nom::error::ErrorKind::Digit)),
+                }
+            })
+        )
+    )(input)
 }
 
-fn bang_line<'a>(expect: &'static str) -> impl FnMut(&str) -> IResult<&str, ()> {
-    move |input: &str| -> IResult<&str, ()> {
-        let (input, _) = tag("!:")(input)?;
-        let (input, _) = space0(input)?;
-        let (input, _) = tag(expect)(input)?;
-        Ok((input, ()))
-    }
+fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, &'a str> {
+    preceded(tag("!: "), preceded(space0, tag(expect)))
 }
 
 fn allow_restart_bang_line(input: &str) -> IResult<&str, BangLine> {
@@ -157,17 +150,17 @@ fn allow_concurrent_bang_line(input: &str) -> IResult<&str, BangLine> {
 }
 
 fn auto_bang_line(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = bang_line("AUTO")(input)?;
-    let (input, _) = space1(input)?;
-    let (input, message) = alpha1(input)?;
-    let (input, _) = end_of_line(input)?;
-    Ok((input, BangLine::Auto(message.to_owned())))
+    map(
+        and_then(preceded(
+            bang_line("AUTO"),
+            preceded((space1, |ws: &str| ws.cont), pair(alpha1, end_of_line)),
+        )),
+        |(_, (message, _))| BangLine::Auto(message.to_owned()),
+    )(input)
 }
 
-fn end_of_line(input: &str) -> IResult<&str, ()> {
-    let (input, _) = space0(input)?;
-    let (input, _) = opt(tag("\r"))(input)?;
-    alt((tag("\n"), eof))(input).map(|(input, _)| (input, ()))
+fn end_of_line(input: &str) -> IResult<&str, &str> {
+    alt((multispace1, eof))(input)
 }
 
 #[cfg(test)]
@@ -175,6 +168,13 @@ mod tests {
     use crate::{scanner, BangLine, BoltVersion};
 
     use rstest::rstest;
+
+    #[test]
+    fn test_eol() {
+        let (input, eol) = scanner::end_of_line("\t \r\njeff").unwrap();
+        assert_eq!(input, "jeff");
+        assert_eq!(eol, "\t \r\n");
+    }
 
     #[test]
     fn test_parse_minimal_script() {
@@ -185,7 +185,24 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_bangs() {
-        let input = "!: BOLT 5.4\n!: ALLOW RESTART\n!: ALLOW CONCURRENT\r\n";
+        let input = "!: BOLT 5.4\n!: AUTO Nonsense\n!: ALLOW RESTART\n";
+        let result = dbg!(scanner::scan_script(input, "test.script"));
+        let result = result.unwrap();
+        assert_eq!(result.bang_lines.len(), 3);
+        assert_eq!(
+            result.bang_lines.get(0),
+            Some(&BangLine::Version(BoltVersion::V5_4))
+        );
+        assert_eq!(
+            result.bang_lines.get(1),
+            Some(&BangLine::Auto("Nonsense".into()))
+        );
+        assert_eq!(result.bang_lines.get(2), Some(&BangLine::AllowRestart));
+    }
+
+    #[test]
+    fn test_parse_auto() {
+        let input = "!: BOLT 5.4\n!: ALLOW RESTART\r\n!: ALLOW CONCURRENT\r\n";
         let result = dbg!(scanner::scan_script(input, "test.script"));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
@@ -195,6 +212,13 @@ mod tests {
         );
         assert_eq!(result.bang_lines.get(1), Some(&BangLine::AllowRestart));
         assert_eq!(result.bang_lines.get(2), Some(&BangLine::Concurrent));
+    }
+
+    #[test]
+    fn test_auto_bang_line() {
+        let (input, bl) = scanner::auto_bang_line("!: AUTO Nonsense\n").unwrap();
+        assert_eq!(input, "");
+        assert_eq!(bl, BangLine::Auto("Nonsense".into()));
     }
 
     #[test]
