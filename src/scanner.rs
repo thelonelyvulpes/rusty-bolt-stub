@@ -1,18 +1,20 @@
 use crate::{BangLine, Block, Script};
-use anyhow::Error;
+use anyhow::{anyhow, Error};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{alpha1, multispace0, multispace1, space0, space1, u8};
 use nom::combinator::{eof, map, opt, value};
-use nom::error::ParseError;
+use nom::error::{context, FromExternalError, ParseError, VerboseError};
 use nom::multi::many1;
 use nom::sequence::{preceded, separated_pair, terminated};
-use nom::IResult;
+use nom_supreme::error::ErrorTree;
 
-pub fn scan_script(input: &'static str, name: &str) -> Result<Script, Error> {
-    let (input, bangs) = scan_bang_lines(input)?;
+type PError<I> = ErrorTree<I>;
+type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
 
-    let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
+pub fn scan_script<'a>(input: &'a str, name: &str) -> Result<Script, nom::Err<PError<&'a str>>> {
+    let (input, bangs) =
+        terminated(context("Bang line headers", scan_bang_lines), multispace0)(input)?;
 
     if input.is_empty() && bangs.iter().any(|x| matches!(x, BangLine::Version(_, _))) {
         return Ok(Script {
@@ -22,33 +24,46 @@ pub fn scan_script(input: &'static str, name: &str) -> Result<Script, Error> {
         });
     };
 
-    let (input, body) = scan_tree(input)?;
-    let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
+    let (input, body) = terminated(opt(scan_body), multispace0)(input)?;
     if !input.is_empty() {
-        return Err(Error::msg("Trailing input"));
+        return Err(nom::Err::Failure(PError::from_external_error(
+            input,
+            nom::error::ErrorKind::Complete,
+            anyhow!("Trailing input"),
+        )));
     }
 
     Ok(Script {
         name: name.into(),
         bang_lines: bangs,
-        body,
+        body: body.unwrap_or(Block::BlockList(vec![])),
     })
 }
 
-fn scan_tree(input: &str) -> IResult<&str, Block> {
+fn scan_body(input: &str) -> IResult<Block> {
     let (input, blocks) = many1(scan_block)(input)?;
     Ok((input, Block::BlockList(blocks)))
 }
 
-fn scan_block(input: &str) -> IResult<&str, Block> {
+fn scan_block(input: &str) -> IResult<Block> {
     let (input, _) = multispace0(input)?;
-    alt((client, server, auto))(input)
+    alt((
+        context("client line", client),
+        server,
+        auto,
+        comment,
+        untagged,
+    ))(input)
 }
 
-fn prefixed_line(prefix: &'static str) -> impl FnMut(&str) -> IResult<&str, (&str, Option<&str>)> {
-    move |input: &str| -> IResult<&str, (&str, Option<&str>)> {
-        let (input, _) = tag(prefix)(input)?;
-        let (input, _) = space0(input)?;
+fn prefixed_line(
+    prefix: Option<&'static str>,
+) -> impl FnMut(&str) -> IResult<(&str, Option<&str>)> {
+    move |input: &str| -> IResult<(&str, Option<&str>)> {
+        let input = match prefix {
+            Some(prefix) => terminated(tag(prefix), space0)(input)?.0,
+            None => input,
+        };
         let (input, message) = alpha1(input)?;
         let (input, args) = opt(preceded(space1, rest_of_line))(input)?;
         let (input, args) = match args {
@@ -62,32 +77,44 @@ fn prefixed_line(prefix: &'static str) -> impl FnMut(&str) -> IResult<&str, (&st
     }
 }
 
-fn client(input: &str) -> IResult<&str, Block> {
-    let (input, (message, args)) = prefixed_line("C:")(input)?;
+fn client(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(Some("C:"))(input)?;
     Ok((
         input,
         Block::ClientMessage(message.into(), args.map(Into::into)),
     ))
 }
 
-fn server(input: &str) -> IResult<&str, Block> {
-    let (input, (message, args)) = prefixed_line("S:")(input)?;
+fn server(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(Some("S:"))(input)?;
     Ok((
         input,
         Block::ServerMessage(message.into(), args.map(Into::into)),
     ))
 }
 
-fn auto(input: &str) -> IResult<&str, Block> {
-    let (input, (message, args)) = prefixed_line("A:")(input)?;
+fn auto(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(Some("A:"))(input)?;
     Ok((
         input,
         Block::AutoMessage(message.into(), args.map(Into::into)),
     ))
 }
 
-fn optional(input: &str) -> IResult<&str, Block> {
-    let (input, (message, args)) = prefixed_line("*:")(input)?;
+fn comment(input: &str) -> IResult<Block> {
+    preceded(tag("#"), rest_of_line)(input).map(|(input, _)| (input, Block::Comment))
+}
+
+fn untagged(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(None)(input)?;
+    Ok((
+        input,
+        Block::UntaggedMessage(message.into(), args.map(Into::into)),
+    ))
+}
+
+fn optional(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(Some("*:"))(input)?;
     Ok((
         input,
         Block::Repeat0(Box::new(Block::AutoMessage(
@@ -97,51 +124,60 @@ fn optional(input: &str) -> IResult<&str, Block> {
     ))
 }
 
-fn scan_bang_lines(input: &str) -> IResult<&str, Vec<BangLine>> {
+fn scan_bang_lines(input: &str) -> IResult<Vec<BangLine>> {
     many1(alt((
-        auto_bang_line,
-        bolt_version_bang_line,
-        simple_bang_line("ALLOW RESTART", BangLine::AllowRestart),
-        simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
+        context("auto bang", auto_bang_line),
+        context("bolt version bang", bolt_version_bang_line),
+        context(
+            "allow restart",
+            simple_bang_line("ALLOW RESTART", BangLine::AllowRestart),
+        ),
+        context(
+            "allow concurrent",
+            simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
+        ),
     )))(input)
 }
 
-fn rest_of_line(input: &str) -> IResult<&str, &str> {
+fn rest_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, &'a str, E> {
     let (input, mut line) = take_while(|c: char| c != '\n' && c != '\r')(input)?;
     line = line.trim();
     if line.is_empty() {
-        return Err(nom::Err::Error(nom::error::Error {
+        return Err(nom::Err::Error(E::from_error_kind(
             input,
-            code: nom::error::ErrorKind::Complete,
-        }));
+            nom::error::ErrorKind::Complete,
+        )));
     }
     Ok((input, line))
 }
 
-fn bolt_version_bang_line(input: &str) -> IResult<&str, BangLine> {
+fn bolt_version_bang_line(input: &str) -> IResult<BangLine> {
     preceded(
         bang_line("BOLT"),
         preceded(
             space1,
-            map(separated_pair(u8, tag("."), u8), |(major, minor)| {
-                BangLine::Version(major, minor)
-            }),
+            terminated(
+                map(separated_pair(u8, tag("."), u8), |(major, minor)| {
+                    BangLine::Version(major, minor)
+                }),
+                end_of_line,
+            ),
         ),
     )(input)
 }
 
-fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, &'a str> {
-    preceded(tag("!: "), preceded(space0, tag(expect)))
+fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<'a, &'a str> {
+    preceded(tag("!:"), preceded(space1, tag(expect)))
 }
 
 fn simple_bang_line<'a>(
     expect: &'static str,
     res: BangLine,
-) -> impl FnMut(&'a str) -> IResult<&'a str, BangLine> {
+) -> impl FnMut(&'a str) -> IResult<'a, BangLine> {
     value(res, preceded(bang_line(expect), end_of_line))
 }
 
-fn auto_bang_line(input: &str) -> IResult<&str, BangLine> {
+fn auto_bang_line(input: &str) -> IResult<BangLine> {
     map(
         preceded(
             bang_line("AUTO"),
@@ -151,7 +187,7 @@ fn auto_bang_line(input: &str) -> IResult<&str, BangLine> {
     )(input)
 }
 
-fn end_of_line(input: &str) -> IResult<&str, &str> {
+fn end_of_line(input: &str) -> IResult<&str> {
     alt((multispace1, eof))(input)
 }
 
@@ -169,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_minimal_script() {
+    fn test_scan_minimal_script() {
         let input = "!: BOLT 5.5\n";
         let result = dbg!(scanner::scan_script(input, "test.script"));
         assert!(result.is_ok());
@@ -181,13 +217,44 @@ mod tests {
         let result = dbg!(scanner::bolt_version_bang_line(input));
         assert!(result.is_ok());
         let (rem, bl) = result.unwrap();
-        assert_eq!(rem, "\n");
+        assert_eq!(rem, "");
         assert_eq!(bl, BangLine::Version(16, 5));
     }
 
+    #[rstest]
+    #[case::bolt_5_4("!: BOLT 5.4\n", BangLine::Version(5, 4))]
+    #[case::bolt_5_0("!: BOLT 5.0\n", BangLine::Version(5, 0))]
+    // #[case::bolt_5("!: BOLT 5\n", BangLine::Version(5, 0))]
+    #[case::restart("!: ALLOW RESTART\n", BangLine::AllowRestart)]
+    #[case::auto_reset("!: AUTO RESET\n", BangLine::Auto("RESET".into()))]
+    #[case::auto_foo("!: AUTO foo\n", BangLine::Auto("foo".into()))]
+    #[case::concurrent("!: ALLOW CONCURRENT\n", BangLine::Concurrent)]
+    // #[case::handshake("!: HANDSHAKE FF 00\n", BangLine::Handshake(vec![0xFF, 0x00]))]
+    // #[case::handshake_empty("!: HANDSHAKE\n", BangLine::Handshake(vec![]))]
+    // #[case::handshake_delay_zero("!: HANDSHAKE DELAY 0\n", BangLine::HandshakeDelay(0.))]
+    // #[case::handshake_delay_negative("!: HANDSHAKE DELAY -1\n", BangLine::HandshakeDelay(-1.))]
+    // #[case::handshake_delay_neg_f("!: HANDSHAKE DELAY -1.5\n", BangLine::HandshakeDelay(-1.5))]
+    // #[case::handshake_delay_pos_f(
+    //     "!: HANDSHAKE DELAY 12345.6789\n",
+    //     BangLine::HandshakeDelay(12345.6789)
+    // )]
+    // #[case::handshake_delay_pos_f("!: PY FOO bar\tBaz\n", BangLine::Python("FOO bar\tBaz".into()))]
+    fn test_scan_bang_line(
+        #[case] input: &'static str,
+        #[case] expected: BangLine,
+        #[values(1, 3)] repetition: usize,
+    ) {
+        let input = input.repeat(repetition);
+        let result = dbg!(scanner::scan_script(input.as_str(), "test.script"));
+        let result = result.unwrap();
+        assert_eq!(result.bang_lines.len(), repetition);
+        for bl in result.bang_lines.iter() {
+            assert_eq!(bl, &expected);
+        }
+    }
 
     #[test]
-    fn test_parse_multiple_bangs() {
+    fn test_scan_multiple_bangs() {
         let input = "!: BOLT 5.4\n!: AUTO Nonsense\n!: ALLOW RESTART\n";
         let result = dbg!(scanner::scan_script(input, "test.script"));
         let result = result.unwrap();
@@ -208,7 +275,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_concurrent_ok() {
+    fn test_auto_bang_line_script() {
+        let result = dbg!(scanner::scan_script("!: AUTO Nonsense\n", "test.script"));
+        let result = result.unwrap();
+        assert_eq!(
+            result.bang_lines.get(0),
+            Some(&BangLine::Auto("Nonsense".into()))
+        );
+    }
+
+    #[test]
+    fn test_scan_concurrent_ok() {
         let input = "!: ALLOW CONCURRENT\n";
         let result = scanner::simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent)(input);
         let (rem, bang) = result.unwrap();
@@ -216,10 +293,14 @@ mod tests {
         assert_eq!(bang, BangLine::Concurrent);
     }
 
+    fn call_rest_of_line<'a>(input: &'a str) -> super::IResult<&'a str> {
+        scanner::rest_of_line(input)
+    }
+
     #[test]
     fn test_rest_of_line_trims() {
         let input = "ALLOW CONCURRENT\t\r\n";
-        let result = scanner::rest_of_line(input);
+        let result = call_rest_of_line(input);
         let (rem, taken) = result.unwrap();
         assert_eq!(rem, "\r\n");
         assert_eq!(taken, "ALLOW CONCURRENT");
@@ -228,12 +309,15 @@ mod tests {
     #[rstest]
     #[case::crlf("\r\n")]
     #[case::lf("\n")]
-    fn test_rest_of_line(#[case] eol: &str) {
-        let input = format!("ALLOW CONCURRENT{eol}");
-        let result = scanner::rest_of_line(input.as_str());
+    fn test_rest_of_line(
+        #[case] eol: &str,
+        #[values("ALLOW CONCURRENT", "A C ", " A C", "\tA\tC\t")] content: &str,
+    ) {
+        let input = format!("{content}{eol}");
+        let result = call_rest_of_line(input.as_str());
         let (rem, taken) = result.unwrap();
         assert_eq!(rem, eol);
-        assert_eq!(taken, "ALLOW CONCURRENT");
+        assert_eq!(taken, content.trim());
     }
 
     #[rstest]
@@ -261,5 +345,17 @@ mod tests {
             block,
             crate::Block::ClientMessage("RUN".into(), Some("foo bar".into()))
         );
+    }
+
+    #[rstest]
+    #[case::no_space("#RUN foo bar")]
+    #[case::no_space("# RUN foo bar")]
+    #[case::trailing("# RUN foo bar  ")]
+    #[case::messy("#  RUN   foo bar  ")]
+    fn test_comment(#[case] input: &str) {
+        let result = scanner::comment(input);
+        let (rem, block) = result.unwrap();
+        assert_eq!(rem, "");
+        assert_eq!(block, crate::Block::Comment);
     }
 }
