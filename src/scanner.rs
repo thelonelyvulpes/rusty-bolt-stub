@@ -1,18 +1,20 @@
-use crate::{BangLine, Block, BoltVersion, Script};
+use crate::{BangLine, Block, Script};
 use anyhow::Error;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
-use nom::character::complete::{alpha1, digit1, multispace0, multispace1, space0, space1};
-use nom::combinator::{consumed, eof, map, map_res, opt, recognize};
+use nom::character::complete::{alpha1, multispace0, multispace1, space0, space1, u8};
+use nom::combinator::{eof, map, opt, value};
+use nom::error::ParseError;
 use nom::multi::many1;
-use nom::sequence::{pair, preceded, separated_pair};
+use nom::sequence::{preceded, separated_pair, terminated};
 use nom::IResult;
 
 pub fn scan_script(input: &'static str, name: &str) -> Result<Script, Error> {
     let (input, bangs) = scan_bang_lines(input)?;
 
     let (input, _) = multispace0::<_, nom::error::Error<&str>>(input)?;
-    if input.is_empty() && bangs.iter().any(|x| matches!(x, BangLine::Version(_))) {
+
+    if input.is_empty() && bangs.iter().any(|x| matches!(x, BangLine::Version(_, _))) {
         return Ok(Script {
             name: name.into(),
             bang_lines: bangs,
@@ -96,16 +98,12 @@ fn optional(input: &str) -> IResult<&str, Block> {
 }
 
 fn scan_bang_lines(input: &str) -> IResult<&str, Vec<BangLine>> {
-    many1(scan_bang_line)(input)
-}
-
-fn scan_bang_line(input: &str) -> IResult<&str, BangLine> {
-    alt((
-        bolt_version_bang_line,
-        allow_restart_bang_line,
-        allow_concurrent_bang_line,
+    many1(alt((
         auto_bang_line,
-    ))(input)
+        bolt_version_bang_line,
+        simple_bang_line("ALLOW RESTART", BangLine::AllowRestart),
+        simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
+    )))(input)
 }
 
 fn rest_of_line(input: &str) -> IResult<&str, &str> {
@@ -125,13 +123,10 @@ fn bolt_version_bang_line(input: &str) -> IResult<&str, BangLine> {
         bang_line("BOLT"),
         preceded(
             space1,
-            map_res(separated_pair(digit1, tag("."), digit1), |(a, b): (&str, &str)| {
-                match BoltVersion::match_valid_version(a.parse::<u8>().map_err(|_|nom::error::Error::new(a, nom::error::ErrorKind::Digit))?, b.parse::<u8>().map_err(|_|nom::error::Error::new(b, nom::error::ErrorKind::Digit))?) {
-                    Some(version) => Ok(BangLine::Version(version)),
-                    None => Err(nom::error::Error::new(input, nom::error::ErrorKind::Digit)),
-                }
-            })
-        )
+            map(separated_pair(u8, tag("."), u8), |(major, minor)| {
+                BangLine::Version(major, minor)
+            }),
+        ),
     )(input)
 }
 
@@ -139,23 +134,20 @@ fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str
     preceded(tag("!: "), preceded(space0, tag(expect)))
 }
 
-fn allow_restart_bang_line(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = preceded(bang_line("ALLOW RESTART"), end_of_line)(input)?;
-    Ok((input, BangLine::AllowRestart))
-}
-
-fn allow_concurrent_bang_line(input: &str) -> IResult<&str, BangLine> {
-    let (input, _) = preceded(bang_line("ALLOW CONCURRENT"), end_of_line)(input)?;
-    Ok((input, BangLine::Concurrent))
+fn simple_bang_line<'a>(
+    expect: &'static str,
+    res: BangLine,
+) -> impl FnMut(&'a str) -> IResult<&'a str, BangLine> {
+    value(res, preceded(bang_line(expect), end_of_line))
 }
 
 fn auto_bang_line(input: &str) -> IResult<&str, BangLine> {
     map(
-        and_then(preceded(
+        preceded(
             bang_line("AUTO"),
-            preceded((space1, |ws: &str| ws.cont), pair(alpha1, end_of_line)),
-        )),
-        |(_, (message, _))| BangLine::Auto(message.to_owned()),
+            preceded(space1, terminated(alpha1, end_of_line)),
+        ),
+        |message| BangLine::Auto(message.to_owned()),
     )(input)
 }
 
@@ -165,7 +157,7 @@ fn end_of_line(input: &str) -> IResult<&str, &str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{scanner, BangLine, BoltVersion};
+    use crate::{scanner, BangLine};
 
     use rstest::rstest;
 
@@ -184,34 +176,28 @@ mod tests {
     }
 
     #[test]
+    fn should_scan_u8() {
+        let input = "!: BOLT 16.5\n";
+        let result = dbg!(scanner::bolt_version_bang_line(input));
+        assert!(result.is_ok());
+        let (rem, bl) = result.unwrap();
+        assert_eq!(rem, "\n");
+        assert_eq!(bl, BangLine::Version(16, 5));
+    }
+
+
+    #[test]
     fn test_parse_multiple_bangs() {
         let input = "!: BOLT 5.4\n!: AUTO Nonsense\n!: ALLOW RESTART\n";
         let result = dbg!(scanner::scan_script(input, "test.script"));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
-        assert_eq!(
-            result.bang_lines.get(0),
-            Some(&BangLine::Version(BoltVersion::V5_4))
-        );
+        assert_eq!(result.bang_lines.get(0), Some(&BangLine::Version(5, 4)));
         assert_eq!(
             result.bang_lines.get(1),
             Some(&BangLine::Auto("Nonsense".into()))
         );
         assert_eq!(result.bang_lines.get(2), Some(&BangLine::AllowRestart));
-    }
-
-    #[test]
-    fn test_parse_auto() {
-        let input = "!: BOLT 5.4\n!: ALLOW RESTART\r\n!: ALLOW CONCURRENT\r\n";
-        let result = dbg!(scanner::scan_script(input, "test.script"));
-        let result = result.unwrap();
-        assert_eq!(result.bang_lines.len(), 3);
-        assert_eq!(
-            result.bang_lines.get(0),
-            Some(&BangLine::Version(BoltVersion::V5_4))
-        );
-        assert_eq!(result.bang_lines.get(1), Some(&BangLine::AllowRestart));
-        assert_eq!(result.bang_lines.get(2), Some(&BangLine::Concurrent));
     }
 
     #[test]
@@ -224,7 +210,7 @@ mod tests {
     #[test]
     fn test_parse_concurrent_ok() {
         let input = "!: ALLOW CONCURRENT\n";
-        let result = scanner::allow_concurrent_bang_line(input);
+        let result = scanner::simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent)(input);
         let (rem, bang) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(bang, BangLine::Concurrent);

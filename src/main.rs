@@ -4,9 +4,9 @@ fn main() {
     let input = "!: BOLT 5.5";
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum BangLine {
-    Version(BoltVersion),
+    Version(u8, u8),
     AllowRestart,
     Auto(String),
     Concurrent,
@@ -15,7 +15,7 @@ enum BangLine {
     Python(String),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 enum BoltVersion {
     V3_5,
     V4_0,
