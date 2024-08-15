@@ -1,13 +1,14 @@
 use crate::{BangLine, Block, Script};
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{alpha1, multispace0, multispace1, space0, space1, u8};
-use nom::combinator::{eof, map, opt, value};
+use nom::combinator::{cond, eof, map, opt, value};
 use nom::error::{context, FromExternalError, ParseError, VerboseError};
 use nom::multi::many1;
-use nom::sequence::{preceded, separated_pair, terminated};
+use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom_supreme::error::ErrorTree;
+use nom_supreme::ParserExt;
 
 type PError<I> = ErrorTree<I>;
 type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
@@ -46,71 +47,40 @@ fn scan_body(input: &str) -> IResult<Block> {
 }
 
 fn scan_block(input: &str) -> IResult<Block> {
-    let (input, _) = multispace0(input)?;
+    preceded(
+        multispace0,
     alt((
-        context("client line", client),
-        server,
-        auto,
+        context("client line", message(Some("C:"), Block::ClientMessage)),
+        context("server line", message(Some("S:"), Block::ServerMessage)),
+        context("auto line", message(Some("A:"), Block::AutoMessage)),
+        context("untagged line", message(None, Block::UntaggedMessage)),
         comment,
-        untagged,
-    ))(input)
+    )))(input)
 }
 
-fn prefixed_line(
+fn prefixed_line<'a>(
     prefix: Option<&'static str>,
-) -> impl FnMut(&str) -> IResult<(&str, Option<&str>)> {
-    move |input: &str| -> IResult<(&str, Option<&str>)> {
-        let input = match prefix {
-            Some(prefix) => terminated(tag(prefix), space0)(input)?.0,
-            None => input,
-        };
-        let (input, message) = alpha1(input)?;
-        let (input, args) = opt(preceded(space1, rest_of_line))(input)?;
-        let (input, args) = match args {
-            None => {
-                let (input, _) = space0(input)?;
-                (input, None)
-            }
-            Some(args) => (input, Some(args)),
-        };
-        Ok((input, (message, args)))
-    }
+) -> impl FnMut(&'a str) -> IResult<(&'a str, Option<&'a str>)> {
+    preceded(
+        cond(
+            prefix.is_some(),
+            terminated(tag(prefix.unwrap_or("")), space0),
+        ),
+        pair(
+            alpha1,
+            terminated(opt(preceded(space1, rest_of_line)), space0),
+        ),
+    )
 }
 
-fn client(input: &str) -> IResult<Block> {
-    let (input, (message, args)) = prefixed_line(Some("C:"))(input)?;
-    Ok((
-        input,
-        Block::ClientMessage(message.into(), args.map(Into::into)),
-    ))
-}
-
-fn server(input: &str) -> IResult<Block> {
-    let (input, (message, args)) = prefixed_line(Some("S:"))(input)?;
-    Ok((
-        input,
-        Block::ServerMessage(message.into(), args.map(Into::into)),
-    ))
-}
-
-fn auto(input: &str) -> IResult<Block> {
-    let (input, (message, args)) = prefixed_line(Some("A:"))(input)?;
-    Ok((
-        input,
-        Block::AutoMessage(message.into(), args.map(Into::into)),
-    ))
+fn message<'a>(tag: Option<&'static str>, block: fn(String, Option<String>) -> Block) -> impl FnMut(&'a str) -> IResult<Block>  {
+    map(prefixed_line(tag), move |(message, args)| {
+        block(message.into(), args.map(Into::into))
+    })
 }
 
 fn comment(input: &str) -> IResult<Block> {
-    preceded(tag("#"), rest_of_line)(input).map(|(input, _)| (input, Block::Comment))
-}
-
-fn untagged(input: &str) -> IResult<Block> {
-    let (input, (message, args)) = prefixed_line(None)(input)?;
-    Ok((
-        input,
-        Block::UntaggedMessage(message.into(), args.map(Into::into)),
-    ))
+    map(preceded(tag("#"), rest_of_line), |v| Block::Comment)(input)
 }
 
 fn optional(input: &str) -> IResult<Block> {
@@ -196,6 +166,8 @@ mod tests {
     use crate::{scanner, BangLine};
 
     use rstest::rstest;
+    use crate::Block::ClientMessage;
+    use crate::scanner::message;
 
     #[test]
     fn test_eol() {
@@ -326,7 +298,7 @@ mod tests {
     #[case::trailing("C: RUN  ")]
     #[case::messy("C:   RUN  ")]
     fn test_client_message_with_no_args(#[case] input: &str) {
-        let result = scanner::client(input);
+        let result = message(Some("C:"), ClientMessage)(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(block, crate::Block::ClientMessage("RUN".into(), None));
@@ -338,7 +310,7 @@ mod tests {
     #[case::trailing("C: RUN foo bar  ")]
     #[case::messy("C:  RUN   foo bar  ")]
     fn test_client_message_con_args(#[case] input: &str) {
-        let result = scanner::client(input);
+        let result = message(Some("C:"), ClientMessage)(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(
