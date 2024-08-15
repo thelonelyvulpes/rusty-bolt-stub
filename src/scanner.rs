@@ -1,10 +1,12 @@
 use crate::{BangLine, Block, Script};
-use anyhow::{anyhow};
+use anyhow::anyhow;
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_while};
-use nom::character::complete::{alpha1, multispace0, multispace1, space0, space1, u8};
+use nom::bytes::complete::tag;
+use nom::character::complete::{
+    alpha1, line_ending, multispace0, not_line_ending, space0, space1, u8,
+};
 use nom::combinator::{cond, eof, map, opt, value};
-use nom::error::{context, FromExternalError, ParseError, VerboseError};
+use nom::error::{context, FromExternalError, ParseError};
 use nom::multi::many1;
 use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom_supreme::error::ErrorTree;
@@ -49,13 +51,14 @@ fn scan_body(input: &str) -> IResult<Block> {
 fn scan_block(input: &str) -> IResult<Block> {
     preceded(
         multispace0,
-    alt((
-        context("client line", message(Some("C:"), Block::ClientMessage)),
-        context("server line", message(Some("S:"), Block::ServerMessage)),
-        context("auto line", message(Some("A:"), Block::AutoMessage)),
-        context("untagged line", message(None, Block::UntaggedMessage)),
-        comment,
-    )))(input)
+        alt((
+            context("client line", message(Some("C:"), Block::ClientMessage)),
+            context("server line", message(Some("S:"), Block::ServerMessage)),
+            context("auto line", message(Some("A:"), Block::AutoMessage)),
+            context("untagged line", message(None, Block::UntaggedMessage)),
+            comment,
+        )),
+    )(input)
 }
 
 fn prefixed_line<'a>(
@@ -73,7 +76,10 @@ fn prefixed_line<'a>(
     )
 }
 
-fn message<'a>(tag: Option<&'static str>, block: fn(String, Option<String>) -> Block) -> impl FnMut(&'a str) -> IResult<Block>  {
+fn message<'a>(
+    tag: Option<&'static str>,
+    block: fn(String, Option<String>) -> Block,
+) -> impl FnMut(&'a str) -> IResult<Block> {
     map(prefixed_line(tag), move |(message, args)| {
         block(message.into(), args.map(Into::into))
     })
@@ -110,7 +116,7 @@ fn scan_bang_lines(input: &str) -> IResult<Vec<BangLine>> {
 }
 
 fn rest_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, &'a str, E> {
-    let (input, mut line) = take_while(|c: char| c != '\n' && c != '\r')(input)?;
+    let (input, mut line) = terminated(not_line_ending, end_of_line)(input)?;
     line = line.trim();
     if line.is_empty() {
         return Err(nom::Err::Error(E::from_error_kind(
@@ -157,23 +163,30 @@ fn auto_bang_line(input: &str) -> IResult<BangLine> {
     )(input)
 }
 
-fn end_of_line(input: &str) -> IResult<&str> {
-    alt((multispace1, eof))(input)
+fn end_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, (), E> {
+    let eol = alt((line_ending, eof));
+    value((), preceded(space0, eol))(input)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{scanner, BangLine};
+    use super::super::{scanner, BangLine};
+    use super::message;
+    use crate::Block;
 
     use rstest::rstest;
-    use crate::Block::ClientMessage;
-    use crate::scanner::message;
 
-    #[test]
-    fn test_eol() {
-        let (input, eol) = scanner::end_of_line("\t \r\njeff").unwrap();
-        assert_eq!(input, "jeff");
-        assert_eq!(eol, "\t \r\n");
+    fn call_end_of_line(input: &str) -> super::IResult<()> {
+        scanner::end_of_line(input)
+    }
+
+    #[rstest]
+    #[case::crlf("\r\n")]
+    #[case::lf("\n")]
+    fn test_eol(#[case] eol: &str) {
+        let input = format!("\t {eol}jeff");
+        let (rem, ()) = call_end_of_line(&input).unwrap();
+        assert_eq!(rem, "jeff");
     }
 
     #[test]
@@ -259,7 +272,8 @@ mod tests {
     #[test]
     fn test_scan_concurrent_ok() {
         let input = "!: ALLOW CONCURRENT\n";
-        let result = scanner::simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent)(input);
+        let mut f = scanner::simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent);
+        let result = f(input);
         let (rem, bang) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(bang, BangLine::Concurrent);
@@ -274,8 +288,8 @@ mod tests {
         let input = "ALLOW CONCURRENT\t\r\n";
         let result = call_rest_of_line(input);
         let (rem, taken) = result.unwrap();
-        assert_eq!(rem, "\r\n");
         assert_eq!(taken, "ALLOW CONCURRENT");
+        assert_eq!(rem, "");
     }
 
     #[rstest]
@@ -288,8 +302,8 @@ mod tests {
         let input = format!("{content}{eol}");
         let result = call_rest_of_line(input.as_str());
         let (rem, taken) = result.unwrap();
-        assert_eq!(rem, eol);
         assert_eq!(taken, content.trim());
+        assert_eq!(rem, "");
     }
 
     #[rstest]
@@ -298,10 +312,10 @@ mod tests {
     #[case::trailing("C: RUN  ")]
     #[case::messy("C:   RUN  ")]
     fn test_client_message_with_no_args(#[case] input: &str) {
-        let result = message(Some("C:"), ClientMessage)(input);
+        let result = message(Some("C:"), Block::ClientMessage)(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(block, crate::Block::ClientMessage("RUN".into(), None));
+        assert_eq!(block, Block::ClientMessage("RUN".into(), None));
     }
 
     #[rstest]
@@ -310,12 +324,12 @@ mod tests {
     #[case::trailing("C: RUN foo bar  ")]
     #[case::messy("C:  RUN   foo bar  ")]
     fn test_client_message_con_args(#[case] input: &str) {
-        let result = message(Some("C:"), ClientMessage)(input);
+        let result = message(Some("C:"), Block::ClientMessage)(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(
             block,
-            crate::Block::ClientMessage("RUN".into(), Some("foo bar".into()))
+            Block::ClientMessage("RUN".into(), Some("foo bar".into()))
         );
     }
 
@@ -328,6 +342,14 @@ mod tests {
         let result = scanner::comment(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(block, crate::Block::Comment);
+        assert_eq!(block, Block::Comment);
+    }
+
+    #[test]
+    fn test_failing_scan() {
+        let input = "!: BOLT 5.4\n\nF: NOPE foo\n";
+        let result = dbg!(scanner::scan_script(input, "test.script"));
+        assert!(result.is_err());
+        println!("{:}", result.unwrap_err());
     }
 }
