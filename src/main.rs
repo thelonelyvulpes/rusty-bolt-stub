@@ -71,7 +71,6 @@ enum Block {
     ClientMessage(String, Option<String>),
     ServerMessage(String, Option<String>),
     AutoMessage(String, Option<String>),
-    UntaggedMessage(String, Option<String>),
     Comment,
     Python(String),
     Condition(CompositeConditionBlock),

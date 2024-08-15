@@ -5,10 +5,11 @@ use nom::bytes::complete::tag;
 use nom::character::complete::{
     alpha1, line_ending, multispace0, not_line_ending, space0, space1, u8,
 };
-use nom::combinator::{cond, eof, map, opt, value};
+use nom::combinator::{cond, eof, map, opt, peek, value};
 use nom::error::{context, FromExternalError, ParseError};
-use nom::multi::many1;
+use nom::multi::{many1, many_till};
 use nom::sequence::{pair, preceded, separated_pair, terminated};
+use nom::Parser;
 use nom_supreme::error::ErrorTree;
 
 type PError<I> = ErrorTree<I>;
@@ -108,12 +109,16 @@ fn scan_block(input: &str) -> IResult<Block> {
     preceded(
         multispace0,
         alt((
-            context("client line", message(Some("C:"), Block::ClientMessage)),
-            context("server line", message(Some("S:"), Block::ServerMessage)),
             context("auto line", message(Some("A:"), Block::AutoMessage)),
             context("comment line", comment),
-            // untagged line has to go last because it will match pretty much anything
-            context("untagged line", message(None, Block::UntaggedMessage)),
+            context(
+                "client lines",
+                multi_message(Some("C:"), Block::ClientMessage),
+            ),
+            context(
+                "server lines",
+                multi_message(Some("S:"), Block::ServerMessage),
+            ),
         )),
     )(input)
 }
@@ -121,9 +126,26 @@ fn scan_block(input: &str) -> IResult<Block> {
 // ############
 // Simple Lines
 // ############
+fn multi_message<'a>(
+    tag: Option<&'static str>,
+    mut block: impl FnMut(String, Option<String>) -> Block,
+) -> impl FnMut(&'a str) -> IResult<Block> {
+    move |input| {
+        let (input, head) = many1(message(tag, &mut block))(input)?;
+        let (input, (tail, _)) = context(
+            "implicit line",
+            many_till(
+                message(None, &mut block),
+                preceded(multispace0, alt((void(eof), void(peek(scan_block))))),
+            ),
+        )(input)?;
+        Ok((input, Block::List(head.into_iter().chain(tail).collect())))
+    }
+}
+
 fn message<'a>(
     tag: Option<&'static str>,
-    block: fn(String, Option<String>) -> Block,
+    mut block: impl FnMut(String, Option<String>) -> Block,
 ) -> impl FnMut(&'a str) -> IResult<Block> {
     map(prefixed_line(tag), move |(message, args)| {
         block(message.into(), args.map(Into::into))
@@ -136,11 +158,11 @@ fn prefixed_line<'a>(
     preceded(
         cond(
             prefix.is_some(),
-            terminated(tag(prefix.unwrap_or("")), space0),
+            terminated(tag(prefix.unwrap_or("")), multispace0),
         ),
         pair(
             alpha1,
-            terminated(opt(preceded(space1, rest_of_line)), space0),
+            terminated(opt(preceded(space1, rest_of_line)), multispace0),
         ),
     )
 }
@@ -152,7 +174,17 @@ fn comment(input: &str) -> IResult<Block> {
 // #################
 // Logic/Flow Blocks
 // #################
-// TODO
+// fn block(opening: &'static str, closing: &'static str) -> IResult<Vec<Block>> {
+//     todo!()
+// }
+//
+// fn multiblock(
+//     opening: &'static str,
+//     closing: &'static str,
+//     sep: &'static str,
+// ) -> IResult<Vec<Vec<Block>>> {
+//     todo!()
+// }
 
 // ###############
 // Syntactic Sugar
@@ -188,10 +220,17 @@ fn end_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a s
     value((), preceded(space0, eol))(input)
 }
 
+fn void<F, I, O, E>(f: F) -> impl FnMut(I) -> nom::IResult<I, (), E>
+where
+    F: Parser<I, O, E>,
+{
+    map(f, |_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{scanner, BangLine};
-    use super::message;
+    use super::{message, multi_message};
     use crate::Block;
 
     use rstest::rstest;
@@ -304,6 +343,25 @@ mod tests {
     // ############
     // Simple Lines
     // ############
+    #[rstest]
+    #[case::implicit("C: Foo a b \n   Bar lel lol ")]
+    #[case::explicit("C: Foo a b \nC: Bar lel lol ")]
+    fn test_multi_message(
+        #[case] input: &'static str,
+        #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n")] ending: &'static str,
+    ) {
+        let input = format!("{input}{ending}");
+        let (rem, block) = multi_message(Some("C:"), Block::ClientMessage)(&input).unwrap();
+        assert_eq!(rem, ending.trim_start());
+        assert_eq!(
+            block,
+            Block::List(vec![
+                Block::ClientMessage("Foo".into(), Some("a b".into())),
+                Block::ClientMessage("Bar".into(), Some("lel lol".into()))
+            ])
+        );
+    }
+
     #[rstest]
     #[case::no_space("C:RUN")]
     #[case::clean("C: RUN")]
