@@ -54,8 +54,9 @@ fn scan_block(input: &str) -> IResult<Block> {
             context("client line", message(Some("C:"), Block::ClientMessage)),
             context("server line", message(Some("S:"), Block::ServerMessage)),
             context("auto line", message(Some("A:"), Block::AutoMessage)),
-            context("untagged line", message(None, Block::UntaggedMessage)),
             comment,
+            // untagged line has to go last because it will match pretty much anything
+            context("untagged line", message(None, Block::UntaggedMessage)),
         )),
     )(input)
 }
