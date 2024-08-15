@@ -10,7 +10,6 @@ use nom::error::{context, FromExternalError, ParseError};
 use nom::multi::many1;
 use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom_supreme::error::ErrorTree;
-use nom_supreme::ParserExt;
 
 type PError<I> = ErrorTree<I>;
 type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
@@ -23,7 +22,7 @@ pub fn scan_script<'a>(input: &'a str, name: &str) -> Result<Script, nom::Err<PE
         return Ok(Script {
             name: name.into(),
             bang_lines: bangs,
-            body: Block::BlockList(vec![]),
+            body: Block::List(vec![]),
         });
     };
 
@@ -39,13 +38,13 @@ pub fn scan_script<'a>(input: &'a str, name: &str) -> Result<Script, nom::Err<PE
     Ok(Script {
         name: name.into(),
         bang_lines: bangs,
-        body: body.unwrap_or(Block::BlockList(vec![])),
+        body: body.unwrap_or(Block::List(vec![])),
     })
 }
 
 fn scan_body(input: &str) -> IResult<Block> {
     let (input, blocks) = many1(scan_block)(input)?;
-    Ok((input, Block::BlockList(blocks)))
+    Ok((input, Block::List(blocks)))
 }
 
 fn scan_block(input: &str) -> IResult<Block> {
@@ -86,7 +85,7 @@ fn message<'a>(
 }
 
 fn comment(input: &str) -> IResult<Block> {
-    map(preceded(tag("#"), rest_of_line), |v| Block::Comment)(input)
+    map(preceded(tag("#"), rest_of_line), |_| Block::Comment)(input)
 }
 
 fn optional(input: &str) -> IResult<Block> {

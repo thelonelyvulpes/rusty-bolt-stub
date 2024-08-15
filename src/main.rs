@@ -1,7 +1,10 @@
+// TODO: remove when rapid PoC phase is over
+#![allow(dead_code)]
+
 mod scanner;
 
 fn main() {
-    let input = "!: BOLT 5.5";
+    // let input = "!: BOLT 5.5";
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -60,9 +63,9 @@ struct Script {
 
 #[derive(Debug, Eq, PartialEq)]
 enum Block {
-    BlockList(Vec<Block>),
-    AltBlock(Vec<Block>),
-    OptionalBlock(Box<Block>),
+    List(Vec<Block>),
+    Alt(Vec<Block>),
+    Opt(Box<Block>),
     Repeat0(Box<Block>),
     Repeat1(Box<Block>),
     ClientMessage(String, Option<String>),
