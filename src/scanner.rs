@@ -109,6 +109,7 @@ fn scan_block(input: &str) -> IResult<Block> {
     preceded(
         multispace0,
         alt((
+            context("simple block", map(block("{{", "}}"), Block::List)),
             context("auto line", message(Some("A:"), Block::AutoMessage)),
             context("comment line", comment),
             context(
@@ -131,12 +132,15 @@ fn multi_message<'a>(
     mut block: impl FnMut(String, Option<String>) -> Block,
 ) -> impl FnMut(&'a str) -> IResult<Block> {
     move |input| {
-        let (input, head) = many1(message(tag, &mut block))(input)?;
+        let (input, head) = many1(context("explicit line", message(tag, &mut block)))(input)?;
         let (input, (tail, _)) = context(
             "implicit line",
-            many_till(
-                message(None, &mut block),
-                preceded(multispace0, alt((void(eof), void(peek(scan_block))))),
+            map(
+                opt(many_till(
+                    message(None, &mut block),
+                    peek(preceded(multispace0, alt((void(eof), void(scan_block))))),
+                )),
+                Option::unwrap_or_default,
             ),
         )(input)?;
         Ok((input, Block::List(head.into_iter().chain(tail).collect())))
@@ -174,10 +178,19 @@ fn comment(input: &str) -> IResult<Block> {
 // #################
 // Logic/Flow Blocks
 // #################
-// fn block(opening: &'static str, closing: &'static str) -> IResult<Vec<Block>> {
-//     todo!()
-// }
-//
+fn block<'a>(
+    opening: &'static str,
+    closing: &'static str,
+) -> impl FnMut(&'a str) -> IResult<'a, Vec<Block>> {
+    preceded(
+        terminated(tag(opening), end_of_line),
+        terminated(
+            many1(scan_block),
+            preceded(space0, terminated(tag(closing), end_of_line)),
+        ),
+    )
+}
+
 // fn multiblock(
 //     opening: &'static str,
 //     closing: &'static str,
@@ -404,6 +417,20 @@ mod tests {
     // #################
     // Logic/Flow Blocks
     // #################
+    #[test]
+    fn test_simple_block() {
+        let input = "{{\n    C: RUN\n    S: OK\n}}";
+        let result = dbg!(scanner::block("{{", "}}")(input));
+        let (rem, blocks) = result.unwrap();
+        assert_eq!(rem, "");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::List(vec![Block::ClientMessage("RUN".into(), None)]),
+                Block::List(vec![Block::ServerMessage("OK".into(), None)]),
+            ]
+        );
+    }
 
     // ###############
     // Syntactic Sugar
