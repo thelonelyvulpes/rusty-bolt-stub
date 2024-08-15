@@ -42,64 +42,9 @@ pub fn scan_script<'a>(input: &'a str, name: &str) -> Result<Script, nom::Err<PE
     })
 }
 
-fn scan_body(input: &str) -> IResult<Block> {
-    let (input, blocks) = many1(scan_block)(input)?;
-    Ok((input, Block::List(blocks)))
-}
-
-fn scan_block(input: &str) -> IResult<Block> {
-    preceded(
-        multispace0,
-        alt((
-            context("client line", message(Some("C:"), Block::ClientMessage)),
-            context("server line", message(Some("S:"), Block::ServerMessage)),
-            context("auto line", message(Some("A:"), Block::AutoMessage)),
-            comment,
-            // untagged line has to go last because it will match pretty much anything
-            context("untagged line", message(None, Block::UntaggedMessage)),
-        )),
-    )(input)
-}
-
-fn prefixed_line<'a>(
-    prefix: Option<&'static str>,
-) -> impl FnMut(&'a str) -> IResult<(&'a str, Option<&'a str>)> {
-    preceded(
-        cond(
-            prefix.is_some(),
-            terminated(tag(prefix.unwrap_or("")), space0),
-        ),
-        pair(
-            alpha1,
-            terminated(opt(preceded(space1, rest_of_line)), space0),
-        ),
-    )
-}
-
-fn message<'a>(
-    tag: Option<&'static str>,
-    block: fn(String, Option<String>) -> Block,
-) -> impl FnMut(&'a str) -> IResult<Block> {
-    map(prefixed_line(tag), move |(message, args)| {
-        block(message.into(), args.map(Into::into))
-    })
-}
-
-fn comment(input: &str) -> IResult<Block> {
-    map(preceded(tag("#"), rest_of_line), |_| Block::Comment)(input)
-}
-
-fn optional(input: &str) -> IResult<Block> {
-    let (input, (message, args)) = prefixed_line(Some("*:"))(input)?;
-    Ok((
-        input,
-        Block::Repeat0(Box::new(Block::AutoMessage(
-            message.into(),
-            args.map(Into::into),
-        ))),
-    ))
-}
-
+// #################
+// Header/Bang Lines
+// #################
 fn scan_bang_lines(input: &str) -> IResult<Vec<BangLine>> {
     many1(alt((
         context("auto bang", auto_bang_line),
@@ -113,18 +58,6 @@ fn scan_bang_lines(input: &str) -> IResult<Vec<BangLine>> {
             simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
         ),
     )))(input)
-}
-
-fn rest_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, &'a str, E> {
-    let (input, mut line) = terminated(not_line_ending, end_of_line)(input)?;
-    line = line.trim();
-    if line.is_empty() {
-        return Err(nom::Err::Error(E::from_error_kind(
-            input,
-            nom::error::ErrorKind::Complete,
-        )));
-    }
-    Ok((input, line))
 }
 
 fn bolt_version_bang_line(input: &str) -> IResult<BangLine> {
@@ -142,8 +75,14 @@ fn bolt_version_bang_line(input: &str) -> IResult<BangLine> {
     )(input)
 }
 
-fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<'a, &'a str> {
-    preceded(tag("!:"), preceded(space1, tag(expect)))
+fn auto_bang_line(input: &str) -> IResult<BangLine> {
+    map(
+        preceded(
+            bang_line("AUTO"),
+            preceded(space1, terminated(alpha1, end_of_line)),
+        ),
+        |message| BangLine::Auto(message.to_owned()),
+    )(input)
 }
 
 fn simple_bang_line<'a>(
@@ -153,14 +92,95 @@ fn simple_bang_line<'a>(
     value(res, preceded(bang_line(expect), end_of_line))
 }
 
-fn auto_bang_line(input: &str) -> IResult<BangLine> {
-    map(
-        preceded(
-            bang_line("AUTO"),
-            preceded(space1, terminated(alpha1, end_of_line)),
-        ),
-        |message| BangLine::Auto(message.to_owned()),
+fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<'a, &'a str> {
+    preceded(tag("!:"), preceded(space1, tag(expect)))
+}
+
+// ##########
+//    Body
+// ##########
+fn scan_body(input: &str) -> IResult<Block> {
+    let (input, blocks) = many1(scan_block)(input)?;
+    Ok((input, Block::List(blocks)))
+}
+
+fn scan_block(input: &str) -> IResult<Block> {
+    preceded(
+        multispace0,
+        alt((
+            context("client line", message(Some("C:"), Block::ClientMessage)),
+            context("server line", message(Some("S:"), Block::ServerMessage)),
+            context("auto line", message(Some("A:"), Block::AutoMessage)),
+            context("comment line", comment),
+            // untagged line has to go last because it will match pretty much anything
+            context("untagged line", message(None, Block::UntaggedMessage)),
+        )),
     )(input)
+}
+
+// ############
+// Simple Lines
+// ############
+fn message<'a>(
+    tag: Option<&'static str>,
+    block: fn(String, Option<String>) -> Block,
+) -> impl FnMut(&'a str) -> IResult<Block> {
+    map(prefixed_line(tag), move |(message, args)| {
+        block(message.into(), args.map(Into::into))
+    })
+}
+
+fn prefixed_line<'a>(
+    prefix: Option<&'static str>,
+) -> impl FnMut(&'a str) -> IResult<(&'a str, Option<&'a str>)> {
+    preceded(
+        cond(
+            prefix.is_some(),
+            terminated(tag(prefix.unwrap_or("")), space0),
+        ),
+        pair(
+            alpha1,
+            terminated(opt(preceded(space1, rest_of_line)), space0),
+        ),
+    )
+}
+
+fn comment(input: &str) -> IResult<Block> {
+    map(preceded(tag("#"), rest_of_line), |_| Block::Comment)(input)
+}
+
+// #################
+// Logic/Flow Blocks
+// #################
+// TODO
+
+// ###############
+// Syntactic Sugar
+// ###############
+fn optional(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(Some("*:"))(input)?;
+    Ok((
+        input,
+        Block::Repeat0(Box::new(Block::AutoMessage(
+            message.into(),
+            args.map(Into::into),
+        ))),
+    ))
+}
+
+// #########
+// Utilities
+// #########
+fn rest_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, &'a str, E> {
+    let (input, mut line) = terminated(not_line_ending, end_of_line)(input)?;
+    line = line.trim();
+    if line.is_empty() {
+        return Err(nom::Err::Error(E::from_error_kind(
+            input,
+            nom::error::ErrorKind::Complete,
+        )));
+    }
+    Ok((input, line))
 }
 
 fn end_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, (), E> {
@@ -176,19 +196,6 @@ mod tests {
 
     use rstest::rstest;
 
-    fn call_end_of_line(input: &str) -> super::IResult<()> {
-        scanner::end_of_line(input)
-    }
-
-    #[rstest]
-    #[case::crlf("\r\n")]
-    #[case::lf("\n")]
-    fn test_eol(#[case] eol: &str) {
-        let input = format!("\t {eol}jeff");
-        let (rem, ()) = call_end_of_line(&input).unwrap();
-        assert_eq!(rem, "jeff");
-    }
-
     #[test]
     fn test_scan_minimal_script() {
         let input = "!: BOLT 5.5\n";
@@ -196,6 +203,17 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_failing_scan() {
+        let input = "!: BOLT 5.4\n\nF: NOPE foo\n";
+        let result = dbg!(scanner::scan_script(input, "test.script"));
+        assert!(result.is_err());
+        println!("{:}", result.unwrap_err());
+    }
+
+    // #################
+    // Header/Bang Lines
+    // #################
     #[test]
     fn should_scan_u8() {
         let input = "!: BOLT 16.5\n";
@@ -279,33 +297,13 @@ mod tests {
         assert_eq!(bang, BangLine::Concurrent);
     }
 
-    fn call_rest_of_line<'a>(input: &'a str) -> super::IResult<&'a str> {
-        scanner::rest_of_line(input)
-    }
+    // ##########
+    //    Body
+    // ##########
 
-    #[test]
-    fn test_rest_of_line_trims() {
-        let input = "ALLOW CONCURRENT\t\r\n";
-        let result = call_rest_of_line(input);
-        let (rem, taken) = result.unwrap();
-        assert_eq!(taken, "ALLOW CONCURRENT");
-        assert_eq!(rem, "");
-    }
-
-    #[rstest]
-    #[case::crlf("\r\n")]
-    #[case::lf("\n")]
-    fn test_rest_of_line(
-        #[case] eol: &str,
-        #[values("ALLOW CONCURRENT", "A C ", " A C", "\tA\tC\t")] content: &str,
-    ) {
-        let input = format!("{content}{eol}");
-        let result = call_rest_of_line(input.as_str());
-        let (rem, taken) = result.unwrap();
-        assert_eq!(taken, content.trim());
-        assert_eq!(rem, "");
-    }
-
+    // ############
+    // Simple Lines
+    // ############
     #[rstest]
     #[case::no_space("C:RUN")]
     #[case::clean("C: RUN")]
@@ -345,11 +343,54 @@ mod tests {
         assert_eq!(block, Block::Comment);
     }
 
+    // #################
+    // Logic/Flow Blocks
+    // #################
+
+    // ###############
+    // Syntactic Sugar
+    // ###############
+
+    // #########
+    // Utilities
+    // #########
+    fn call_end_of_line(input: &str) -> super::IResult<()> {
+        scanner::end_of_line(input)
+    }
+
+    #[rstest]
+    #[case::crlf("\r\n")]
+    #[case::lf("\n")]
+    fn test_eol(#[case] eol: &str) {
+        let input = format!("\t {eol}jeff");
+        let (rem, ()) = call_end_of_line(&input).unwrap();
+        assert_eq!(rem, "jeff");
+    }
+
+    fn call_rest_of_line<'a>(input: &'a str) -> super::IResult<&'a str> {
+        scanner::rest_of_line(input)
+    }
+
     #[test]
-    fn test_failing_scan() {
-        let input = "!: BOLT 5.4\n\nF: NOPE foo\n";
-        let result = dbg!(scanner::scan_script(input, "test.script"));
-        assert!(result.is_err());
-        println!("{:}", result.unwrap_err());
+    fn test_rest_of_line_trims() {
+        let input = "ALLOW CONCURRENT\t\r\n";
+        let result = call_rest_of_line(input);
+        let (rem, taken) = result.unwrap();
+        assert_eq!(taken, "ALLOW CONCURRENT");
+        assert_eq!(rem, "");
+    }
+
+    #[rstest]
+    #[case::crlf("\r\n")]
+    #[case::lf("\n")]
+    fn test_rest_of_line(
+        #[case] eol: &str,
+        #[values("ALLOW CONCURRENT", "A C ", " A C", "\tA\tC\t")] content: &str,
+    ) {
+        let input = format!("{content}{eol}");
+        let result = call_rest_of_line(input.as_str());
+        let (rem, taken) = result.unwrap();
+        assert_eq!(taken, content.trim());
+        assert_eq!(rem, "");
     }
 }
