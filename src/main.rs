@@ -9,7 +9,7 @@ fn main() {
 
 #[derive(Debug, PartialEq, Clone)]
 enum BangLine {
-    Version(u8, u8),
+    Version(u8, Option<u8>),
     AllowRestart,
     Auto(String),
     Concurrent,

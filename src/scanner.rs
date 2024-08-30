@@ -67,9 +67,12 @@ fn bolt_version_bang_line(input: &str) -> IResult<BangLine> {
         preceded(
             space1,
             terminated(
-                map(separated_pair(u8, tag("."), u8), |(major, minor)| {
-                    BangLine::Version(major, minor)
-                }),
+                alt((
+                    map(separated_pair(u8, tag("."), u8), |(major, minor)| {
+                        BangLine::Version(major, Some(minor))
+                    }),
+                    map(u8, |major| { BangLine::Version(major, None)})
+                )),
                 end_of_line,
             ),
         ),
@@ -273,13 +276,13 @@ mod tests {
         assert!(result.is_ok());
         let (rem, bl) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(bl, BangLine::Version(16, 5));
+        assert_eq!(bl, BangLine::Version(16, Some(5)));
     }
 
     #[rstest]
-    #[case::bolt_5_4("!: BOLT 5.4\n", BangLine::Version(5, 4))]
-    #[case::bolt_5_0("!: BOLT 5.0\n", BangLine::Version(5, 0))]
-    // #[case::bolt_5("!: BOLT 5\n", BangLine::Version(5, 0))]
+    #[case::bolt_5_4("!: BOLT 5.4\n", BangLine::Version(5, Some(4)))]
+    #[case::bolt_5_0("!: BOLT 5.0\n", BangLine::Version(5, Some(0)))]
+    #[case::bolt_5("!: BOLT 5\n", BangLine::Version(5, None))]
     #[case::restart("!: ALLOW RESTART\n", BangLine::AllowRestart)]
     #[case::auto_reset("!: AUTO RESET\n", BangLine::Auto("RESET".into()))]
     #[case::auto_foo("!: AUTO foo\n", BangLine::Auto("foo".into()))]
@@ -314,7 +317,7 @@ mod tests {
         let result = dbg!(scanner::scan_script(input, "test.script"));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
-        assert_eq!(result.bang_lines.get(0), Some(&BangLine::Version(5, 4)));
+        assert_eq!(result.bang_lines.get(0), Some(&BangLine::Version(5, Some(4))));
         assert_eq!(
             result.bang_lines.get(1),
             Some(&BangLine::Auto("Nonsense".into()))
