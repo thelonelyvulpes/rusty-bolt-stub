@@ -151,21 +151,44 @@ fn scan_block(input: &str) -> IResult<Block> {
     )(input)
 }
 
+fn keyword(input: &str) -> IResult<()> {
+    void(alt((
+        tag("{{"),
+        tag("}}"),
+        tag("----"),
+        tag("++++"),
+        tag("{*"),
+        tag("*}"),
+        tag("{+"),
+        tag("+}"),
+        tag("{?"),
+        tag("?}"),
+        tag("C:"),
+        tag("S:"),
+        tag("PY:"),
+        tag("A:"),
+        tag("*:"),
+        tag("+:"),
+        tag("?:"),
+    )))(input)
+}
+
 // ############
 // Simple Lines
 // ############
 fn multi_message<'a>(
-    tag: Option<&'static str>,
+    message_tag: Option<&'static str>,
     mut block: impl FnMut(String, Option<String>) -> Block,
 ) -> impl FnMut(&'a str) -> IResult<Block> {
     move |input| {
-        let (input, head) = many1(context("explicit line", message(tag, &mut block)))(input)?;
+        let (input, head) =
+            many1(context("explicit line", message(message_tag, &mut block)))(input)?;
         let (input, (tail, _)) = context(
             "implicit line",
             map(
                 opt(many_till(
                     message(None, &mut block),
-                    peek(preceded(multispace0, alt((void(eof), void(scan_block))))),
+                    peek(preceded(multispace0, alt((void(eof), keyword)))),
                 )),
                 Option::unwrap_or_default,
             ),
@@ -429,7 +452,7 @@ mod tests {
     #[case::explicit("C: Foo a b \nC: Bar lel lol ")]
     fn test_multi_message(
         #[case] input: &'static str,
-        #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n")] ending: &'static str,
+        #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n", "\n?}", "\n?}")] ending: &'static str,
     ) {
         let input = format!("{input}{ending}");
         let (rem, block) = multi_message(Some("C:"), Block::ClientMessage)(&input).unwrap();
