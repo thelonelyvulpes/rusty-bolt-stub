@@ -7,10 +7,11 @@ use nom::character::complete::{
 };
 use nom::combinator::{cond, eof, map, opt, peek, value};
 use nom::error::{context, FromExternalError, ParseError};
-use nom::multi::{many1, many_till};
+use nom::multi::{many1, many_till, separated_list1};
 use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom::Parser;
 use nom_supreme::error::ErrorTree;
+use nom_supreme::ParserExt;
 
 type PError<I> = ErrorTree<I>;
 type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
@@ -112,8 +113,31 @@ fn scan_block(input: &str) -> IResult<Block> {
     preceded(
         multispace0,
         alt((
+            context(
+                "alternative block",
+                map(multiblock("{{", "}}", "----"), Block::Alt),
+            ),
             context("simple block", map(block("{{", "}}"), Block::List)),
+            context(
+                "repeat 0 block",
+                map(block("{*", "*}"), |b| {
+                    Block::Repeat0(Box::new(Block::List(b)))
+                }),
+            ),
+            context(
+                "repeat 1 block",
+                map(block("{+", "+}"), |b| {
+                    Block::Repeat1(Box::new(Block::List(b)))
+                }),
+            ),
+            context(
+                "optional block",
+                map(block("{?", "?}"), |b| Block::Opt(Box::new(Block::List(b)))),
+            ),
             context("auto line", message(Some("A:"), Block::AutoMessage)),
+            context("auto repeat 0 line", auto_repeat_0),
+            context("auto repeat 1 line", auto_repeat_1),
+            context("auto optional", auto_optional),
             context("comment line", comment),
             context(
                 "client lines",
@@ -194,22 +218,57 @@ fn block<'a>(
     )
 }
 
-// fn multiblock(
-//     opening: &'static str,
-//     closing: &'static str,
-//     sep: &'static str,
-// ) -> IResult<Vec<Vec<Block>>> {
-//     todo!()
-// }
+// TODO: add tests
+fn multiblock<'a>(
+    opening: &'static str,
+    closing: &'static str,
+    sep: &'static str,
+) -> impl FnMut(&'a str) -> IResult<'a, Vec<Block>> {
+    preceded(
+        terminated(tag(opening), end_of_line),
+        terminated(
+            separated_list1(
+                terminated(tag(sep), end_of_line),
+                map(many1(scan_block), Block::List),
+            ),
+            preceded(space0, terminated(tag(closing), end_of_line)),
+        ),
+    )
+}
 
 // ###############
 // Syntactic Sugar
 // ###############
-fn optional(input: &str) -> IResult<Block> {
+// TODO: add tests
+fn auto_repeat_0(input: &str) -> IResult<Block> {
     let (input, (message, args)) = prefixed_line(Some("*:"))(input)?;
     Ok((
         input,
         Block::Repeat0(Box::new(Block::AutoMessage(
+            message.into(),
+            args.map(Into::into),
+        ))),
+    ))
+}
+
+// TODO: add tests
+fn auto_repeat_1(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(Some("+:"))(input)?;
+    Ok((
+        input,
+        Block::Repeat1(Box::new(Block::AutoMessage(
+            message.into(),
+            args.map(Into::into),
+        ))),
+    ))
+}
+
+// TODO: add tests
+fn auto_optional(input: &str) -> IResult<Block> {
+    let (input, (message, args)) = prefixed_line(Some("?:"))(input)?;
+    Ok((
+        input,
+        Block::Opt(Box::new(Block::AutoMessage(
             message.into(),
             args.map(Into::into),
         ))),
