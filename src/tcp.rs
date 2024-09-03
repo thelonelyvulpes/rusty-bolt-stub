@@ -14,15 +14,8 @@ impl Server<'_> {
         }
     }
 
-    pub fn start(&mut self) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(self.address)?;
-        if self.server_script_cfg.allow_concurrent {
-            // start the server so that it concurrently accepts connections
-        } else if self.server_script_cfg.allow_restart {
-            // start the server in a way that lets it run 1 connection at a time
-        } else {
-            // start the server in a 1 pass
-        }
+    pub async fn start(&mut self) -> anyhow::Result<()> {
+        //Create tokio runtime
         Ok(())
     }
 }

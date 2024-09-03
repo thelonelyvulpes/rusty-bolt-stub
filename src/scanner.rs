@@ -245,11 +245,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::{scanner, BangLine};
     use super::{message, multi_message};
-    use crate::Block;
 
     use rstest::rstest;
+    use crate::scanner;
+    use crate::types::BangLine;
 
     #[test]
     fn test_scan_minimal_script() {

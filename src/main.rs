@@ -9,6 +9,7 @@ mod types;
 use anyhow::Context;
 use clap::Parser;
 use std::io::Read;
+use std::sync::OnceLock;
 
 const LISTEN_ADDR_HELP: &'static str = "The base address on which to listen for incoming \
 connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localhost'. Each script \
@@ -31,22 +32,23 @@ struct StubArgs {
     verbose: bool,
     script: String,
 }
+static SCRIPT: OnceLock<&str> = OnceLock::new();
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = StubArgs::parse();
+    let script_text = std::fs::read_to_string(&args.script).with_context(|| {
+        format!("Failed to read script file: {}", &args.script)
+    })?;
+    let a = Box::new(script_text);
+    Box::leak(a);
 
-    let script = std::fs::read_to_string(&args.script)
-        .with_context(|| format!("Failed to read script file '{}'", args.script))?;
 
-    let output = scanner::scan_script(&script, args.script.into())
-        .with_context(|| format!("Failed to scan script file '{}'", args.script))?;
+    let output = scanner::scan_script(*SCRIPT.get().unwrap(), args.script.into())?;
 
-    let engine = parser::parse(output)
-        .with_context(|| format!("Failed to parse script file '{}'", args.script))?;
+    let engine = parser::parse(output)?;
 
-    let mut server = server::Server::new(&args.listen_addr, &engine);
+    let mut server = tcp::Server::new(&args.listen_addr, &engine);
 
-    server
-        .start()
-        .with_context(|| format!("Failed to run server for script file '{}'", args.script))
+    server.start().await
 }
