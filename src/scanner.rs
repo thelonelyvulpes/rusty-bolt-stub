@@ -1,4 +1,4 @@
-use crate::{BangLine, Block, Script};
+use crate::types::{BangLine, Block, Script};
 use anyhow::anyhow;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
@@ -15,13 +15,13 @@ use nom_supreme::error::ErrorTree;
 type PError<I> = ErrorTree<I>;
 type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
 
-pub fn scan_script<'a>(input: &'a str, name: &str) -> Result<Script, nom::Err<PError<&'a str>>> {
+pub fn scan_script<'a>(input: &'a str, name: String) -> Result<Script, nom::Err<PError<&'a str>>> {
     let (input, bangs) =
         terminated(context("Bang line headers", scan_bang_lines), multispace0)(input)?;
 
     if input.is_empty() && bangs.iter().any(|x| matches!(x, BangLine::Version(_, _))) {
         return Ok(Script {
-            name: name.into(),
+            name,
             bang_lines: bangs,
             body: Block::List(vec![]),
         });
@@ -71,7 +71,7 @@ fn bolt_version_bang_line(input: &str) -> IResult<BangLine> {
                     map(separated_pair(u8, tag("."), u8), |(major, minor)| {
                         BangLine::Version(major, Some(minor))
                     }),
-                    map(u8, |major| { BangLine::Version(major, None)})
+                    map(u8, |major| BangLine::Version(major, None)),
                 )),
                 end_of_line,
             ),
@@ -317,7 +317,10 @@ mod tests {
         let result = dbg!(scanner::scan_script(input, "test.script"));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
-        assert_eq!(result.bang_lines.get(0), Some(&BangLine::Version(5, Some(4))));
+        assert_eq!(
+            result.bang_lines.get(0),
+            Some(&BangLine::Version(5, Some(4)))
+        );
         assert_eq!(
             result.bang_lines.get(1),
             Some(&BangLine::Auto("Nonsense".into()))

@@ -1,90 +1,52 @@
 // TODO: remove when rapid PoC phase is over
 #![allow(dead_code)]
 
+mod parser;
 mod scanner;
+mod tcp;
+mod types;
 
-fn main() {
-    // let input = "!: BOLT 5.5";
+use anyhow::Context;
+use clap::Parser;
+use std::io::Read;
+
+const LISTEN_ADDR_HELP: &'static str = "The base address on which to listen for incoming \
+connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localhost'. Each script \
+(which doesn't specify an explicit port number) will use subsequent ports. If completely omitted, \
+this defaults to ':17687'.";
+const TIMEOUT_HELP: &'static str = "The number of seconds for which the stub server will run \
+before automatically terminating. If unspecified, the server will wait for 30 seconds.";
+
+#[derive(Parser)]
+struct StubArgs {
+    #[arg(short, long, default_value_t=30.0, help=TIMEOUT_HELP)]
+    timeout: f32,
+    #[arg(long="listen-addr", short, default_value=":17687", help=LISTEN_ADDR_HELP)]
+    listen_addr: String,
+    #[arg(
+        short,
+        long,
+        help = "Show more detail about the client-server exchange."
+    )]
+    verbose: bool,
+    script: String,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-enum BangLine {
-    Version(u8, Option<u8>),
-    AllowRestart,
-    Auto(String),
-    Concurrent,
-    Handshake(Vec<u8>),
-    HandshakeDelay(f64),
-    Python(String),
-}
+fn main() -> anyhow::Result<()> {
+    let args = StubArgs::parse();
 
-#[derive(Debug, Eq, PartialEq, Clone)]
-enum BoltVersion {
-    V3_5,
-    V4_0,
-    V4_1,
-    V4_2,
-    V4_3,
-    V4_4,
-    V5_0,
-    V5_1,
-    V5_2,
-    V5_3,
-    V5_4,
-    V5_5,
-}
+    let script = std::fs::read_to_string(&args.script)
+        .with_context(|| format!("Failed to read script file '{}'", args.script))?;
 
-impl BoltVersion {
-    pub(crate) fn match_valid_version(major: u8, minor: u8) -> Option<Self> {
-        Some(match (major, minor) {
-            (3, 5) => BoltVersion::V3_5,
-            (4, 0) => BoltVersion::V4_0,
-            (4, 1) => BoltVersion::V4_1,
-            (4, 2) => BoltVersion::V4_2,
-            (4, 3) => BoltVersion::V4_3,
-            (4, 4) => BoltVersion::V4_4,
-            (5, 0) => BoltVersion::V5_0,
-            (5, 1) => BoltVersion::V5_1,
-            (5, 2) => BoltVersion::V5_2,
-            (5, 3) => BoltVersion::V5_3,
-            (5, 4) => BoltVersion::V5_4,
-            (5, 5) => BoltVersion::V5_5,
-            _ => return None,
-        })
-    }
-}
+    let output = scanner::scan_script(&script, args.script.into())
+        .with_context(|| format!("Failed to scan script file '{}'", args.script))?;
 
-#[derive(Debug)]
-struct Script {
-    name: String,
-    bang_lines: Vec<BangLine>,
-    body: Block,
-}
+    let engine = parser::parse(output)
+        .with_context(|| format!("Failed to parse script file '{}'", args.script))?;
 
-#[derive(Debug, Eq, PartialEq)]
-enum Block {
-    List(Vec<Block>),
-    Alt(Vec<Block>),
-    Opt(Box<Block>),
-    Repeat0(Box<Block>),
-    Repeat1(Box<Block>),
-    ClientMessage(String, Option<String>),
-    ServerMessage(String, Option<String>),
-    AutoMessage(String, Option<String>),
-    Comment,
-    Python(String),
-    Condition(CompositeConditionBlock),
-}
+    let mut server = server::Server::new(&args.listen_addr, &engine);
 
-#[derive(Debug, Eq, PartialEq)]
-struct CompositeConditionBlock {
-    if_: Box<ConditionBranch>,
-    elif_: Vec<ConditionBranch>,
-    else_: Option<Box<Block>>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ConditionBranch {
-    condition: String,
-    body: Block,
+    server
+        .start()
+        .with_context(|| format!("Failed to run server for script file '{}'", args.script))
 }
