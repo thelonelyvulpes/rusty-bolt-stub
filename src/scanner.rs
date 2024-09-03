@@ -59,6 +59,9 @@ fn scan_bang_lines(input: &str) -> IResult<Vec<BangLine>> {
             "allow concurrent",
             simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
         ),
+        // TODO: add delay handshake
+        //       handshake bytes
+        //       python line
     )))(input)
 }
 
@@ -156,6 +159,7 @@ fn scan_block(input: &str) -> IResult<Block> {
                 "python lines",
                 message_simple_content(Some("PY:"), Block::Python),
             ),
+            // TODO: Add IF, ELSE and ELIF blocks
             context(
                 "client lines",
                 multi_message(Some("C:"), Block::ClientMessage),

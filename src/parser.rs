@@ -1,15 +1,29 @@
-use crate::types::Script;
+use crate::types::{Block, Script};
+use crate::types::actor_types::ActorBlock;
 
-pub struct Engine {
-    pub allow_restart: bool,
-    pub allow_concurrent: bool,
+pub struct Actor {
+    pub config: ActorConfig,
+    pub tree: ActorBlock,
     pub script: Script,
 }
 
-pub fn parse(script: Script) -> anyhow::Result<Engine> {
-    Ok(Engine {
-        allow_restart: false,
-        allow_concurrent: false,
+pub struct ActorConfig {
+}
+
+pub fn parse(script: Script) -> anyhow::Result<Actor> {
+    let config = ActorConfig {
+
+    };
+
+    let tree = parse_body(&script.body)?;
+
+    Ok(Actor {
+        config,
+        tree,
         script,
     })
+}
+
+fn parse_body(block: &Block) -> anyhow::Result<ActorBlock> {
+    panic!("Not implemented")
 }

@@ -1,3 +1,4 @@
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum BangLine {
     Version(u8, Option<u8>),
@@ -79,4 +80,13 @@ pub struct CompositeConditionBlock {
 pub struct ConditionBranch {
     condition: String,
     body: Block,
+}
+
+pub mod actor_types {
+    use crate::values::ClientMessage;
+
+    pub enum ActorBlock {
+        BlockList(Vec<ActorBlock>),
+        ClientMessageValidate(Box<dyn Fn(ClientMessage) -> bool>)
+    }
 }

@@ -1,13 +1,13 @@
-use crate::parser::Engine;
+use crate::parser::Actor;
 use std::net::TcpListener;
 
 pub struct Server<'a> {
     address: &'a str,
-    server_script_cfg: &'a Engine,
+    server_script_cfg: &'a Actor,
 }
 
 impl Server<'_> {
-    pub fn new<'a>(address: &'a str, server_script_cfg: &'a Engine) -> Server<'a> {
+    pub fn new<'a>(address: &'a str, server_script_cfg: &'a Actor) -> Server<'a> {
         Server {
             address,
             server_script_cfg,

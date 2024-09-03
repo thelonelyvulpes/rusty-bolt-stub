@@ -5,10 +5,10 @@ mod parser;
 mod scanner;
 mod tcp;
 mod types;
+mod values;
 
 use anyhow::Context;
 use clap::Parser;
-use std::io::Read;
 use std::sync::OnceLock;
 
 const LISTEN_ADDR_HELP: &'static str = "The base address on which to listen for incoming \
