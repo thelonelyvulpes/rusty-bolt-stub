@@ -47,9 +47,9 @@ impl BoltVersion {
 
 #[derive(Debug)]
 pub struct Script {
-    name: String,
-    bang_lines: Vec<BangLine>,
-    body: Block,
+    pub(crate) name: String,
+    pub(crate) bang_lines: Vec<BangLine>,
+    pub(crate) body: Block,
 }
 
 #[derive(Debug, Eq, PartialEq)]

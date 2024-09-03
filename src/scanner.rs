@@ -247,21 +247,21 @@ where
 mod tests {
     use super::{message, multi_message};
 
-    use rstest::rstest;
     use crate::scanner;
-    use crate::types::BangLine;
+    use crate::types::{BangLine, Block};
+    use rstest::rstest;
 
     #[test]
     fn test_scan_minimal_script() {
         let input = "!: BOLT 5.5\n";
-        let result = dbg!(scanner::scan_script(input, "test.script"));
+        let result = dbg!(scanner::scan_script(input, "test.script".into()));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_failing_scan() {
         let input = "!: BOLT 5.4\n\nF: NOPE foo\n";
-        let result = dbg!(scanner::scan_script(input, "test.script"));
+        let result = dbg!(scanner::scan_script(input, "test.script".into()));
         assert!(result.is_err());
         println!("{:}", result.unwrap_err());
     }
@@ -303,7 +303,7 @@ mod tests {
         #[values(1, 3)] repetition: usize,
     ) {
         let input = input.repeat(repetition);
-        let result = dbg!(scanner::scan_script(input.as_str(), "test.script"));
+        let result = dbg!(scanner::scan_script(input.as_str(), "test.script".into()));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), repetition);
         for bl in result.bang_lines.iter() {
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn test_scan_multiple_bangs() {
         let input = "!: BOLT 5.4\n!: AUTO Nonsense\n!: ALLOW RESTART\n";
-        let result = dbg!(scanner::scan_script(input, "test.script"));
+        let result = dbg!(scanner::scan_script(input, "test.script".into()));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
         assert_eq!(
@@ -337,7 +337,10 @@ mod tests {
 
     #[test]
     fn test_auto_bang_line_script() {
-        let result = dbg!(scanner::scan_script("!: AUTO Nonsense\n", "test.script"));
+        let result = dbg!(scanner::scan_script(
+            "!: AUTO Nonsense\n",
+            "test.script".into()
+        ));
         let result = result.unwrap();
         assert_eq!(
             result.bang_lines.get(0),
