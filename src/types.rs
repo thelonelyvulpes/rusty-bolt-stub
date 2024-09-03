@@ -56,6 +56,7 @@ pub struct Script {
 pub enum Block {
     List(Vec<Block>),
     Alt(Vec<Block>),
+    Parallel(Vec<Block>),
     Opt(Box<Block>),
     Repeat0(Box<Block>),
     Repeat1(Box<Block>),

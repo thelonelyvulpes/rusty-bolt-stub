@@ -104,6 +104,13 @@ fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<'a, &'a
 // ##########
 //    Body
 // ##########
+fn wrap_block_vec(blocks: Vec<Block>) -> Block {
+    match blocks.len() {
+        1 => blocks.into_iter().next().unwrap(),
+        _ => Block::List(blocks),
+    }
+}
+
 fn scan_body(input: &str) -> IResult<Block> {
     let (input, blocks) = many1(scan_block)(input)?;
     Ok((input, Block::List(blocks)))
@@ -117,28 +124,38 @@ fn scan_block(input: &str) -> IResult<Block> {
                 "alternative block",
                 map(multiblock("{{", "}}", "----"), Block::Alt),
             ),
-            context("simple block", map(block("{{", "}}"), Block::List)),
+            context(
+                "parallel block",
+                map(multiblock("{{", "}}", "++++"), Block::Parallel),
+            ),
+            context("simple block", map(block("{{", "}}"), wrap_block_vec)),
             context(
                 "repeat 0 block",
                 map(block("{*", "*}"), |b| {
-                    Block::Repeat0(Box::new(Block::List(b)))
+                    Block::Repeat0(Box::new(wrap_block_vec(b)))
                 }),
             ),
             context(
                 "repeat 1 block",
                 map(block("{+", "+}"), |b| {
-                    Block::Repeat1(Box::new(Block::List(b)))
+                    Block::Repeat1(Box::new(wrap_block_vec(b)))
                 }),
             ),
             context(
                 "optional block",
-                map(block("{?", "?}"), |b| Block::Opt(Box::new(Block::List(b)))),
+                map(block("{?", "?}"), |b| {
+                    Block::Opt(Box::new(wrap_block_vec(b)))
+                }),
             ),
             context("auto line", message(Some("A:"), Block::AutoMessage)),
             context("auto repeat 0 line", auto_repeat_0),
             context("auto repeat 1 line", auto_repeat_1),
             context("auto optional", auto_optional),
             context("comment line", comment),
+            context(
+                "python lines",
+                message_simple_content(Some("PY:"), Block::Python),
+            ),
             context(
                 "client lines",
                 multi_message(Some("C:"), Block::ClientMessage),
@@ -193,7 +210,8 @@ fn multi_message<'a>(
                 Option::unwrap_or_default,
             ),
         )(input)?;
-        Ok((input, Block::List(head.into_iter().chain(tail).collect())))
+        let blocks = head.into_iter().chain(tail).collect();
+        Ok((input, wrap_block_vec(blocks)))
     }
 }
 
@@ -212,12 +230,33 @@ fn prefixed_line<'a>(
     preceded(
         cond(
             prefix.is_some(),
-            terminated(tag(prefix.unwrap_or("")), multispace0),
+            terminated(tag(prefix.unwrap_or("")), space0),
         ),
         pair(
             alpha1,
             terminated(opt(preceded(space1, rest_of_line)), multispace0),
         ),
+    )
+}
+
+fn message_simple_content<'a>(
+    tag: Option<&'static str>,
+    mut block: impl FnMut(String) -> Block,
+) -> impl FnMut(&'a str) -> IResult<Block> {
+    map(prefixed_line_simple_content(tag), move |content| {
+        block(content.into())
+    })
+}
+
+fn prefixed_line_simple_content<'a>(
+    prefix: Option<&'static str>,
+) -> impl FnMut(&'a str) -> IResult<&'a str> {
+    preceded(
+        cond(
+            prefix.is_some(),
+            terminated(tag(prefix.unwrap_or("")), space0),
+        ),
+        terminated(preceded(space0, rest_of_line), multispace0),
     )
 }
 
@@ -252,7 +291,7 @@ fn multiblock<'a>(
         terminated(
             separated_list1(
                 terminated(tag(sep), end_of_line),
-                map(many1(scan_block), Block::List),
+                map(many1(scan_block), wrap_block_vec),
             ),
             preceded(space0, terminated(tag(closing), end_of_line)),
         ),
@@ -505,6 +544,17 @@ mod tests {
         assert_eq!(block, Block::Comment);
     }
 
+    #[rstest]
+    fn test_python_line() {
+        let input = "PY: print('Hello, World!')";
+        let result = dbg!(scanner::message_simple_content(Some("PY:"), Block::Python)(
+            input
+        ));
+        let (rem, block) = result.unwrap();
+        assert_eq!(rem, "");
+        assert_eq!(block, Block::Python("print('Hello, World!')".into()));
+    }
+
     // #################
     // Logic/Flow Blocks
     // #################
@@ -517,8 +567,8 @@ mod tests {
         assert_eq!(
             blocks,
             vec![
-                Block::List(vec![Block::ClientMessage("RUN".into(), None)]),
-                Block::List(vec![Block::ServerMessage("OK".into(), None)]),
+                Block::ClientMessage("RUN".into(), None),
+                Block::ServerMessage("OK".into(), None),
             ]
         );
     }
