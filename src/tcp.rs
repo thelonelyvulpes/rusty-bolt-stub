@@ -1,5 +1,4 @@
 use crate::parser::Actor;
-use std::net::TcpListener;
 
 pub struct Server<'a> {
     address: &'a str,

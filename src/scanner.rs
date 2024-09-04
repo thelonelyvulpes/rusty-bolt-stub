@@ -1,4 +1,4 @@
-use crate::types::{BangLine, Block, Script};
+use crate::types::{BangLine, ScanBlock, Script};
 use anyhow::anyhow;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
@@ -11,7 +11,6 @@ use nom::multi::{many1, many_till, separated_list1};
 use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom::Parser;
 use nom_supreme::error::ErrorTree;
-use nom_supreme::ParserExt;
 
 type PError<I> = ErrorTree<I>;
 type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
@@ -24,7 +23,7 @@ pub fn scan_script<'a>(input: &'a str, name: String) -> Result<Script, nom::Err<
         return Ok(Script {
             name,
             bang_lines: bangs,
-            body: Block::List(vec![]),
+            body: ScanBlock::List(vec![]),
         });
     };
 
@@ -40,7 +39,7 @@ pub fn scan_script<'a>(input: &'a str, name: String) -> Result<Script, nom::Err<
     Ok(Script {
         name: name.into(),
         bang_lines: bangs,
-        body: body.unwrap_or(Block::List(vec![])),
+        body: body.unwrap_or(ScanBlock::List(vec![])),
     })
 }
 
@@ -107,66 +106,66 @@ fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<'a, &'a
 // ##########
 //    Body
 // ##########
-fn wrap_block_vec(blocks: Vec<Block>) -> Block {
+fn wrap_block_vec(blocks: Vec<ScanBlock>) -> ScanBlock {
     match blocks.len() {
         1 => blocks.into_iter().next().unwrap(),
-        _ => Block::List(blocks),
+        _ => ScanBlock::List(blocks),
     }
 }
 
-fn scan_body(input: &str) -> IResult<Block> {
+fn scan_body(input: &str) -> IResult<ScanBlock> {
     let (input, blocks) = many1(scan_block)(input)?;
-    Ok((input, Block::List(blocks)))
+    Ok((input, ScanBlock::List(blocks)))
 }
 
-fn scan_block(input: &str) -> IResult<Block> {
+fn scan_block(input: &str) -> IResult<ScanBlock> {
     preceded(
         multispace0,
         alt((
             context(
                 "alternative block",
-                map(multiblock("{{", "}}", "----"), Block::Alt),
+                map(multiblock("{{", "}}", "----"), ScanBlock::Alt),
             ),
             context(
                 "parallel block",
-                map(multiblock("{{", "}}", "++++"), Block::Parallel),
+                map(multiblock("{{", "}}", "++++"), ScanBlock::Parallel),
             ),
             context("simple block", map(block("{{", "}}"), wrap_block_vec)),
             context(
                 "repeat 0 block",
                 map(block("{*", "*}"), |b| {
-                    Block::Repeat0(Box::new(wrap_block_vec(b)))
+                    ScanBlock::Repeat0(Box::new(wrap_block_vec(b)))
                 }),
             ),
             context(
                 "repeat 1 block",
                 map(block("{+", "+}"), |b| {
-                    Block::Repeat1(Box::new(wrap_block_vec(b)))
+                    ScanBlock::Repeat1(Box::new(wrap_block_vec(b)))
                 }),
             ),
             context(
                 "optional block",
                 map(block("{?", "?}"), |b| {
-                    Block::Opt(Box::new(wrap_block_vec(b)))
+                    ScanBlock::Opt(Box::new(wrap_block_vec(b)))
                 }),
             ),
-            context("auto line", message(Some("A:"), Block::AutoMessage)),
+            context("auto line", message(Some("A:"), ScanBlock::AutoMessage)),
             context("auto repeat 0 line", auto_repeat_0),
             context("auto repeat 1 line", auto_repeat_1),
             context("auto optional", auto_optional),
             context("comment line", comment),
             context(
                 "python lines",
-                message_simple_content(Some("PY:"), Block::Python),
+                message_simple_content(Some("PY:"), ScanBlock::Python),
             ),
             // TODO: Add IF, ELSE and ELIF blocks
             context(
                 "client lines",
-                multi_message(Some("C:"), Block::ClientMessage),
+                multi_message(Some("C:"), ScanBlock::ClientMessage),
             ),
             context(
                 "server lines",
-                multi_message(Some("S:"), Block::ServerMessage),
+                multi_message(Some("S:"), ScanBlock::ServerMessage),
             ),
         )),
     )(input)
@@ -199,8 +198,8 @@ fn keyword(input: &str) -> IResult<()> {
 // ############
 fn multi_message<'a>(
     message_tag: Option<&'static str>,
-    mut block: impl FnMut(String, Option<String>) -> Block,
-) -> impl FnMut(&'a str) -> IResult<Block> {
+    mut block: impl FnMut(String, Option<String>) -> ScanBlock,
+) -> impl FnMut(&'a str) -> IResult<ScanBlock> {
     move |input| {
         let (input, head) =
             many1(context("explicit line", message(message_tag, &mut block)))(input)?;
@@ -221,8 +220,8 @@ fn multi_message<'a>(
 
 fn message<'a>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(String, Option<String>) -> Block,
-) -> impl FnMut(&'a str) -> IResult<Block> {
+    mut block: impl FnMut(String, Option<String>) -> ScanBlock,
+) -> impl FnMut(&'a str) -> IResult<ScanBlock> {
     map(prefixed_line(tag), move |(message, args)| {
         block(message.into(), args.map(Into::into))
     })
@@ -245,8 +244,8 @@ fn prefixed_line<'a>(
 
 fn message_simple_content<'a>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(String) -> Block,
-) -> impl FnMut(&'a str) -> IResult<Block> {
+    mut block: impl FnMut(String) -> ScanBlock,
+) -> impl FnMut(&'a str) -> IResult<ScanBlock> {
     map(prefixed_line_simple_content(tag), move |content| {
         block(content.into())
     })
@@ -264,8 +263,8 @@ fn prefixed_line_simple_content<'a>(
     )
 }
 
-fn comment(input: &str) -> IResult<Block> {
-    map(preceded(tag("#"), rest_of_line), |_| Block::Comment)(input)
+fn comment(input: &str) -> IResult<ScanBlock> {
+    map(preceded(tag("#"), rest_of_line), |_| ScanBlock::Comment)(input)
 }
 
 // #################
@@ -274,7 +273,7 @@ fn comment(input: &str) -> IResult<Block> {
 fn block<'a>(
     opening: &'static str,
     closing: &'static str,
-) -> impl FnMut(&'a str) -> IResult<'a, Vec<Block>> {
+) -> impl FnMut(&'a str) -> IResult<'a, Vec<ScanBlock>> {
     preceded(
         terminated(tag(opening), end_of_line),
         terminated(
@@ -289,7 +288,7 @@ fn multiblock<'a>(
     opening: &'static str,
     closing: &'static str,
     sep: &'static str,
-) -> impl FnMut(&'a str) -> IResult<'a, Vec<Block>> {
+) -> impl FnMut(&'a str) -> IResult<'a, Vec<ScanBlock>> {
     preceded(
         terminated(tag(opening), end_of_line),
         terminated(
@@ -306,11 +305,11 @@ fn multiblock<'a>(
 // Syntactic Sugar
 // ###############
 // TODO: add tests
-fn auto_repeat_0(input: &str) -> IResult<Block> {
+fn auto_repeat_0(input: &str) -> IResult<ScanBlock> {
     let (input, (message, args)) = prefixed_line(Some("*:"))(input)?;
     Ok((
         input,
-        Block::Repeat0(Box::new(Block::AutoMessage(
+        ScanBlock::Repeat0(Box::new(ScanBlock::AutoMessage(
             message.into(),
             args.map(Into::into),
         ))),
@@ -318,11 +317,11 @@ fn auto_repeat_0(input: &str) -> IResult<Block> {
 }
 
 // TODO: add tests
-fn auto_repeat_1(input: &str) -> IResult<Block> {
+fn auto_repeat_1(input: &str) -> IResult<ScanBlock> {
     let (input, (message, args)) = prefixed_line(Some("+:"))(input)?;
     Ok((
         input,
-        Block::Repeat1(Box::new(Block::AutoMessage(
+        ScanBlock::Repeat1(Box::new(ScanBlock::AutoMessage(
             message.into(),
             args.map(Into::into),
         ))),
@@ -330,11 +329,11 @@ fn auto_repeat_1(input: &str) -> IResult<Block> {
 }
 
 // TODO: add tests
-fn auto_optional(input: &str) -> IResult<Block> {
+fn auto_optional(input: &str) -> IResult<ScanBlock> {
     let (input, (message, args)) = prefixed_line(Some("?:"))(input)?;
     Ok((
         input,
-        Block::Opt(Box::new(Block::AutoMessage(
+        ScanBlock::Opt(Box::new(ScanBlock::AutoMessage(
             message.into(),
             args.map(Into::into),
         ))),
@@ -373,7 +372,7 @@ mod tests {
     use super::{message, multi_message};
 
     use crate::scanner;
-    use crate::types::{BangLine, Block};
+    use crate::types::{BangLine, ScanBlock};
     use rstest::rstest;
 
     #[test]
@@ -498,13 +497,13 @@ mod tests {
         #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n", "\n?}", "\n?}")] ending: &'static str,
     ) {
         let input = format!("{input}{ending}");
-        let (rem, block) = multi_message(Some("C:"), Block::ClientMessage)(&input).unwrap();
+        let (rem, block) = multi_message(Some("C:"), ScanBlock::ClientMessage)(&input).unwrap();
         assert_eq!(rem, ending.trim_start());
         assert_eq!(
             block,
-            Block::List(vec![
-                Block::ClientMessage("Foo".into(), Some("a b".into())),
-                Block::ClientMessage("Bar".into(), Some("lel lol".into()))
+            ScanBlock::List(vec![
+                ScanBlock::ClientMessage("Foo".into(), Some("a b".into())),
+                ScanBlock::ClientMessage("Bar".into(), Some("lel lol".into()))
             ])
         );
     }
@@ -515,10 +514,10 @@ mod tests {
     #[case::trailing("C: RUN  ")]
     #[case::messy("C:   RUN  ")]
     fn test_client_message_with_no_args(#[case] input: &str) {
-        let result = message(Some("C:"), Block::ClientMessage)(input);
+        let result = message(Some("C:"), ScanBlock::ClientMessage)(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(block, Block::ClientMessage("RUN".into(), None));
+        assert_eq!(block, ScanBlock::ClientMessage("RUN".into(), None));
     }
 
     #[rstest]
@@ -527,12 +526,12 @@ mod tests {
     #[case::trailing("C: RUN foo bar  ")]
     #[case::messy("C:  RUN   foo bar  ")]
     fn test_client_message_con_args(#[case] input: &str) {
-        let result = message(Some("C:"), Block::ClientMessage)(input);
+        let result = message(Some("C:"), ScanBlock::ClientMessage)(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(
             block,
-            Block::ClientMessage("RUN".into(), Some("foo bar".into()))
+            ScanBlock::ClientMessage("RUN".into(), Some("foo bar".into()))
         );
     }
 
@@ -545,18 +544,18 @@ mod tests {
         let result = scanner::comment(input);
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(block, Block::Comment);
+        assert_eq!(block, ScanBlock::Comment);
     }
 
     #[rstest]
     fn test_python_line() {
         let input = "PY: print('Hello, World!')";
-        let result = dbg!(scanner::message_simple_content(Some("PY:"), Block::Python)(
+        let result = dbg!(scanner::message_simple_content(Some("PY:"), ScanBlock::Python)(
             input
         ));
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
-        assert_eq!(block, Block::Python("print('Hello, World!')".into()));
+        assert_eq!(block, ScanBlock::Python("print('Hello, World!')".into()));
     }
 
     // #################
@@ -571,8 +570,8 @@ mod tests {
         assert_eq!(
             blocks,
             vec![
-                Block::ClientMessage("RUN".into(), None),
-                Block::ServerMessage("OK".into(), None),
+                ScanBlock::ClientMessage("RUN".into(), None),
+                ScanBlock::ServerMessage("OK".into(), None),
             ]
         );
     }

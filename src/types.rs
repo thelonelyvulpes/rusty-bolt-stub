@@ -50,17 +50,17 @@ impl BoltVersion {
 pub struct Script {
     pub(crate) name: String,
     pub(crate) bang_lines: Vec<BangLine>,
-    pub(crate) body: Block,
+    pub(crate) body: ScanBlock,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum Block {
-    List(Vec<Block>),
-    Alt(Vec<Block>),
-    Parallel(Vec<Block>),
-    Opt(Box<Block>),
-    Repeat0(Box<Block>),
-    Repeat1(Box<Block>),
+pub enum ScanBlock {
+    List(Vec<ScanBlock>),
+    Alt(Vec<ScanBlock>),
+    Parallel(Vec<ScanBlock>),
+    Opt(Box<ScanBlock>),
+    Repeat0(Box<ScanBlock>),
+    Repeat1(Box<ScanBlock>),
     ClientMessage(String, Option<String>),
     ServerMessage(String, Option<String>),
     AutoMessage(String, Option<String>),
@@ -73,20 +73,42 @@ pub enum Block {
 pub struct CompositeConditionBlock {
     if_: Box<ConditionBranch>,
     elif_: Vec<ConditionBranch>,
-    else_: Option<Box<Block>>,
+    else_: Option<Box<ScanBlock>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ConditionBranch {
     condition: String,
-    body: Block,
+    body: ScanBlock,
 }
 
+
 pub mod actor_types {
+    use tokio::net::TcpStream;
     use crate::values::ClientMessage;
+
+    pub enum ValidationFault {
+        Fault(String),
+    }
+
+    pub trait ClientMessageValidator {
+        fn validate(&self, message: ClientMessage) -> anyhow::Result<()>;
+    }
+
+    pub trait ServerMessageSender {
+        fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()>;
+    }
+
+    pub trait AutoMessageHandler: ClientMessageValidator + ServerMessageSender {}
 
     pub enum ActorBlock {
         BlockList(Vec<ActorBlock>),
-        ClientMessageValidate(Box<dyn Fn(ClientMessage) -> bool>)
+        ClientMessageValidate(Box<dyn ClientMessageValidator>),
+        ServerMessageSend(Box<dyn ServerMessageSender>),
+        Alt(Vec<ActorBlock>),
+        Optional(Box<ActorBlock>),
+        Repeat(Box<ActorBlock>, usize),
+        AutoMessage(Box<dyn AutoMessageHandler>),
+        NoOp,
     }
 }
