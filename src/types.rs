@@ -4,7 +4,7 @@ pub enum BangLine {
     AllowRestart,
     Auto(String),
     Concurrent,
-    Handshake(Vec<u8>),
+    Handshake(String),
     HandshakeDelay(f64),
     Python(String),
 }

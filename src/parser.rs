@@ -1,8 +1,10 @@
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
 };
-use crate::types::{ScanBlock, Script};
-use anyhow::{Result};
+use crate::types::{BangLine, BoltVersion, ScanBlock, Script};
+use anyhow::Result;
+use itertools::Itertools;
+use std::time::Duration;
 use tokio::net::TcpStream;
 
 pub struct Actor {
@@ -11,17 +13,83 @@ pub struct Actor {
     pub script: Script,
 }
 
-pub struct ActorConfig {}
+pub struct ActorConfig {
+    pub bolt_version: BoltVersion,
+    pub allow_restart: bool,
+    pub allow_concurrent: bool,
+    pub handshake_delay: Option<Duration>,
+    pub handshake: Option<Vec<u8>>,
+}
 
 pub fn parse(script: Script) -> Result<Actor> {
-    let config = ActorConfig {};
-
+    let config = parse_config(&script.bang_lines)?;
     let tree = parse_block(&script.body, &config)?;
 
     Ok(Actor {
         config,
         tree,
         script,
+    })
+}
+
+fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
+    let mut bolt_version: Option<BoltVersion> = None;
+    let mut allow_restart: Option<bool> = None;
+    let mut allow_concurrent: Option<bool> = None;
+    let mut handshake: Option<Vec<u8>> = None;
+    let mut handshake_delay: Option<Duration> = None;
+
+    for bang_line in bang_lines {
+        match bang_line {
+            BangLine::Version(major, minor) => {
+                if bolt_version.is_some() {
+                    return Err(anyhow::anyhow!("Multiple BOLT version bang lines found"));
+                }
+                let bolt = BoltVersion::match_valid_version(*major, minor.unwrap_or_default())
+                    .ok_or(anyhow::anyhow!("Invalid BOLT version"))?;
+                bolt_version = Some(bolt);
+            }
+            BangLine::AllowRestart => {
+                if allow_restart.is_some() {
+                    return Err(anyhow::anyhow!("Multiple allow restart bang lines found"));
+                }
+                allow_restart = Some(true);
+            }
+            BangLine::Auto(_) => {
+                todo!("Auto blocks are not yet supported in the actor")
+            }
+            BangLine::Concurrent => {
+                if allow_concurrent.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "Multiple allow concurrent bang lines found"
+                    ));
+                }
+                allow_concurrent = Some(true);
+            }
+            BangLine::Handshake(byte_str) => {
+                if handshake.is_some() {
+                    return Err(anyhow::anyhow!("Multiple handshake bang lines found"));
+                }
+                todo!("Parse handshake bytes")
+            }
+            BangLine::HandshakeDelay(_) => {
+                todo!("Parse handshake delay")
+            }
+            BangLine::Python(_) => {
+                todo!("Python blocks are not yet supported in the actor")
+            }
+        }
+    }
+
+    let bolt_version = bolt_version.ok_or(anyhow::anyhow!("Bolt version not specified"))?;
+    let allow_restart = allow_restart.unwrap_or(false);
+    let allow_concurrent = allow_concurrent.unwrap_or(false);
+    Ok(ActorConfig {
+        bolt_version,
+        allow_restart,
+        allow_concurrent,
+        handshake,
+        handshake_delay,
     })
 }
 

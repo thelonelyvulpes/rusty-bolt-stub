@@ -42,10 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("Failed to read script file: {}", &args.script))?;
     SCRIPT.get_or_init(move || script_text);
 
-    let output = dbg!(scanner::scan_script(
-        SCRIPT.get().unwrap(),
-        args.script
-    )?);
+    let output = dbg!(scanner::scan_script(SCRIPT.get().unwrap(), args.script)?);
 
     let engine = parser::parse(output)?;
 
