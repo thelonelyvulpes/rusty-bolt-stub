@@ -1,6 +1,9 @@
-use anyhow::anyhow;
+use crate::types::actor_types::{
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
+};
 use crate::types::{ScanBlock, Script};
-use crate::types::actor_types::ActorBlock;
+use anyhow::{Result};
+use tokio::net::TcpStream;
 
 pub struct Actor {
     pub config: ActorConfig,
@@ -8,13 +11,10 @@ pub struct Actor {
     pub script: Script,
 }
 
-pub struct ActorConfig {
-}
+pub struct ActorConfig {}
 
-pub fn parse(script: Script) -> anyhow::Result<Actor> {
-    let config = ActorConfig {
-
-    };
+pub fn parse(script: Script) -> Result<Actor> {
+    let config = ActorConfig {};
 
     let tree = parse_block(&script.body, &config)?;
 
@@ -25,54 +25,110 @@ pub fn parse(script: Script) -> anyhow::Result<Actor> {
     })
 }
 
-fn parse_block(block: &ScanBlock, config: &ActorConfig) -> anyhow::Result<ActorBlock> {
+fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     match block {
-        ScanBlock::List(block_nodes) => {
-            let mut actor_nodes = Vec::with_capacity(block_nodes.len());
-            for node in block_nodes {
-                let b = parse_block(node, config)?;
+        ScanBlock::List(scan_blocks) => {
+            let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
+            for scan_block in scan_blocks {
+                let b = parse_block(scan_block, config)?;
                 if matches!(b, ActorBlock::NoOp) {
                     continue;
                 }
-                actor_nodes.push(b);
+                actor_blocks.push(b);
             }
-            match actor_nodes.len() {
+            validate_list_children(&actor_blocks)?;
+
+            match actor_blocks.len() {
                 0 => Ok(ActorBlock::NoOp),
-                1 => Ok(actor_nodes.remove(0)),
-                _ => Ok(ActorBlock::BlockList(actor_nodes)),
+                1 => Ok(actor_blocks.remove(0)),
+                _ => Ok(ActorBlock::BlockList(actor_blocks)),
             }
         }
-        ScanBlock::Alt(alt_blocks) => {
-            let mut actor_blocks = Vec::with_capacity(alt_blocks.len());
-            for block in alt_blocks {
+        ScanBlock::Alt(scan_blocks) => {
+            let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
+            for block in scan_blocks {
                 let b = parse_block(block, config)?;
-                if matches!(b, ActorBlock::NoOp) {
-                    // TODO: Improve error handling
-                    return Err(anyhow!("NoOp not allowed in Alt block"));
-                }
+                validate_alt_child(&b)?;
                 actor_blocks.push(b);
             }
             Ok(ActorBlock::Alt(actor_blocks))
         }
         ScanBlock::Parallel(_) => {
-            // TODO: implement parallel
-            Ok(ActorBlock::NoOp)
+            todo!("Parallel blocks are not yet supported in the actor")
         }
-        ScanBlock::Opt(b) => {
+        ScanBlock::Optional(optional_scan_block) => {
             // TODO: Handle bad optional blocks
-            Ok(ActorBlock::Optional(Box::new(parse_block(b, config)?)))
-        },
+            let b = parse_block(optional_scan_block, config)?;
+            validate_non_action(&b)?;
+            Ok(ActorBlock::Optional(Box::new(b)))
+        }
         ScanBlock::Repeat0(b) => Ok(ActorBlock::Repeat(Box::new(parse_block(b, config)?), 0)),
         ScanBlock::Repeat1(b) => Ok(ActorBlock::Repeat(Box::new(parse_block(b, config)?), 1)),
-        ScanBlock::ClientMessage(_, _) => {
-            panic!("ClientMessage not implemented");
-        },
-        ScanBlock::ServerMessage(_, _) => {
-            panic!("ServerMessage not implemented");
-        },
-        ScanBlock::AutoMessage(_, _) => Ok(ActorBlock::NoOp),
+        ScanBlock::ClientMessage(message_name, body_string) => {
+            let validator = create_validator(message_name, body_string, config)?;
+            Ok(ActorBlock::ClientMessageValidate(validator))
+        }
+        ScanBlock::ServerMessage(message_name, body_string) => {
+            let server_message_sender = create_message_sender(message_name, body_string, config)?;
+            Ok(ActorBlock::ServerMessageSend(server_message_sender))
+        }
+        ScanBlock::AutoMessage(client_message_name, client_body_string) => {
+            let validator = create_validator(client_message_name, client_body_string, config)?;
+            let server_message_sender = create_auto_message_sender(client_message_name, config)?;
+            Ok(ActorBlock::AutoMessage(AutoMessageHandler {
+                client_validator: validator,
+                server_sender: server_message_sender,
+            }))
+        }
         ScanBlock::Comment => Ok(ActorBlock::NoOp),
-        ScanBlock::Python(_) => Ok(ActorBlock::NoOp),
-        ScanBlock::Condition(_) => Ok(ActorBlock::NoOp),
+        ScanBlock::Python(_) => {
+            todo!("Python blocks are not yet supported in the actor")
+        }
+        ScanBlock::Condition(_) => {
+            todo!("Python blocks are not yet supported in the actor")
+        }
     }
+}
+
+fn create_auto_message_sender(
+    client_message_tag: &str,
+    config: &ActorConfig,
+) -> Result<Box<dyn ServerMessageSender>> {
+    todo!()
+}
+
+fn create_message_sender(
+    message_name: &str,
+    message_body: &Option<String>,
+    config: &ActorConfig,
+) -> Result<Box<dyn ServerMessageSender>> {
+    todo!()
+}
+
+fn create_validator(
+    expected_tag: &str,
+    expected_body_string: &Option<String>,
+    config: &ActorConfig,
+) -> Result<Box<dyn ClientMessageValidator>> {
+    todo!()
+}
+
+fn message_tag_from_name(tag_name: &str, config: &ActorConfig) -> Result<u8> {
+    todo!()
+}
+
+fn validate_non_action(p0: &ActorBlock) -> Result<()> {
+    todo!()
+}
+
+fn validate_list_children(blocks: &[ActorBlock]) -> Result<()> {
+    todo!()
+}
+
+fn validate_alt_child(b: &ActorBlock) -> Result<()> {
+    if matches!(b, ActorBlock::NoOp) {
+        // TODO: Improve error handling
+        return Err(anyhow::anyhow!("NoOp not allowed in Alt block"));
+    }
+    Ok(())
 }

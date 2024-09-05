@@ -11,11 +11,11 @@ use anyhow::Context;
 use clap::Parser;
 use std::sync::OnceLock;
 
-const LISTEN_ADDR_HELP: &'static str = "The base address on which to listen for incoming \
+const LISTEN_ADDR_HELP: &str = "The base address on which to listen for incoming \
 connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localhost'. Each script \
 (which doesn't specify an explicit port number) will use subsequent ports. If completely omitted, \
 this defaults to ':17687'.";
-const TIMEOUT_HELP: &'static str = "The number of seconds for which the stub server will run \
+const TIMEOUT_HELP: &str = "The number of seconds for which the stub server will run \
 before automatically terminating. If unspecified, the server will wait for 30 seconds.";
 
 #[derive(Parser)]
@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
     let output = dbg!(scanner::scan_script(
         SCRIPT.get().unwrap(),
-        args.script.into()
+        args.script
     )?);
 
     let engine = parser::parse(output)?;

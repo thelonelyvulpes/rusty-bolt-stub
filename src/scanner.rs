@@ -15,7 +15,7 @@ use nom_supreme::error::ErrorTree;
 type PError<I> = ErrorTree<I>;
 type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
 
-pub fn scan_script<'a>(input: &'a str, name: String) -> Result<Script, nom::Err<PError<&'a str>>> {
+pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<&str>>> {
     let (input, bangs) =
         terminated(context("Bang line headers", scan_bang_lines), multispace0)(input)?;
 
@@ -37,7 +37,7 @@ pub fn scan_script<'a>(input: &'a str, name: String) -> Result<Script, nom::Err<
     }
 
     Ok(Script {
-        name: name.into(),
+        name,
         bang_lines: bangs,
         body: body.unwrap_or(ScanBlock::List(vec![])),
     })
@@ -146,7 +146,7 @@ fn scan_block(input: &str) -> IResult<ScanBlock> {
             context(
                 "optional block",
                 map(block("{?", "?}"), |b| {
-                    ScanBlock::Opt(Box::new(wrap_block_vec(b)))
+                    ScanBlock::Optional(Box::new(wrap_block_vec(b)))
                 }),
             ),
             context("auto line", message(Some("A:"), ScanBlock::AutoMessage)),
@@ -333,7 +333,7 @@ fn auto_optional(input: &str) -> IResult<ScanBlock> {
     let (input, (message, args)) = prefixed_line(Some("?:"))(input)?;
     Ok((
         input,
-        ScanBlock::Opt(Box::new(ScanBlock::AutoMessage(
+        ScanBlock::Optional(Box::new(ScanBlock::AutoMessage(
             message.into(),
             args.map(Into::into),
         ))),
@@ -550,9 +550,10 @@ mod tests {
     #[rstest]
     fn test_python_line() {
         let input = "PY: print('Hello, World!')";
-        let result = dbg!(scanner::message_simple_content(Some("PY:"), ScanBlock::Python)(
-            input
-        ));
+        let result = dbg!(scanner::message_simple_content(
+            Some("PY:"),
+            ScanBlock::Python
+        )(input));
         let (rem, block) = result.unwrap();
         assert_eq!(rem, "");
         assert_eq!(block, ScanBlock::Python("print('Hello, World!')".into()));

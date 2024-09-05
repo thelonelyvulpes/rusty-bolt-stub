@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use crate::values::{spatial, time};
+use std::collections::HashMap;
 
 #[allow(unused)]
-
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ValueReceive {
@@ -72,8 +71,12 @@ impl ValueReceive {
             ValueReceive::Cartesian3D(v1) => {
                 matches!(other, ValueReceive::Cartesian3D(v2) if v1.eq_data(v2))
             }
-            ValueReceive::WGS84_2D(v1) => matches!(other, ValueReceive::WGS84_2D(v2) if v1.eq_data(v2)),
-            ValueReceive::WGS84_3D(v1) => matches!(other, ValueReceive::WGS84_3D(v2) if v1.eq_data(v2)),
+            ValueReceive::WGS84_2D(v1) => {
+                matches!(other, ValueReceive::WGS84_2D(v2) if v1.eq_data(v2))
+            }
+            ValueReceive::WGS84_3D(v1) => {
+                matches!(other, ValueReceive::WGS84_3D(v2) if v1.eq_data(v2))
+            }
             ValueReceive::Duration(v1) => matches!(other, ValueReceive::Duration(v2) if v1 == v2),
             ValueReceive::LocalTime(v1) => matches!(other, ValueReceive::LocalTime(v2) if v1 == v2),
             ValueReceive::Time(v1) => matches!(other, ValueReceive::Time(v2) if v1 == v2),

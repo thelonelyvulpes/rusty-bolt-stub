@@ -1,4 +1,3 @@
-
 #[derive(Debug, PartialEq, Clone)]
 pub enum BangLine {
     Version(u8, Option<u8>),
@@ -58,7 +57,7 @@ pub enum ScanBlock {
     List(Vec<ScanBlock>),
     Alt(Vec<ScanBlock>),
     Parallel(Vec<ScanBlock>),
-    Opt(Box<ScanBlock>),
+    Optional(Box<ScanBlock>),
     Repeat0(Box<ScanBlock>),
     Repeat1(Box<ScanBlock>),
     ClientMessage(String, Option<String>),
@@ -82,24 +81,43 @@ pub struct ConditionBranch {
     body: ScanBlock,
 }
 
-
 pub mod actor_types {
-    use tokio::net::TcpStream;
     use crate::values::ClientMessage;
-
-    pub enum ValidationFault {
-        Fault(String),
+    use tokio::net::TcpStream;
+    pub trait ScriptLine {
+        fn original_line(&self) -> &str;
     }
 
-    pub trait ClientMessageValidator {
+    pub trait ClientMessageValidator: ScriptLine {
         fn validate(&self, message: ClientMessage) -> anyhow::Result<()>;
     }
 
-    pub trait ServerMessageSender {
+    pub trait ServerMessageSender: ScriptLine {
         fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()>;
     }
 
-    pub trait AutoMessageHandler: ClientMessageValidator + ServerMessageSender {}
+    pub struct AutoMessageHandler {
+        pub(crate) client_validator: Box<dyn ClientMessageValidator>,
+        pub(crate) server_sender: Box<dyn ServerMessageSender>,
+    }
+
+    impl ClientMessageValidator for AutoMessageHandler {
+        fn validate(&self, message: ClientMessage) -> anyhow::Result<()> {
+            self.client_validator.validate(message)
+        }
+    }
+
+    impl ServerMessageSender for AutoMessageHandler {
+        fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()> {
+            self.server_sender.send(stream)
+        }
+    }
+
+    impl ScriptLine for AutoMessageHandler {
+        fn original_line(&self) -> &str {
+            self.client_validator.original_line()
+        }
+    }
 
     pub enum ActorBlock {
         BlockList(Vec<ActorBlock>),
@@ -108,7 +126,7 @@ pub mod actor_types {
         Alt(Vec<ActorBlock>),
         Optional(Box<ActorBlock>),
         Repeat(Box<ActorBlock>, usize),
-        AutoMessage(Box<dyn AutoMessageHandler>),
+        AutoMessage(AutoMessageHandler),
         NoOp,
     }
 }
