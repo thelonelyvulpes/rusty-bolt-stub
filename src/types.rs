@@ -1,12 +1,38 @@
 #[derive(Debug, PartialEq, Clone)]
 pub enum BangLine {
-    Version(u8, Option<u8>),
-    AllowRestart,
-    Auto(String),
-    Concurrent,
-    Handshake(String),
-    HandshakeDelay(f64),
-    Python(String),
+    Version(Context, u8, Option<u8>),
+    AllowRestart(Context),
+    Auto(Context, String),
+    Concurrent(Context),
+    Handshake(Context, String),
+    HandshakeDelay(Context, f64),
+    Python(Context, String),
+}
+
+impl BangLine {
+    pub fn ctx(&self) -> &Context {
+        match self {
+            BangLine::Version(ctx, _, _) => ctx,
+            BangLine::AllowRestart(ctx) => ctx,
+            BangLine::Auto(ctx, _) => ctx,
+            BangLine::Concurrent(ctx) => ctx,
+            BangLine::Handshake(ctx, _) => ctx,
+            BangLine::HandshakeDelay(ctx, _) => ctx,
+            BangLine::Python(ctx, _) => ctx,
+        }
+    }
+
+    pub fn ctx_mut(&mut self) -> &mut Context {
+        match self {
+            BangLine::Version(ctx, _, _) => ctx,
+            BangLine::AllowRestart(ctx) => ctx,
+            BangLine::Auto(ctx, _) => ctx,
+            BangLine::Concurrent(ctx) => ctx,
+            BangLine::Handshake(ctx, _) => ctx,
+            BangLine::HandshakeDelay(ctx, _) => ctx,
+            BangLine::Python(ctx, _) => ctx,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -52,20 +78,26 @@ pub struct Script {
     pub(crate) body: ScanBlock,
 }
 
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct Context {
+    pub(crate) start_line_number: usize,
+    pub(crate) end_line_number: usize,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum ScanBlock {
-    List(Vec<ScanBlock>),
-    Alt(Vec<ScanBlock>),
-    Parallel(Vec<ScanBlock>),
-    Optional(Box<ScanBlock>),
-    Repeat0(Box<ScanBlock>),
-    Repeat1(Box<ScanBlock>),
-    ClientMessage(String, Option<String>),
-    ServerMessage(String, Option<String>),
-    AutoMessage(String, Option<String>),
-    Comment,
-    Python(String),
-    Condition(CompositeConditionBlock),
+    List(Context, Vec<ScanBlock>),
+    Alt(Context, Vec<ScanBlock>),
+    Parallel(Context, Vec<ScanBlock>),
+    Optional(Context, Box<ScanBlock>),
+    Repeat0(Context, Box<ScanBlock>),
+    Repeat1(Context, Box<ScanBlock>),
+    ClientMessage(Context, String, Option<String>),
+    ServerMessage(Context, String, Option<String>),
+    AutoMessage(Context, String, Option<String>),
+    Comment(Context),
+    Python(Context, String),
+    Condition(Context, CompositeConditionBlock),
 }
 
 #[derive(Debug, Eq, PartialEq)]

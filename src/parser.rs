@@ -41,7 +41,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
 
     for bang_line in bang_lines {
         match bang_line {
-            BangLine::Version(major, minor) => {
+            BangLine::Version(_, major, minor) => {
                 if bolt_version.is_some() {
                     return Err(anyhow::anyhow!("Multiple BOLT version bang lines found"));
                 }
@@ -49,16 +49,16 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                     .ok_or(anyhow::anyhow!("Invalid BOLT version"))?;
                 bolt_version = Some(bolt);
             }
-            BangLine::AllowRestart => {
+            BangLine::AllowRestart(_) => {
                 if allow_restart.is_some() {
                     return Err(anyhow::anyhow!("Multiple allow restart bang lines found"));
                 }
                 allow_restart = Some(true);
             }
-            BangLine::Auto(_) => {
+            BangLine::Auto(_, _) => {
                 todo!("Auto blocks are not yet supported in the actor")
             }
-            BangLine::Concurrent => {
+            BangLine::Concurrent(_) => {
                 if allow_concurrent.is_some() {
                     return Err(anyhow::anyhow!(
                         "Multiple allow concurrent bang lines found"
@@ -66,16 +66,16 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 }
                 allow_concurrent = Some(true);
             }
-            BangLine::Handshake(byte_str) => {
+            BangLine::Handshake(_, byte_str) => {
                 if handshake.is_some() {
                     return Err(anyhow::anyhow!("Multiple handshake bang lines found"));
                 }
                 todo!("Parse handshake bytes")
             }
-            BangLine::HandshakeDelay(_) => {
+            BangLine::HandshakeDelay(_, _) => {
                 todo!("Parse handshake delay")
             }
-            BangLine::Python(_) => {
+            BangLine::Python(_, _) => {
                 todo!("Python blocks are not yet supported in the actor")
             }
         }
@@ -95,7 +95,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
 
 fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     match block {
-        ScanBlock::List(scan_blocks) => {
+        ScanBlock::List(_, scan_blocks) => {
             let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
             for scan_block in scan_blocks {
                 let b = parse_block(scan_block, config)?;
@@ -109,10 +109,13 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             match actor_blocks.len() {
                 0 => Ok(ActorBlock::NoOp),
                 1 => Ok(actor_blocks.remove(0)),
-                _ => Ok(ActorBlock::BlockList(actor_blocks)),
+                _ => {
+                    // TODO: if to sibling blocks are lists, merge them
+                    Ok(ActorBlock::BlockList(actor_blocks))
+                }
             }
         }
-        ScanBlock::Alt(scan_blocks) => {
+        ScanBlock::Alt(_, scan_blocks) => {
             let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
             for block in scan_blocks {
                 let b = parse_block(block, config)?;
@@ -121,26 +124,26 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             }
             Ok(ActorBlock::Alt(actor_blocks))
         }
-        ScanBlock::Parallel(_) => {
+        ScanBlock::Parallel(_, _) => {
             todo!("Parallel blocks are not yet supported in the actor")
         }
-        ScanBlock::Optional(optional_scan_block) => {
+        ScanBlock::Optional(_, optional_scan_block) => {
             // TODO: Handle bad optional blocks
             let b = parse_block(optional_scan_block, config)?;
             validate_non_action(&b)?;
             Ok(ActorBlock::Optional(Box::new(b)))
         }
-        ScanBlock::Repeat0(b) => Ok(ActorBlock::Repeat(Box::new(parse_block(b, config)?), 0)),
-        ScanBlock::Repeat1(b) => Ok(ActorBlock::Repeat(Box::new(parse_block(b, config)?), 1)),
-        ScanBlock::ClientMessage(message_name, body_string) => {
+        ScanBlock::Repeat0(_, b) => Ok(ActorBlock::Repeat(Box::new(parse_block(b, config)?), 0)),
+        ScanBlock::Repeat1(_, b) => Ok(ActorBlock::Repeat(Box::new(parse_block(b, config)?), 1)),
+        ScanBlock::ClientMessage(_, message_name, body_string) => {
             let validator = create_validator(message_name, body_string, config)?;
             Ok(ActorBlock::ClientMessageValidate(validator))
         }
-        ScanBlock::ServerMessage(message_name, body_string) => {
+        ScanBlock::ServerMessage(_, message_name, body_string) => {
             let server_message_sender = create_message_sender(message_name, body_string, config)?;
             Ok(ActorBlock::ServerMessageSend(server_message_sender))
         }
-        ScanBlock::AutoMessage(client_message_name, client_body_string) => {
+        ScanBlock::AutoMessage(_, client_message_name, client_body_string) => {
             let validator = create_validator(client_message_name, client_body_string, config)?;
             let server_message_sender = create_auto_message_sender(client_message_name, config)?;
             Ok(ActorBlock::AutoMessage(AutoMessageHandler {
@@ -148,11 +151,11 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 server_sender: server_message_sender,
             }))
         }
-        ScanBlock::Comment => Ok(ActorBlock::NoOp),
-        ScanBlock::Python(_) => {
+        ScanBlock::Comment(_) => Ok(ActorBlock::NoOp),
+        ScanBlock::Python(_, _) => {
             todo!("Python blocks are not yet supported in the actor")
         }
-        ScanBlock::Condition(_) => {
+        ScanBlock::Condition(_, _) => {
             todo!("Python blocks are not yet supported in the actor")
         }
     }
