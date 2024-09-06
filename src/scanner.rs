@@ -1,36 +1,55 @@
-use crate::types::{BangLine, ScanBlock, Script};
+use crate::types::{BangLine, Context, ScanBlock, Script};
 use anyhow::anyhow;
-use nom::branch::alt;
+use nom::branch::{alt, Alt};
 use nom::bytes::complete::tag;
 use nom::character::complete::{
     alpha1, line_ending, multispace0, not_line_ending, space0, space1, u8,
 };
-use nom::combinator::{cond, eof, map, opt, peek, value};
+use nom::combinator::{cond, consumed, eof, map, opt, peek, value};
 use nom::error::{context, FromExternalError, ParseError};
 use nom::multi::{many1, many_till, separated_list1};
-use nom::sequence::{pair, preceded, separated_pair, terminated};
-use nom::Parser;
+use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
+use nom::{AsChar, Compare, InputIter, InputLength, InputTakeAtPosition, Parser, Slice};
+use nom_span::Spanned;
 use nom_supreme::error::ErrorTree;
+use std::cmp::max;
+use std::ops::{Deref, Range, RangeFrom, RangeTo};
 
 type PError<I> = ErrorTree<I>;
-type IResult<'a, O> = nom::IResult<&'a str, O, PError<&'a str>>;
+type Input<'a> = Spanned<&'a str>;
+type IResult<'a, O> = nom::IResult<Input<'a>, O, PError<Input<'a>>>;
 
-pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<&str>>> {
-    let (input, bangs) =
-        terminated(context("Bang line headers", scan_bang_lines), multispace0)(input)?;
+impl From<Input<'_>> for Context {
+    fn from(value: Input) -> Self {
+        let start_line_number = value.line();
+        Self {
+            start_line_number,
+            end_line_number: start_line_number + max(1, value.data().lines().count()) - 1,
+        }
+    }
+}
 
-    if input.is_empty() && bangs.iter().any(|x| matches!(x, BangLine::Version(_, _))) {
+pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<Input>>> {
+    let span = Spanned::new(input, true);
+    let (span, bangs) =
+        terminated(context("Bang line headers", scan_bang_lines), multispace0)(span)?;
+
+    if input.is_empty()
+        && bangs
+            .iter()
+            .any(|x| matches!(x, BangLine::Version(_, _, _)))
+    {
         return Ok(Script {
             name,
             bang_lines: bangs,
-            body: ScanBlock::List(vec![]),
+            body: ScanBlock::List(span.into(), vec![]),
         });
     };
 
-    let (input, body) = terminated(opt(scan_body), multispace0)(input)?;
-    if !input.is_empty() {
+    let (span, body) = terminated(opt(scan_body), multispace0)(span)?;
+    if !span.is_empty() {
         return Err(nom::Err::Failure(PError::from_external_error(
-            input,
+            span.into(),
             nom::error::ErrorKind::Complete,
             anyhow!("Trailing input"),
         )));
@@ -39,42 +58,45 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
     Ok(Script {
         name,
         bang_lines: bangs,
-        body: body.unwrap_or(ScanBlock::List(vec![])),
+        body: body.unwrap_or(ScanBlock::List(span.into(), vec![])),
     })
 }
 
 // #################
 // Header/Bang Lines
 // #################
-fn scan_bang_lines(input: &str) -> IResult<Vec<BangLine>> {
+fn scan_bang_lines(input: Input) -> IResult<Vec<BangLine>> {
     many1(alt((
         context("auto bang", auto_bang_line),
         context("bolt version bang", bolt_version_bang_line),
         context(
             "allow restart",
-            simple_bang_line("ALLOW RESTART", BangLine::AllowRestart),
+            simple_bang_line("ALLOW RESTART", |b| BangLine::AllowRestart(b)),
         ),
         context(
             "allow concurrent",
-            simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
+            simple_bang_line("ALLOW CONCURRENT", |b| BangLine::Concurrent(b)),
+            // TODO: add delay handshake
+            //       handshake bytes
+            //       python line
         ),
-        // TODO: add delay handshake
-        //       handshake bytes
-        //       python line
     )))(input)
 }
 
-fn bolt_version_bang_line(input: &str) -> IResult<BangLine> {
+fn bolt_version_bang_line(input: Input) -> IResult<BangLine> {
     preceded(
         bang_line("BOLT"),
         preceded(
             space1,
             terminated(
                 alt((
-                    map(separated_pair(u8, tag("."), u8), |(major, minor)| {
-                        BangLine::Version(major, Some(minor))
+                    map(
+                        consumed(separated_pair(u8, tag("."), u8)),
+                        |(i, (major, minor))| BangLine::Version(i.into(), major, Some(minor)),
+                    ),
+                    map(consumed(u8), |(i, major)| {
+                        BangLine::Version(i.into(), major, None)
                     }),
-                    map(u8, |major| BangLine::Version(major, None)),
                 )),
                 end_of_line,
             ),
@@ -82,71 +104,83 @@ fn bolt_version_bang_line(input: &str) -> IResult<BangLine> {
     )(input)
 }
 
-fn auto_bang_line(input: &str) -> IResult<BangLine> {
+fn auto_bang_line(input: Input) -> IResult<BangLine> {
     map(
-        preceded(
+        consumed(preceded(
             bang_line("AUTO"),
             preceded(space1, terminated(alpha1, end_of_line)),
-        ),
-        |message| BangLine::Auto(message.to_owned()),
+        )),
+        |(i, message)| BangLine::Auto(i.into(), message.into()),
     )(input)
 }
 
-fn simple_bang_line<'a>(
+fn simple_bang_line<'a, 'b>(
     expect: &'static str,
-    res: BangLine,
-) -> impl FnMut(&'a str) -> IResult<'a, BangLine> {
-    value(res, preceded(bang_line(expect), end_of_line))
+    res: impl FnOnce(Context) -> BangLine,
+) -> impl FnMut(Input<'a>) -> IResult<'a, BangLine> {
+    map(
+        consumed(preceded(bang_line(expect), end_of_line)),
+        move |(i, _)| res(i.into()),
+    )
 }
 
-fn bang_line<'a>(expect: &'static str) -> impl FnMut(&'a str) -> IResult<'a, &'a str> {
+fn bang_line<'a>(expect: &'static str) -> impl FnMut(Input<'a>) -> IResult<'a, Input<'a>> {
     preceded(tag("!:"), preceded(space1, tag(expect)))
 }
 
 // ##########
 //    Body
 // ##########
-fn wrap_block_vec(blocks: Vec<ScanBlock>) -> ScanBlock {
+fn wrap_block_vec(context: Context, blocks: Vec<ScanBlock>) -> ScanBlock {
     match blocks.len() {
         1 => blocks.into_iter().next().unwrap(),
-        _ => ScanBlock::List(blocks),
+        _ => ScanBlock::List(context, blocks),
     }
 }
 
-fn scan_body(input: &str) -> IResult<ScanBlock> {
-    let (input, blocks) = many1(scan_block)(input)?;
-    Ok((input, ScanBlock::List(blocks)))
+fn scan_body(input: Input) -> IResult<ScanBlock> {
+    let (input, (i, blocks)) = consumed(many1(scan_block))(input)?;
+    Ok((input, ScanBlock::List(i.into(), blocks)))
 }
 
-fn scan_block(input: &str) -> IResult<ScanBlock> {
+fn scan_block(input: Input) -> IResult<ScanBlock> {
     preceded(
         multispace0,
         alt((
             context(
                 "alternative block",
-                map(multiblock("{{", "}}", "----"), ScanBlock::Alt),
+                map(consumed(multiblock("{{", "}}", "----")), |(i, b)| {
+                    ScanBlock::Alt(i.into(), b)
+                }),
             ),
             context(
                 "parallel block",
-                map(multiblock("{{", "}}", "++++"), ScanBlock::Parallel),
+                map(consumed(multiblock("{{", "}}", "++++")), |(i, b)| {
+                    ScanBlock::Parallel(i.into(), b)
+                }),
             ),
-            context("simple block", map(block("{{", "}}"), wrap_block_vec)),
+            context(
+                "simple block",
+                map(consumed(block("{{", "}}")), |(i, b)| {
+                    wrap_block_vec(i.into(), b)
+                }),
+            ),
             context(
                 "repeat 0 block",
-                map(block("{*", "*}"), |b| {
-                    ScanBlock::Repeat0(Box::new(wrap_block_vec(b)))
+                map(consumed(block("{*", "*}")), |(i, b)| {
+                    ScanBlock::Repeat0(i.into(), Box::new(wrap_block_vec(i.into(), b)))
                 }),
             ),
             context(
                 "repeat 1 block",
-                map(block("{+", "+}"), |b| {
-                    ScanBlock::Repeat1(Box::new(wrap_block_vec(b)))
+                map(consumed(block("{+", "+}")), |(i, b)| {
+                    ScanBlock::Repeat1(i.into(), Box::new(wrap_block_vec(i.into(), b)))
                 }),
             ),
             context(
                 "optional block",
-                map(block("{?", "?}"), |b| {
-                    ScanBlock::Optional(Box::new(wrap_block_vec(b)))
+                map(consumed(block("{?", "?}")), |(i, b)| {
+                    ScanBlock::Optional(i.into(), Box::new(wrap_block_vec(i.into(), b)))
                 }),
             ),
             context("auto line", message(Some("A:"), ScanBlock::AutoMessage)),
@@ -171,7 +205,7 @@ fn scan_block(input: &str) -> IResult<ScanBlock> {
     )(input)
 }
 
-fn keyword(input: &str) -> IResult<()> {
+fn keyword(input: Input) -> IResult<()> {
     void(alt((
         tag("{{"),
         tag("}}"),
@@ -198,38 +232,40 @@ fn keyword(input: &str) -> IResult<()> {
 // ############
 fn multi_message<'a>(
     message_tag: Option<&'static str>,
-    mut block: impl FnMut(String, Option<String>) -> ScanBlock,
-) -> impl FnMut(&'a str) -> IResult<ScanBlock> {
+    block: impl FnMut(Context, String, Option<String>) -> ScanBlock,
+) -> impl FnMut(Input<'a>) -> IResult<ScanBlock> {
     move |input| {
-        let (input, head) =
-            many1(context("explicit line", message(message_tag, &mut block)))(input)?;
-        let (input, (tail, _)) = context(
-            "implicit line",
-            map(
-                opt(many_till(
-                    message(None, &mut block),
-                    peek(preceded(multispace0, alt((void(eof), keyword)))),
-                )),
-                Option::unwrap_or_default,
+        let (input, (i, (head, (tail, _)))) = consumed(pair(
+            many1(context("explicit line", message(message_tag, &block))),
+            context(
+                "implicit line",
+                map(
+                    opt(many_till(
+                        message(None, &block),
+                        peek(preceded(multispace0, alt((void(eof), keyword)))),
+                    )),
+                    Option::unwrap_or_default,
+                ),
             ),
-        )(input)?;
+        ))(input)?;
+
         let blocks = head.into_iter().chain(tail).collect();
-        Ok((input, wrap_block_vec(blocks)))
+        Ok((input, wrap_block_vec(i.into(), blocks)))
     }
 }
 
 fn message<'a>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(String, Option<String>) -> ScanBlock,
-) -> impl FnMut(&'a str) -> IResult<ScanBlock> {
+    block: impl FnMut(Context, String, Option<String>) -> ScanBlock,
+) -> impl FnMut(Input<'a>) -> IResult<ScanBlock> {
     map(prefixed_line(tag), move |(message, args)| {
-        block(message.into(), args.map(Into::into))
+        block(message.into(), message.into(), args.map(Into::into))
     })
 }
 
 fn prefixed_line<'a>(
     prefix: Option<&'static str>,
-) -> impl FnMut(&'a str) -> IResult<(&'a str, Option<&'a str>)> {
+) -> impl FnMut(Input<'a>) -> IResult<(&'a str, Option<&'a str>)> {
     preceded(
         cond(
             prefix.is_some(),
@@ -244,16 +280,16 @@ fn prefixed_line<'a>(
 
 fn message_simple_content<'a>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(String) -> ScanBlock,
-) -> impl FnMut(&'a str) -> IResult<ScanBlock> {
+    mut block: impl FnMut(Context, String) -> ScanBlock,
+) -> impl FnMut(Input<'a>) -> IResult<ScanBlock> {
     map(prefixed_line_simple_content(tag), move |content| {
-        block(content.into())
+        block(context.into(), content.into())
     })
 }
 
 fn prefixed_line_simple_content<'a>(
     prefix: Option<&'static str>,
-) -> impl FnMut(&'a str) -> IResult<&'a str> {
+) -> impl FnMut(Input<'a>) -> IResult<&'a str> {
     preceded(
         cond(
             prefix.is_some(),
@@ -263,8 +299,10 @@ fn prefixed_line_simple_content<'a>(
     )
 }
 
-fn comment(input: &str) -> IResult<ScanBlock> {
-    map(preceded(tag("#"), rest_of_line), |_| ScanBlock::Comment)(input)
+fn comment(input: Input) -> IResult<ScanBlock> {
+    map(preceded(tag("#"), rest_of_line), |t| {
+        ScanBlock::Comment(t.into())
+    })(input)
 }
 
 // #################
@@ -273,7 +311,7 @@ fn comment(input: &str) -> IResult<ScanBlock> {
 fn block<'a>(
     opening: &'static str,
     closing: &'static str,
-) -> impl FnMut(&'a str) -> IResult<'a, Vec<ScanBlock>> {
+) -> impl FnMut(Input<'a>) -> IResult<'a, Vec<ScanBlock>> {
     preceded(
         terminated(tag(opening), end_of_line),
         terminated(
@@ -288,13 +326,13 @@ fn multiblock<'a>(
     opening: &'static str,
     closing: &'static str,
     sep: &'static str,
-) -> impl FnMut(&'a str) -> IResult<'a, Vec<ScanBlock>> {
+) -> impl FnMut(Input<'a>) -> IResult<'a, Vec<ScanBlock>> {
     preceded(
         terminated(tag(opening), end_of_line),
         terminated(
             separated_list1(
                 terminated(tag(sep), end_of_line),
-                map(many1(scan_block), wrap_block_vec),
+                map(consumed(many1(scan_block)), wrap_block_vec),
             ),
             preceded(space0, terminated(tag(closing), end_of_line)),
         ),
@@ -305,47 +343,63 @@ fn multiblock<'a>(
 // Syntactic Sugar
 // ###############
 // TODO: add tests
-fn auto_repeat_0(input: &str) -> IResult<ScanBlock> {
+fn auto_repeat_0(input: Input) -> IResult<ScanBlock> {
     let (input, (message, args)) = prefixed_line(Some("*:"))(input)?;
     Ok((
         input,
-        ScanBlock::Repeat0(Box::new(ScanBlock::AutoMessage(
+        ScanBlock::Repeat0(
             message.into(),
-            args.map(Into::into),
-        ))),
+            Box::new(ScanBlock::AutoMessage(
+                message.into(),
+                message.into(),
+                args.map(Into::into),
+            )),
+        ),
     ))
 }
 
 // TODO: add tests
-fn auto_repeat_1(input: &str) -> IResult<ScanBlock> {
+fn auto_repeat_1(input: Input) -> IResult<ScanBlock> {
     let (input, (message, args)) = prefixed_line(Some("+:"))(input)?;
     Ok((
         input,
-        ScanBlock::Repeat1(Box::new(ScanBlock::AutoMessage(
+        ScanBlock::Repeat1(
             message.into(),
-            args.map(Into::into),
-        ))),
+            Box::new(ScanBlock::AutoMessage(
+                message.into(),
+                message.into(),
+                args.map(Into::into),
+            )),
+        ),
     ))
 }
 
 // TODO: add tests
-fn auto_optional(input: &str) -> IResult<ScanBlock> {
+fn auto_optional(input: Input) -> IResult<ScanBlock> {
     let (input, (message, args)) = prefixed_line(Some("?:"))(input)?;
     Ok((
         input,
-        ScanBlock::Optional(Box::new(ScanBlock::AutoMessage(
+        ScanBlock::Optional(
             message.into(),
-            args.map(Into::into),
-        ))),
+            Box::new(ScanBlock::AutoMessage(
+                message.into(),
+                message.into(),
+                args.map(Into::into),
+            )),
+        ),
     ))
 }
 
 // #########
 // Utilities
 // #########
-fn rest_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, &'a str, E> {
-    let (input, mut line) = terminated(not_line_ending, end_of_line)(input)?;
-    line = line.trim();
+fn rest_of_line<'a, I: Clone, E: ParseError<I>>(input: I) -> nom::IResult<I, I, E> {
+    let (input, mut line) = delimited(
+        multispace0,
+        terminated(not_line_ending, end_of_line),
+        multispace0,
+    )(input)?;
+    // TODO: Replace delimited combinator with trim below
     if line.is_empty() {
         return Err(nom::Err::Error(E::from_error_kind(
             input,
@@ -355,16 +409,27 @@ fn rest_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a 
     Ok((input, line))
 }
 
-fn end_of_line<'a, E: ParseError<&'a str>>(input: &'a str) -> nom::IResult<&'a str, (), E> {
-    let eol = alt((line_ending, eof));
-    value((), preceded(space0, eol))(input)
+fn end_of_line<'a, E: ParseError<Input<'a>>>(
+    input: Input<'a>,
+) -> nom::IResult<Input<'a>, Input<'a>, E> {
+    // let choices: nom::IResult<Input<'a>, Input<'a>, E> = eof(input);
+    // let eol: nom::IResult<Input<'a>, Input<'a>, E> = alt((line_ending, eof))(input);
+    // void(preceded(space0, line_ending))(input)
+    line_ending(input)
 }
 
-fn void<F, I, O, E>(f: F) -> impl FnMut(I) -> nom::IResult<I, (), E>
+fn void<F, I, O, E: ParseError<I>>(f: F) -> impl FnMut(I) -> nom::IResult<I, (), E>
 where
     F: Parser<I, O, E>,
 {
-    map(f, |_| ())
+    value((), f)
+}
+
+pub fn trim<'a, O, E: ParseError<Input<'a>>, F>(inner: F) -> impl Parser<Input<'a>, O, E>
+where
+    F: Parser<Input<'a>, O, E>,
+{
+    delimited(multispace0, inner, multispace0)
 }
 
 #[cfg(test)]
