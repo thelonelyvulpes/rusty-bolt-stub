@@ -6,7 +6,7 @@ use nom::character::complete::{
     alpha1, line_ending, multispace0, not_line_ending, space0, space1, u8,
 };
 use nom::combinator::{cond, consumed, eof, map, opt, peek, recognize, value};
-use nom::error::{context, FromExternalError, ParseError};
+use nom::error::{context, ErrorKind, FromExternalError, ParseError};
 use nom::multi::{many1, many_till, separated_list1};
 use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
 use nom::{AsChar, Compare, InputIter, InputLength, InputTakeAtPosition, Parser, Slice};
@@ -110,7 +110,7 @@ fn auto_bang_line(input: Input) -> IResult<BangLine> {
             multispace0,
             consumed(preceded(
                 bang_line("AUTO"),
-                preceded(space1, terminated(alpha1, peek(end_of_line))),
+                preceded(space1, terminated(message_name, peek(end_of_line))),
             )),
         ),
         |(ctx, message)| BangLine::Auto(ctx.into(), String::from(message.trim())),
@@ -298,7 +298,7 @@ fn prefixed_line<'a>(
                 terminated(tag(prefix.unwrap_or("")), space0),
             ),
             pair(
-                context("message name", alpha1),
+                context("message name", message_name),
                 context(
                     "message body",
                     alt((
@@ -378,15 +378,16 @@ fn multiblock<'a>(
     sep: &'static str,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, Vec<ScanBlock>> {
     preceded(
-        terminated(tag(opening), end_of_line),
+        delimited(multispace0, tag(opening), end_of_line),
         terminated(
             separated_list1(
-                terminated(tag(sep), end_of_line),
-                map(consumed(many1(scan_block)), |(ctx, blocks)| {
-                    wrap_block_vec(ctx.into(), blocks)
-                }),
+                delimited(multispace0, tag(sep), end_of_line),
+                map(
+                    preceded(multispace0, consumed(many1(scan_block))),
+                    |(ctx, blocks)| wrap_block_vec(ctx.into(), blocks),
+                ),
             ),
-            preceded(space0, terminated(tag(closing), end_of_line)),
+            delimited(multispace0, tag(closing), end_of_line),
         ),
     )
 }
@@ -445,6 +446,17 @@ fn auto_optional(input: Input) -> IResult<ScanBlock> {
 // #########
 // Utilities
 // #########
+fn message_name<T, E: ParseError<T>>(input: T) -> nom::IResult<T, T, E>
+where
+    T: InputTakeAtPosition,
+    <T as InputTakeAtPosition>::Item: AsChar + Clone,
+{
+    input.split_at_position1_complete(
+        |item| !(item.clone().is_alphanum() || item.as_char() == '_'),
+        ErrorKind::Alpha,
+    )
+}
+
 fn rest_of_line<'a, E: ParseError<Input<'a>>>(
     input: Input<'a>,
 ) -> nom::IResult<Input<'a>, Input<'a>, E> {
@@ -472,13 +484,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::scanner;
-    use super::{message, multi_message, multi_message_vec, prefixed_line, Input};
-
-    use crate::types::{BangLine, Context, ScanBlock};
-
+    use indoc::indoc;
     use nom_span::Spanned;
     use rstest::rstest;
+
+    use super::super::scanner;
+    use super::{message, multi_message, multi_message_vec, prefixed_line, Input};
+    use crate::types::{BangLine, Context, ScanBlock};
 
     #[test]
     fn test_scan_minimal_script() {
@@ -737,6 +749,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_multi_block() {
+        let input = wrap_input("{{\n    C: RUN1\n    S: OK\n----\n    C: RUN2\n}}");
+        let result = dbg!(scanner::multiblock("{{", "}}", "----")(input));
+        let (rem, blocks) = result.unwrap();
+        assert_eq!(*rem, "");
+        assert_eq!(
+            blocks,
+            vec![
+                ScanBlock::List(
+                    new_ctx(2, 3),
+                    vec![
+                        ScanBlock::ClientMessage(new_ctx(2, 2), "RUN1".into(), None),
+                        ScanBlock::ServerMessage(new_ctx(3, 3), "OK".into(), None),
+                    ]
+                ),
+                ScanBlock::ClientMessage(new_ctx(5, 5), "RUN2".into(), None),
+            ]
+        );
+    }
+
     // ###############
     // Syntactic Sugar
     // ###############
@@ -744,6 +777,42 @@ mod tests {
     // #########
     // Utilities
     // #########
+    fn call_message_name(input: &str) -> super::IResult<Input> {
+        scanner::message_name(wrap_input(input))
+    }
+
+    #[rstest]
+    #[case::trailing_space("FOO ", "FOO", " ")]
+    #[case::trailing_tab("FOO\t", "FOO", "\t")]
+    #[case::trailing_lf("FOO\n", "FOO", "\n")]
+    #[case::trailing_crlf("FOO\r\n", "FOO", "\r\n")]
+    #[case::simple("FOO", "FOO", "")]
+    #[case::alphanum("F2OO3", "F2OO3", "")]
+    #[case::alphanum_underscore("F2O_O3", "F2O_O3", "")]
+    #[case::dash("ABC-DEF", "ABC", "-DEF")]
+    #[case::slash("ABC/DEF", "ABC", "/DEF")]
+    fn test_message_name(
+        #[case] input: &str,
+        #[case] expected_taken: &str,
+        #[case] expected_rem: &str,
+    ) {
+        let result = dbg!(call_message_name(input));
+        let (rem, taken) = result.unwrap();
+        assert_eq!(*rem, expected_rem);
+        assert_eq!(*taken, expected_taken);
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::leading_space(" FOO")]
+    #[case::leading_tab("\tFOO")]
+    #[case::leading_lf("\nFOO")]
+    #[case::leading_crlf("\r\nFOO")]
+    fn test_not_message_name(#[case] input: &str) {
+        let result = dbg!(call_message_name(input));
+        result.unwrap_err();
+    }
+
     fn call_end_of_line(input: &str) -> super::IResult<()> {
         scanner::end_of_line(wrap_input(input))
     }
@@ -773,5 +842,32 @@ mod tests {
         let (rem, taken) = result.unwrap();
         assert_eq!(*taken, content);
         assert_eq!(*rem, eol);
+    }
+
+    #[test]
+    fn test_full_script() {
+        let input = indoc! {r#"
+            !: BOLT 5.6
+
+            C: HELLO {"{}": "*"}
+            S: SUCCESS {"server": "Neo4j/5.23.0, "connection_id": "bolt-123456789"}
+            A: LOGON {"{}": "*"}
+            *: RESET
+            {?
+                ?: TELEMETRY {"{}": "*"}
+                C: RUN {"U": "*"} {"{}": "*"} {"{}": "*"}
+                S: SUCCESS {"fields": ["n.name"]}
+                {{
+                    C: PULL {"n": {"Z": "*"}}
+                ----
+                    C: DISCARD {"n": {"Z": "*"}}
+                }}
+                S: SUCCESS {"type": "w"}
+            ?}
+
+            *: RESET
+            ?: GOODBYE"#};
+
+        let result = dbg!(scanner::scan_script(input, "test.script".into())).unwrap();
     }
 }
