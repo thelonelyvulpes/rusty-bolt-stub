@@ -460,7 +460,7 @@ where
 fn rest_of_line<'a, E: ParseError<Input<'a>>>(
     input: Input<'a>,
 ) -> nom::IResult<Input<'a>, Input<'a>, E> {
-    let (input, mut line) = terminated(not_line_ending, peek(end_of_line))(input)?;
+    let (input, line) = terminated(not_line_ending, peek(end_of_line))(input)?;
     if line.is_empty() {
         return Err(nom::Err::Error(E::from_error_kind(
             input,

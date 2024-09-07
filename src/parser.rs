@@ -252,19 +252,22 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
         ScanBlock::Optional(ctx, optional_scan_block) => {
             // TODO: Handle bad optional blocks
             let b = parse_block(optional_scan_block, config)?;
-            validate_non_action(&b)?;
+            validate_non_action(&b, Some("inside an optional block"))?;
+            validate_non_empty(&b, Some("inside an optional block"))?;
             Ok(ActorBlock::Optional(*ctx, Box::new(b)))
         }
-        ScanBlock::Repeat0(ctx, b) => Ok(ActorBlock::Repeat(
-            *ctx,
-            Box::new(parse_block(b, config)?),
-            0,
-        )),
-        ScanBlock::Repeat1(ctx, b) => Ok(ActorBlock::Repeat(
-            *ctx,
-            Box::new(parse_block(b, config)?),
-            1,
-        )),
+        ScanBlock::Repeat0(ctx, b) => {
+            let b = parse_block(b, config)?;
+            validate_non_action(&b, Some("inside a repeat block"))?;
+            validate_non_empty(&b, Some("inside a repeat block"))?;
+            Ok(ActorBlock::Repeat(*ctx, Box::new(b), 0))
+        }
+        ScanBlock::Repeat1(ctx, b) => {
+            let b = parse_block(b, config)?;
+            validate_non_action(&b, Some("inside a repeat block"))?;
+            validate_non_empty(&b, Some("inside a repeat block"))?;
+            Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
+        }
         ScanBlock::ClientMessage(ctx, message_name, body_string) => {
             let validator = create_validator(message_name, body_string, config)?;
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
@@ -298,6 +301,7 @@ fn create_auto_message_sender(
     client_message_tag: &str,
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
+    // return Ok(Box::new(()));
     todo!()
 }
 
@@ -306,6 +310,7 @@ fn create_message_sender(
     message_body: &Option<String>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
+    // return Ok(Box::new(()));
     todo!()
 }
 
@@ -314,6 +319,7 @@ fn create_validator(
     expected_body_string: &Option<String>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
+    // return Ok(Box::new(()));
     todo!()
 }
 
@@ -321,17 +327,100 @@ fn message_tag_from_name(tag_name: &str, config: &ActorConfig) -> Result<u8> {
     todo!()
 }
 
-fn validate_non_action(p0: &ActorBlock) -> Result<()> {
-    todo!()
+fn is_skippable(block: &ActorBlock) -> bool {
+    match block {
+        ActorBlock::BlockList(_, blocks) | ActorBlock::Alt(_, blocks) => {
+            blocks.iter().all(is_skippable)
+        }
+        ActorBlock::Repeat(_, block, count) => *count == 0 || is_skippable(block),
+        ActorBlock::Optional(..) | ActorBlock::NoOp(..) => true,
+        ActorBlock::ClientMessageValidate(..)
+        | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::Python(..)
+        | ActorBlock::AutoMessage(..) => false,
+    }
+}
+
+fn has_deterministic_end(block: &ActorBlock) -> bool {
+    match block {
+        ActorBlock::BlockList(_, blocks) => blocks
+            .iter()
+            .rev()
+            .filter(|b| !matches!(b, ActorBlock::NoOp(_)))
+            .map(has_deterministic_end)
+            .next()
+            .unwrap_or(true),
+        ActorBlock::ClientMessageValidate(..)
+        | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::Python(..) => true,
+        ActorBlock::Alt(_, blocks) => blocks.iter().all(has_deterministic_end),
+        ActorBlock::Optional(..) | ActorBlock::Repeat(..) => false,
+        ActorBlock::AutoMessage(..) => true,
+        ActorBlock::NoOp(..) => true,
+    }
+}
+
+fn is_action_block(block: &ActorBlock) -> bool {
+    match block {
+        ActorBlock::Python(..) | ActorBlock::ServerMessageSend(..) => true,
+        ActorBlock::BlockList(_, blocks) => 'arm: {
+            for block in blocks {
+                if is_action_block(block) {
+                    break 'arm true;
+                }
+                if !is_skippable(block) {
+                    break;
+                }
+            }
+            break 'arm false;
+        }
+        ActorBlock::Alt(_, blocks) => blocks.iter().any(is_action_block),
+        ActorBlock::Optional(_, block) => is_action_block(block),
+        ActorBlock::Repeat(_, block, _) => is_action_block(block),
+        ActorBlock::ClientMessageValidate(..)
+        | ActorBlock::AutoMessage(..)
+        | ActorBlock::NoOp(..) => false,
+    }
+}
+
+fn validate_non_action(block: &ActorBlock, context: Option<&str>) -> Result<()> {
+    if is_action_block(block) {
+        Err(ParseError::new_ctx(
+            *block.ctx(),
+            format!(
+                "Cannot have a block that requires server initiative (ambiguous) {}",
+                context.unwrap_or("here")
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_non_empty(block: &ActorBlock, context: Option<&str>) -> Result<()> {
+    if matches!(block, ActorBlock::NoOp(_)) {
+        Err(ParseError::new_ctx(
+            *block.ctx(),
+            format!("Cannot have an empty block {}", context.unwrap_or("here")),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_list_children(blocks: &[ActorBlock]) -> Result<()> {
-    todo!()
+    let mut previous_has_deterministic_end = false;
+    for block in blocks {
+        if !previous_has_deterministic_end {
+            validate_non_action(block, Some("after a block with non-deterministic end"))?;
+        }
+        previous_has_deterministic_end = has_deterministic_end(block);
+    }
+    Ok(())
 }
 
 fn validate_alt_child(b: &ActorBlock) -> Result<()> {
-    if let ActorBlock::NoOp(ctx) = b {
-        return Err(ParseError::new_ctx(*ctx, "Empty branch in Alt block"));
-    }
+    validate_non_empty(b, Some("as an Alt block branch"))?;
+    validate_non_action(b, Some("as an Alt block child"))?;
     Ok(())
 }

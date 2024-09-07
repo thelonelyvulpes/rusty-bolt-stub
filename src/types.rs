@@ -155,6 +155,24 @@ pub mod actor_types {
         fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()>;
     }
 
+    // impl ScriptLine for () {
+    //     fn original_line(&self) -> &str {
+    //         ""
+    //     }
+    // }
+    //
+    // impl ClientMessageValidator for () {
+    //     fn validate(&self, _message: ClientMessage) -> anyhow::Result<()> {
+    //         Ok(())
+    //     }
+    // }
+    //
+    // impl ServerMessageSender for () {
+    //     fn send(&self, _stream: &mut TcpStream) -> anyhow::Result<()> {
+    //         Ok(())
+    //     }
+    // }
+
     #[derive(Debug)]
     pub struct AutoMessageHandler {
         pub(crate) client_validator: Box<dyn ClientMessageValidator>,
@@ -184,10 +202,27 @@ pub mod actor_types {
         BlockList(Context, Vec<ActorBlock>),
         ClientMessageValidate(Context, Box<dyn ClientMessageValidator>),
         ServerMessageSend(Context, Box<dyn ServerMessageSender>),
+        Python(Context, String),
         Alt(Context, Vec<ActorBlock>),
         Optional(Context, Box<ActorBlock>),
         Repeat(Context, Box<ActorBlock>, usize),
         AutoMessage(Context, AutoMessageHandler),
         NoOp(Context),
+    }
+
+    impl ActorBlock {
+        pub fn ctx(&self) -> &Context {
+            match self {
+                ActorBlock::BlockList(ctx, _) => ctx,
+                ActorBlock::ClientMessageValidate(ctx, _) => ctx,
+                ActorBlock::ServerMessageSend(ctx, _) => ctx,
+                ActorBlock::Python(ctx, _) => ctx,
+                ActorBlock::Alt(ctx, _) => ctx,
+                ActorBlock::Optional(ctx, _) => ctx,
+                ActorBlock::Repeat(ctx, _, _) => ctx,
+                ActorBlock::AutoMessage(ctx, _) => ctx,
+                ActorBlock::NoOp(ctx) => ctx,
+            }
+        }
     }
 }
