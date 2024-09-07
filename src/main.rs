@@ -44,7 +44,10 @@ async fn main() -> anyhow::Result<()> {
 
     let output = dbg!(scanner::scan_script(SCRIPT.get().unwrap(), args.script)?);
 
-    let engine = parser::parse(output)?;
+    let engine = dbg!(parser::contextualize_res(
+        parser::parse(output),
+        SCRIPT.get().unwrap()
+    ))?;
 
     let mut server = tcp::Server::new(&args.listen_addr, &engine);
 

@@ -380,7 +380,7 @@ fn multiblock<'a>(
     preceded(
         delimited(multispace0, tag(opening), end_of_line),
         terminated(
-            separated_list1(
+            separated_list2(
                 delimited(multispace0, tag(sep), end_of_line),
                 map(
                     preceded(multispace0, consumed(many1(scan_block))),
@@ -480,6 +480,61 @@ where
     F: Parser<I, O, E>,
 {
     value((), f)
+}
+
+pub fn separated_list2<I, O, O2, E, F, G>(
+    mut sep: G,
+    mut f: F,
+) -> impl FnMut(I) -> nom::IResult<I, Vec<O>, E>
+where
+    I: Clone + InputLength,
+    F: Parser<I, O, E>,
+    G: Parser<I, O2, E>,
+    E: ParseError<I>,
+{
+    move |mut i: I| {
+        let mut res = Vec::new();
+
+        // Parse the first element
+        match f.parse(i.clone()) {
+            Err(e) => return Err(e),
+            Ok((i1, o)) => {
+                res.push(o);
+                i = i1;
+            }
+        }
+
+        loop {
+            let len = i.input_len();
+            match sep.parse(i.clone()) {
+                Err(nom::Err::Error(e)) => {
+                    if res.len() == 1 {
+                        return Err(nom::Err::Error(e));
+                    }
+                    return Ok((i, res));
+                }
+                Err(e) => return Err(e),
+                Ok((i1, _)) => {
+                    // infinite loop check: the parser must always consume
+                    if i1.input_len() == len {
+                        return Err(nom::Err::Error(E::from_error_kind(
+                            i1,
+                            ErrorKind::SeparatedList,
+                        )));
+                    }
+
+                    match f.parse(i1.clone()) {
+                        Err(nom::Err::Error(_)) => return Ok((i, res)),
+                        Err(e) => return Err(e),
+                        Ok((i2, o)) => {
+                            res.push(o);
+                            i = i2;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

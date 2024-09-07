@@ -1,3 +1,6 @@
+use std::cmp::{max, min};
+use std::fmt::Display;
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum BangLine {
     Version(Context, u8, Option<u8>),
@@ -78,10 +81,29 @@ pub struct Script {
     pub(crate) body: ScanBlock,
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub struct Context {
     pub(crate) start_line_number: usize,
     pub(crate) end_line_number: usize,
+}
+
+impl Display for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lines {}-{}",
+            self.start_line_number, self.end_line_number
+        )
+    }
+}
+
+impl Context {
+    pub fn fuse(&self, other: &Context) -> Context {
+        Context {
+            start_line_number: min(self.start_line_number, other.start_line_number),
+            end_line_number: max(self.end_line_number, other.end_line_number),
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -114,9 +136,14 @@ pub struct ConditionBranch {
 }
 
 pub mod actor_types {
+    use super::Context;
     use crate::values::ClientMessage;
+
+    use std::fmt::Debug;
+
     use tokio::net::TcpStream;
-    pub trait ScriptLine {
+
+    pub trait ScriptLine: Debug {
         fn original_line(&self) -> &str;
     }
 
@@ -128,6 +155,7 @@ pub mod actor_types {
         fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()>;
     }
 
+    #[derive(Debug)]
     pub struct AutoMessageHandler {
         pub(crate) client_validator: Box<dyn ClientMessageValidator>,
         pub(crate) server_sender: Box<dyn ServerMessageSender>,
@@ -151,14 +179,15 @@ pub mod actor_types {
         }
     }
 
+    #[derive(Debug)]
     pub enum ActorBlock {
-        BlockList(Vec<ActorBlock>),
-        ClientMessageValidate(Box<dyn ClientMessageValidator>),
-        ServerMessageSend(Box<dyn ServerMessageSender>),
-        Alt(Vec<ActorBlock>),
-        Optional(Box<ActorBlock>),
-        Repeat(Box<ActorBlock>, usize),
-        AutoMessage(AutoMessageHandler),
-        NoOp,
+        BlockList(Context, Vec<ActorBlock>),
+        ClientMessageValidate(Context, Box<dyn ClientMessageValidator>),
+        ServerMessageSend(Context, Box<dyn ServerMessageSender>),
+        Alt(Context, Vec<ActorBlock>),
+        Optional(Context, Box<ActorBlock>),
+        Repeat(Context, Box<ActorBlock>, usize),
+        AutoMessage(Context, AutoMessageHandler),
+        NoOp(Context),
     }
 }
