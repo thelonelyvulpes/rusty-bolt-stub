@@ -1,6 +1,7 @@
 // TODO: remove when rapid PoC phase is over
 #![allow(dead_code)]
 
+mod jolt;
 mod parser;
 mod scanner;
 mod tcp;

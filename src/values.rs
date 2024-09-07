@@ -1,5 +1,3 @@
-use crate::values::value_send::ValueSend;
-
 pub mod graph;
 pub mod spatial;
 pub mod time;
@@ -12,5 +10,5 @@ pub struct ClientMessage {
 }
 
 pub struct ServerMessage {
-    fields: ValueSend,
+    fields: value_send::ValueSend,
 }
