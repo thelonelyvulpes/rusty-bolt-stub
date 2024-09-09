@@ -35,8 +35,7 @@ struct StubArgs {
 
 static SCRIPT: OnceLock<String> = OnceLock::new();
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = StubArgs::parse();
     let script_text = std::fs::read_to_string(&args.script)
         .with_context(|| format!("Failed to read script file: {}", &args.script))?;
@@ -49,7 +48,5 @@ async fn main() -> anyhow::Result<()> {
         SCRIPT.get().unwrap()
     ))?;
 
-    let mut server = tcp::Server::new(&args.listen_addr, &engine);
-
-    server.start().await
+    tcp::Server::new(&args.listen_addr, &engine).start()
 }

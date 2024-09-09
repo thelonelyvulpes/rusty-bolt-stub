@@ -13,8 +13,15 @@ impl Server<'_> {
         }
     }
 
-    pub async fn start(&mut self) -> anyhow::Result<()> {
-        //Create tokio runtime
-        Ok(())
+    pub fn start(&mut self) -> anyhow::Result<()> {
+        let mut rt = match self.server_script_cfg.config.allow_concurrent {
+            true => tokio::runtime::Builder::new_multi_thread().enable_all().build(),
+            false => tokio::runtime::Builder::new_current_thread().enable_all().build(),
+        }?;
+
+        rt.block_on(async {
+            //Create tokio runtime
+            Ok(())
+        })
     }
 }
