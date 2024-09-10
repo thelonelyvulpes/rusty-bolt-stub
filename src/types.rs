@@ -143,7 +143,7 @@ pub mod actor_types {
 
     use tokio::net::TcpStream;
 
-    pub trait ScriptLine: Debug {
+    pub trait ScriptLine: Debug + Send + Sync {
         fn original_line(&self) -> &str;
     }
 
@@ -151,7 +151,7 @@ pub mod actor_types {
         fn validate(&self, message: ClientMessage) -> anyhow::Result<()>;
     }
 
-    pub trait ServerMessageSender: ScriptLine {
+    pub trait ServerMessageSender: ScriptLine + Send {
         fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()>;
     }
 

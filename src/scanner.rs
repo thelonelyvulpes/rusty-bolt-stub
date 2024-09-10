@@ -1,19 +1,16 @@
 use crate::types::{BangLine, Context, ScanBlock, Script};
 use anyhow::anyhow;
-use nom::branch::{alt, Alt};
-use nom::bytes::complete::{tag, take_till};
-use nom::character::complete::{
-    alpha1, line_ending, multispace0, not_line_ending, space0, space1, u8,
-};
+use nom::branch::alt;
+use nom::bytes::complete::tag;
+use nom::character::complete::{line_ending, multispace0, not_line_ending, space0, space1, u8};
 use nom::combinator::{cond, consumed, eof, map, opt, peek, recognize, value};
 use nom::error::{context, ErrorKind, FromExternalError, ParseError};
-use nom::multi::{many1, many_till, separated_list1};
+use nom::multi::{many1, many_till};
 use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
-use nom::{AsChar, Compare, InputIter, InputLength, InputTakeAtPosition, Parser, Slice};
+use nom::{AsChar, InputLength, InputTakeAtPosition, Parser};
 use nom_span::Spanned;
 use nom_supreme::error::ErrorTree;
 use std::cmp::max;
-use std::ops::{Deref, Range, RangeFrom, RangeTo};
 
 type PError<I> = ErrorTree<I>;
 type Input<'a> = Spanned<&'a str>;
@@ -91,7 +88,7 @@ fn bolt_version_bang_line(input: Input) -> IResult<BangLine> {
                 space1,
                 terminated(
                     alt((
-                        map(separated_pair(u8, tag("."), u8), |((major, minor))| {
+                        map(separated_pair(u8, tag("."), u8), |(major, minor)| {
                             (major, Some(minor))
                         }),
                         map(u8, |major| (major, None)),
@@ -544,7 +541,7 @@ mod tests {
     use rstest::rstest;
 
     use super::super::scanner;
-    use super::{message, multi_message, multi_message_vec, prefixed_line, Input};
+    use super::{message, multi_message, Input};
     use crate::types::{BangLine, Context, ScanBlock};
 
     #[test]
@@ -923,6 +920,6 @@ mod tests {
             *: RESET
             ?: GOODBYE"#};
 
-        let result = dbg!(scanner::scan_script(input, "test.script".into())).unwrap();
+        dbg!(scanner::scan_script(input, "test.script".into())).unwrap();
     }
 }
