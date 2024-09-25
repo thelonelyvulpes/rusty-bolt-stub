@@ -32,7 +32,6 @@ impl Server<'_> {
     pub fn start(&mut self) -> Result<()> {
         let rt = match self.server_script_cfg.config.allow_concurrent {
             true => tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
                 .enable_all()
                 .build(),
             false => tokio::runtime::Builder::new_current_thread()
@@ -82,7 +81,7 @@ impl Server<'_> {
         let restarts = self.server_script_cfg.config.allow_restart;
         let concurrent = self.server_script_cfg.config.allow_concurrent;
         loop {
-            let client_token = ct.clone();
+            let connection_cancellation_token = ct.clone();
             select! {
                 res = listener.accept() => {
                     match res {
@@ -94,7 +93,7 @@ impl Server<'_> {
                                 conn,
                                 script: s,
                                 name,
-                                ct: client_token
+                                ct: connection_cancellation_token
                             };
 
                             handles.spawn(async move {
