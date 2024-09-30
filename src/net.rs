@@ -87,13 +87,14 @@ impl Server<'_> {
                     match res {
                         Ok((conn, addr)) => {
                             conn.set_nodelay(true)?;
-                            let s = self.server_script_cfg;
+                            let script = self.server_script_cfg;
                             let name = addr.to_string();
                             let mut actor = NetActor {
                                 conn,
-                                script: s,
+                                script,
                                 name,
-                                ct: connection_cancellation_token
+                                ct: connection_cancellation_token,
+                                peeked_message: None,
                             };
 
                             handles.spawn(async move {

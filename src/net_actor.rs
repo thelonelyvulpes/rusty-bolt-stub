@@ -1,7 +1,10 @@
 use crate::parser::ActorScript;
 use crate::types::actor_types::ActorBlock;
+use crate::values::ClientMessage;
 use anyhow::{anyhow, Context, Result};
+use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 pub struct NetActor<T> {
@@ -9,45 +12,98 @@ pub struct NetActor<T> {
     pub conn: T,
     pub name: String,
     pub script: &'static ActorScript,
+    pub peeked_message: Option<ClientMessage>
 }
 
 impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
     pub async fn run_client_connection(&mut self) -> Result<()> {
         self.handshake().await?;
 
-        let curr = &self.script.tree;
+        let r = self.run_block(&self.script.tree).await?;
+        Ok(())
+    }
 
+    async fn run_block(&mut self, curr: &'static ActorBlock) -> Result<()> {
         match curr {
-            ActorBlock::BlockList(_, _) => {
-                // Top Level!
+            ActorBlock::BlockList(ctx, blocks) => {
+                for block in blocks {
+                    Box::pin(self.run_block(block)).await.context(ctx)?;
+                }
+                Ok(())
             }
-            ActorBlock::ClientMessageValidate(_, _) => {
-                // recv and die.
+            ActorBlock::ClientMessageValidate(ctx, validator) => {
+                let message = self.read_message().await?;
+                validator.validate(message).context(ctx)
             }
-            ActorBlock::ServerMessageSend(_, _) => {
+            ActorBlock::ServerMessageSend(ctx, data) => {
                 // send and die
+                let d = data.send()?;
+                self.conn.write_all(&d).await.context(ctx)
             }
             ActorBlock::Python(_, _) => {
                 // run some python and die.
+                todo!();
             }
-            ActorBlock::Alt(_, _) => {}
-            ActorBlock::Optional(_, _) => {}
-            ActorBlock::Repeat(_, _, _) => {}
-            ActorBlock::AutoMessage(_, _) => {}
-            ActorBlock::NoOp(_) => {}
+            ActorBlock::Alt(ctx, alt_blocks) => {
+                self.peek_message().await?;
+                let peeked_message = self.peeked_message().expect("peeked above");
+                for alt_block in alt_blocks {
+                    if Self::simulate(alt_block, &peeked_message).is_ok() {
+                        return Box::pin(self.run_block(alt_block)).await;
+                    }
+                }
+                Err(anyhow!("No blocks matched")).context(ctx)
+            }
+            ActorBlock::Optional(_, optional_block) => {
+                self.peek_message().await?;
+                let peeked_message = self.peeked_message().expect("peeked above");
+                if Self::simulate(optional_block, &peeked_message).is_ok() {
+                    return Box::pin(self.run_block(optional_block)).await;
+                }
+                Ok(())
+            }
+            ActorBlock::Repeat(ctx, block, rep) => {
+                let mut c = 0;
+                loop {
+                    self.peek_message().await?;
+                    let peeked_message = self.peeked_message().expect("peeked above");
+                    if Self::simulate(block, &peeked_message).is_ok() {
+                        Box::pin(self.run_block(block)).await?;
+                        c += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if c < *rep {
+                    return Err(anyhow!(
+                        "Expected {rep} repetitions but only {c} were completed."
+                    ))
+                    .context(ctx);
+                }
+                Ok(())
+            }
+            ActorBlock::AutoMessage(ctx, handler) => {
+                let message = self.read_message().await?;
+                handler.client_validator.validate(message).context(ctx)?;
+                let d = handler.server_sender.send()?;
+                self.conn.write_all(&d).await.context(ctx)
+            }
+            ActorBlock::NoOp(_) => Ok(()),
         }
-
-        Ok(())
     }
 
     async fn handshake(&mut self) -> Result<()> {
         let mut buffer = [0u8; 20];
 
+        select! {
+            res = self.conn.read_exact(&mut buffer) => {
+                res.context("Reading handshake and magic preamble.")?;
+            },
+            _ = self.ct.cancelled() => {
+                return Err(anyhow!("no good"));
+            }
+        }
         // TODO: Make cancellable
-        self.conn
-            .read_exact(&mut buffer)
-            .await
-            .context("Reading handshake and magic preamble.")?;
 
         if buffer[0..4] != [0x60, 0x60, 0xB0, 0x17] {
             return Err(anyhow::anyhow!("Invalid magic preamble."));
@@ -88,5 +144,28 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
     async fn send_no_negotiated_bolt_version(&mut self) -> Result<()> {
         self.conn.write_all(&[0x00, 0x00, 0x00, 0x00]).await?;
         Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<ClientMessage> {
+        if let Some(peeked) = self.peeked_message.take() {
+            return Ok(peeked);
+        }
+
+        todo!("rouven to do!")
+    }
+
+    fn simulate(p0: &ActorBlock, p1: &ClientMessage) -> Result<()> {
+        todo!()
+    }
+
+    async fn peek_message(&mut self) -> Result<()> {
+        if self.peeked_message.is_none() {
+            todo!("rouven to do!")
+        }
+        Ok(())
+    }
+
+    fn peeked_message(&self) -> Option<&ClientMessage> {
+        self.peeked_message.as_ref()
     }
 }
