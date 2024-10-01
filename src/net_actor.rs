@@ -2,25 +2,38 @@ use crate::parser::ActorScript;
 use crate::types::actor_types::ActorBlock;
 use crate::values::ClientMessage;
 use anyhow::{anyhow, Context, Result};
-use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 pub struct NetActor<T> {
-    pub ct: CancellationToken,
-    pub conn: T,
-    pub name: String,
-    pub script: &'static ActorScript,
-    pub peeked_message: Option<ClientMessage>
+    ct: CancellationToken,
+    conn: T,
+    name: String,
+    script: &'static ActorScript,
+    peeked_message: Option<ClientMessage>,
 }
 
 impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
+    pub fn new(
+        ct: CancellationToken,
+        conn: T,
+        name: String,
+        script: &'static ActorScript,
+    ) -> NetActor<T> {
+        NetActor {
+            ct,
+            conn,
+            name,
+            script,
+            peeked_message: None,
+        }
+    }
+
     pub async fn run_client_connection(&mut self) -> Result<()> {
         self.handshake().await?;
 
-        let r = self.run_block(&self.script.tree).await?;
-        Ok(())
+        self.run_block(&self.script.tree).await
     }
 
     async fn run_block(&mut self, curr: &'static ActorBlock) -> Result<()> {
@@ -45,19 +58,19 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 todo!();
             }
             ActorBlock::Alt(ctx, alt_blocks) => {
-                self.peek_message().await?;
-                let peeked_message = self.peeked_message().expect("peeked above");
+                let peeked_message =
+                    Self::peek_message(&mut self.conn, &mut self.peeked_message).await?;
                 for alt_block in alt_blocks {
-                    if Self::simulate(alt_block, &peeked_message).is_ok() {
+                    if Self::simulate_block(alt_block, &peeked_message).is_ok() {
                         return Box::pin(self.run_block(alt_block)).await;
                     }
                 }
                 Err(anyhow!("No blocks matched")).context(ctx)
             }
             ActorBlock::Optional(_, optional_block) => {
-                self.peek_message().await?;
-                let peeked_message = self.peeked_message().expect("peeked above");
-                if Self::simulate(optional_block, &peeked_message).is_ok() {
+                let peeked_message =
+                    Self::peek_message(&mut self.conn, &mut self.peeked_message).await?;
+                if Self::simulate_block(optional_block, &peeked_message).is_ok() {
                     return Box::pin(self.run_block(optional_block)).await;
                 }
                 Ok(())
@@ -65,9 +78,9 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             ActorBlock::Repeat(ctx, block, rep) => {
                 let mut c = 0;
                 loop {
-                    self.peek_message().await?;
-                    let peeked_message = self.peeked_message().expect("peeked above");
-                    if Self::simulate(block, &peeked_message).is_ok() {
+                    let peeked_message =
+                        Self::peek_message(&mut self.conn, &mut self.peeked_message).await?;
+                    if Self::simulate_block(block, &peeked_message).is_ok() {
                         Box::pin(self.run_block(block)).await?;
                         c += 1;
                     } else {
@@ -146,26 +159,29 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         Ok(())
     }
 
+    fn simulate_block(curr: &ActorBlock, message: &ClientMessage) -> Result<()> {
+        todo!()
+    }
+
     async fn read_message(&mut self) -> Result<ClientMessage> {
         if let Some(peeked) = self.peeked_message.take() {
             return Ok(peeked);
         }
+        Self::read_unbuffered_message(&mut self.conn).await
+    }
 
+    async fn read_unbuffered_message(conn: &'_ mut T) -> Result<ClientMessage> {
         todo!("rouven to do!")
     }
 
-    fn simulate(p0: &ActorBlock, p1: &ClientMessage) -> Result<()> {
-        todo!()
-    }
-
-    async fn peek_message(&mut self) -> Result<()> {
-        if self.peeked_message.is_none() {
-            todo!("rouven to do!")
+    async fn peek_message<'buf>(
+        conn: &'_ mut T,
+        message_buffer: &'buf mut Option<ClientMessage>,
+    ) -> Result<&'buf ClientMessage> {
+        if message_buffer.is_none() {
+            let a: ClientMessage = Self::read_unbuffered_message(conn).await?;
+            message_buffer.replace(a);
         }
-        Ok(())
-    }
-
-    fn peeked_message(&self) -> Option<&ClientMessage> {
-        self.peeked_message.as_ref()
+        Ok(message_buffer.as_ref().unwrap())
     }
 }

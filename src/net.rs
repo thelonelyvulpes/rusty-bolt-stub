@@ -89,14 +89,12 @@ impl Server<'_> {
                             conn.set_nodelay(true)?;
                             let script = self.server_script_cfg;
                             let name = addr.to_string();
-                            let mut actor = NetActor {
+                            let mut actor = NetActor::new(
+                                connection_cancellation_token,
                                 conn,
-                                script,
                                 name,
-                                ct: connection_cancellation_token,
-                                peeked_message: None,
-                            };
-
+                                script,
+                            );
                             handles.spawn(async move {
                                 actor.run_client_connection().await
                             });
