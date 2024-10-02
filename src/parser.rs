@@ -271,6 +271,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
         ScanBlock::ServerMessage(ctx, message_name, body_string) => {
+            // TODO: Implement parser for the special messages like S: <Sleep 2>
             let server_message_sender = create_message_sender(message_name, body_string, config)?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
