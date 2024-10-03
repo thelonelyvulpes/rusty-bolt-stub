@@ -10,6 +10,15 @@ pub struct ClientMessage {
     fields: Vec<value_receive::ValueReceive>,
 }
 
+impl ClientMessage {
+    pub fn new(tag: u8, fields: Vec<value_receive::ValueReceive>) -> Self {
+        Self {
+            tag,
+            fields
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ServerMessage {
     fields: value_send::ValueSend,

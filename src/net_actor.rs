@@ -46,7 +46,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             }
             ActorBlock::ClientMessageValidate(ctx, validator) => {
                 let message = self.read_message().await?;
-                validator.validate(message).context(ctx)
+                validator.validate(&message).context(ctx)
             }
             ActorBlock::ServerMessageSend(ctx, data) => {
                 // send and die
@@ -97,7 +97,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             }
             ActorBlock::AutoMessage(ctx, handler) => {
                 let message = self.read_message().await?;
-                handler.client_validator.validate(message).context(ctx)?;
+                handler.client_validator.validate(&message).context(ctx)?;
                 let d = handler.server_sender.send()?;
                 self.conn.write_all(&d).await.context(ctx)
             }
@@ -159,8 +159,29 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         Ok(())
     }
 
-    fn simulate_block(curr: &ActorBlock, message: &ClientMessage) -> Result<()> {
-        todo!()
+    pub fn simulate_block(curr: &ActorBlock, message: &ClientMessage) -> Result<()> {
+        match curr {
+            ActorBlock::BlockList(_, blocks) => {
+                Self::simulate_block(blocks.first().unwrap(), message)
+            }
+            ActorBlock::ClientMessageValidate(ctx, validator) => validator.validate(message),
+            ActorBlock::ServerMessageSend(_, _) => Ok(()),
+            ActorBlock::Python(_, _) => Ok(()),
+            ActorBlock::Alt(ctx, alt_blocks) => {
+                for alt_block in alt_blocks {
+                    if Self::simulate_block(alt_block, message).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(anyhow!("No blocks matched"))
+            }
+            ActorBlock::Optional(ctx, optional_block) => {
+                Self::simulate_block(optional_block, message)
+            }
+            ActorBlock::Repeat(ctx, block, _) => Self::simulate_block(block, message),
+            ActorBlock::AutoMessage(ctx, handler) => handler.client_validator.validate(message),
+            ActorBlock::NoOp(_) => Ok(()),
+        }
     }
 
     async fn read_message(&mut self) -> Result<ClientMessage> {
@@ -170,7 +191,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         Self::read_unbuffered_message(&mut self.conn).await
     }
 
-    async fn read_unbuffered_message(conn: &'_ mut T) -> Result<ClientMessage> {
+    async fn read_unbuffered_message(_: &'_ mut T) -> Result<ClientMessage> {
         todo!("rouven to do!")
     }
 
@@ -183,5 +204,99 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             message_buffer.replace(a);
         }
         Ok(message_buffer.as_ref().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    mod simulate {
+        use crate::types::actor_types::{ActorBlock, ClientMessageValidator, ScriptLine};
+        use crate::types::Context;
+        use crate::values::ClientMessage;
+        use std::fmt::{Debug, Formatter};
+        use anyhow::anyhow;
+        use tokio::net::TcpStream;
+        use crate::net_actor::NetActor;
+
+        struct TestValidator {
+            pub valid: bool
+        }
+
+        impl ScriptLine for TestValidator {
+            fn original_line(&self) -> &str {
+                ""
+            }
+        }
+
+        impl Debug for TestValidator {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(f, "")
+            }
+        }
+
+        impl ClientMessageValidator for TestValidator {
+            fn validate(&self, message: &ClientMessage) -> anyhow::Result<()> {
+                match self.valid {
+                    true => {
+                        Ok(())
+                    }
+                    false => {
+                        Err(anyhow!("Not valid"))
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn should_ok() {
+            let test_block = ActorBlock::Alt(
+                Context {
+                    start_line_number: 0,
+                    end_line_number: 1,
+                },
+                vec![ActorBlock::BlockList(
+                    Context {
+                        start_line_number: 1,
+                        end_line_number: 3,
+                    },
+                    vec![ActorBlock::ClientMessageValidate(
+                        Context {
+                            start_line_number: 2,
+                            end_line_number: 2,
+                        },
+                        Box::new(TestValidator {valid: true}),
+                    )],
+                )],
+            );
+            let message = ClientMessage::new(0, vec![]);
+            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
+            assert!(res.is_ok());
+        }
+        
+        #[test]
+        fn should_fail() {
+            let test_block = ActorBlock::Alt(
+                Context {
+                    start_line_number: 0,
+                    end_line_number: 1,
+                },
+                vec![ActorBlock::BlockList(
+                    Context {
+                        start_line_number: 1,
+                        end_line_number: 3,
+                    },
+                    vec![ActorBlock::ClientMessageValidate(
+                        Context {
+                            start_line_number: 2,
+                            end_line_number: 2,
+                        },
+                        Box::new(TestValidator {valid: false}),
+                    )],
+                )],
+            );
+            let message = ClientMessage::new(0, vec![]);
+            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
+            assert!(res.is_err());
+        }
     }
 }
