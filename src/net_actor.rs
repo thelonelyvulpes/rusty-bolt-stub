@@ -191,8 +191,22 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         Self::read_unbuffered_message(&mut self.conn).await
     }
 
-    async fn read_unbuffered_message(_: &'_ mut T) -> Result<ClientMessage> {
-        todo!("rouven to do!")
+    async fn read_unbuffered_message(data_stream: &'_ mut T) -> Result<ClientMessage> {
+        let mut nibble_buffer = [0u8; 2];
+        let mut message_buffer = Vec::with_capacity(32);
+        let mut curr_idx = 0usize;
+        loop {
+            data_stream.read_exact(&mut nibble_buffer).await?;
+            let chunk_length = u16::from_be_bytes(nibble_buffer) as usize;
+            if chunk_length == 0usize {
+                break;
+            }
+            message_buffer.try_reserve(chunk_length)?;
+            data_stream.read_exact(&mut message_buffer[curr_idx..curr_idx + chunk_length]).await?;
+            curr_idx += chunk_length;
+        }
+
+        parse_message(message_buffer)
     }
 
     async fn peek_message<'buf>(
@@ -205,6 +219,10 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         }
         Ok(message_buffer.as_ref().unwrap())
     }
+}
+
+fn parse_message(p0: Vec<u8>) -> Result<ClientMessage> {
+    todo!()
 }
 
 #[cfg(test)]
@@ -272,7 +290,7 @@ mod tests {
             let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
             assert!(res.is_ok());
         }
-        
+
         #[test]
         fn should_fail() {
             let test_block = ActorBlock::Alt(
