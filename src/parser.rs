@@ -1,9 +1,9 @@
-use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
-};
+use crate::types::actor_types::{ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender};
 use crate::types::{BangLine, BoltVersion, Context, ScanBlock, Script};
 use std::error::Error;
+use std::fmt::{Debug, Formatter};
 use std::time::Duration;
+use itertools::Itertools;
 
 #[derive(Debug)]
 pub struct ActorScript {
@@ -230,7 +230,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 0 => Ok(ActorBlock::NoOp(*ctx)),
                 1 => Ok(actor_blocks.remove(0)),
                 _ => {
-                    // TODO: if to sibling blocks are lists, merge them
+                    let actor_blocks = condense_actor_blocks(actor_blocks);
                     Ok(ActorBlock::BlockList(*ctx, actor_blocks))
                 }
             }
@@ -296,6 +296,10 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     }
 }
 
+fn condense_actor_blocks(p0: Vec<ActorBlock>) -> Vec<ActorBlock> {
+    todo!()
+}
+
 fn create_auto_message_sender(
     client_message_tag: &str,
     config: &ActorConfig,
@@ -310,7 +314,30 @@ fn create_message_sender(
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
     // return Ok(Box::new(()));
-    todo!()
+    let data = vec![];
+    Ok(Box::new(SenderBytes {data}))
+}
+
+struct SenderBytes {
+    pub data: Vec<u8>
+}
+
+impl ScriptLine for SenderBytes {
+    fn original_line(&self) -> &str {
+        todo!()
+    }
+}
+
+impl Debug for SenderBytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+impl ServerMessageSender for SenderBytes {
+    fn send(&self) -> anyhow::Result<&[u8]> {
+        Ok(&self.data)
+    }
 }
 
 fn create_validator(
