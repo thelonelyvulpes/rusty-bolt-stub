@@ -5,6 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
+use crate::types::BoltVersion;
+use crate::values;
 
 pub struct NetActor<T> {
     ct: CancellationToken,
@@ -32,7 +34,6 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
 
     pub async fn run_client_connection(&mut self) -> Result<()> {
         self.handshake().await?;
-
         self.run_block(&self.script.tree).await
     }
 
@@ -59,7 +60,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             }
             ActorBlock::Alt(ctx, alt_blocks) => {
                 let peeked_message =
-                    Self::peek_message(&mut self.conn, &mut self.peeked_message).await?;
+                    Self::peek_message(&mut self.conn, &mut self.peeked_message, &self.script.config.bolt_version).await?;
                 for alt_block in alt_blocks {
                     if Self::simulate_block(alt_block, &peeked_message).is_ok() {
                         return Box::pin(self.run_block(alt_block)).await;
@@ -69,7 +70,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             }
             ActorBlock::Optional(_, optional_block) => {
                 let peeked_message =
-                    Self::peek_message(&mut self.conn, &mut self.peeked_message).await?;
+                    Self::peek_message(&mut self.conn, &mut self.peeked_message, &self.script.config.bolt_version).await?;
                 if Self::simulate_block(optional_block, &peeked_message).is_ok() {
                     return Box::pin(self.run_block(optional_block)).await;
                 }
@@ -79,7 +80,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 let mut c = 0;
                 loop {
                     let peeked_message =
-                        Self::peek_message(&mut self.conn, &mut self.peeked_message).await?;
+                        Self::peek_message(&mut self.conn, &mut self.peeked_message, &self.script.config.bolt_version).await?;
                     if Self::simulate_block(block, &peeked_message).is_ok() {
                         Box::pin(self.run_block(block)).await?;
                         c += 1;
@@ -107,7 +108,6 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
 
     async fn handshake(&mut self) -> Result<()> {
         let mut buffer = [0u8; 20];
-
         select! {
             res = self.conn.read_exact(&mut buffer) => {
                 res.context("Reading handshake and magic preamble.")?;
@@ -164,10 +164,10 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             ActorBlock::BlockList(_, blocks) => {
                 Self::simulate_block(blocks.first().unwrap(), message)
             }
-            ActorBlock::ClientMessageValidate(ctx, validator) => validator.validate(message),
+            ActorBlock::ClientMessageValidate(_, validator) => validator.validate(message),
             ActorBlock::ServerMessageSend(_, _) => Ok(()),
             ActorBlock::Python(_, _) => Ok(()),
-            ActorBlock::Alt(ctx, alt_blocks) => {
+            ActorBlock::Alt(_, alt_blocks) => {
                 for alt_block in alt_blocks {
                     if Self::simulate_block(alt_block, message).is_ok() {
                         return Ok(());
@@ -175,11 +175,11 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 }
                 Err(anyhow!("No blocks matched"))
             }
-            ActorBlock::Optional(ctx, optional_block) => {
+            ActorBlock::Optional(_, optional_block) => {
                 Self::simulate_block(optional_block, message)
             }
-            ActorBlock::Repeat(ctx, block, _) => Self::simulate_block(block, message),
-            ActorBlock::AutoMessage(ctx, handler) => handler.client_validator.validate(message),
+            ActorBlock::Repeat(_, block, _) => Self::simulate_block(block, message),
+            ActorBlock::AutoMessage(_, handler) => handler.client_validator.validate(message),
             ActorBlock::NoOp(_) => Ok(()),
         }
     }
@@ -188,10 +188,10 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         if let Some(peeked) = self.peeked_message.take() {
             return Ok(peeked);
         }
-        Self::read_unbuffered_message(&mut self.conn).await
+        Self::read_unbuffered_message(&mut self.conn, &self.script.config.bolt_version).await
     }
 
-    async fn read_unbuffered_message(data_stream: &'_ mut T) -> Result<ClientMessage> {
+    async fn read_unbuffered_message(data_stream: &'_ mut T, bolt_version: &BoltVersion) -> Result<ClientMessage> {
         let mut nibble_buffer = [0u8; 2];
         let mut message_buffer = Vec::with_capacity(32);
         let mut curr_idx = 0usize;
@@ -202,42 +202,51 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 break;
             }
             message_buffer.try_reserve(chunk_length)?;
-            data_stream.read_exact(&mut message_buffer[curr_idx..curr_idx + chunk_length]).await?;
+            data_stream
+                .read_exact(&mut message_buffer[curr_idx..curr_idx + chunk_length])
+                .await?;
             curr_idx += chunk_length;
         }
 
-        parse_message(message_buffer)
+        parse_message(message_buffer, bolt_version)
     }
 
     async fn peek_message<'buf>(
         conn: &'_ mut T,
         message_buffer: &'buf mut Option<ClientMessage>,
+        bolt_version: &'_ BoltVersion
     ) -> Result<&'buf ClientMessage> {
         if message_buffer.is_none() {
-            let a: ClientMessage = Self::read_unbuffered_message(conn).await?;
+            let a: ClientMessage = Self::read_unbuffered_message(conn, bolt_version).await?;
             message_buffer.replace(a);
         }
         Ok(message_buffer.as_ref().unwrap())
     }
 }
 
-fn parse_message(p0: Vec<u8>) -> Result<ClientMessage> {
-    todo!()
-}
+fn parse_message(data: Vec<u8>, bolt_version: &BoltVersion) -> Result<ClientMessage> {
+    if data.len() <= 1 {
+        return Err(anyhow!("Message too short, less than or one byte was received."));
+    }
 
+    let marker = data.get(0).unwrap();
+    let values = values::value_receive::ValueReceive::from_data(&data[1..], bolt_version)?;
+    Ok(ClientMessage::new(marker.clone(), values))
+
+}
 #[cfg(test)]
 mod tests {
     mod simulate {
+        use crate::net_actor::NetActor;
         use crate::types::actor_types::{ActorBlock, ClientMessageValidator, ScriptLine};
         use crate::types::Context;
         use crate::values::ClientMessage;
-        use std::fmt::{Debug, Formatter};
         use anyhow::anyhow;
+        use std::fmt::{Debug, Formatter};
         use tokio::net::TcpStream;
-        use crate::net_actor::NetActor;
 
         struct TestValidator {
-            pub valid: bool
+            pub valid: bool,
         }
 
         impl ScriptLine for TestValidator {
@@ -255,12 +264,8 @@ mod tests {
         impl ClientMessageValidator for TestValidator {
             fn validate(&self, message: &ClientMessage) -> anyhow::Result<()> {
                 match self.valid {
-                    true => {
-                        Ok(())
-                    }
-                    false => {
-                        Err(anyhow!("Not valid"))
-                    }
+                    true => Ok(()),
+                    false => Err(anyhow!("Not valid")),
                 }
             }
         }
@@ -282,7 +287,7 @@ mod tests {
                             start_line_number: 2,
                             end_line_number: 2,
                         },
-                        Box::new(TestValidator {valid: true}),
+                        Box::new(TestValidator { valid: true }),
                     )],
                 )],
             );
@@ -308,13 +313,152 @@ mod tests {
                             start_line_number: 2,
                             end_line_number: 2,
                         },
-                        Box::new(TestValidator {valid: false}),
+                        Box::new(TestValidator { valid: false }),
                     )],
                 )],
             );
+
             let message = ClientMessage::new(0, vec![]);
             let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
             assert!(res.is_err());
+        }
+
+        #[test]
+        fn nested_pass() {
+            let test_block = ActorBlock::Alt(
+                Context {
+                    start_line_number: 0,
+                    end_line_number: 1,
+                },
+                vec![
+                    ActorBlock::BlockList(
+                        Context {
+                            start_line_number: 1,
+                            end_line_number: 3,
+                        },
+                        vec![ActorBlock::ClientMessageValidate(
+                            Context {
+                                start_line_number: 2,
+                                end_line_number: 2,
+                            },
+                            Box::new(TestValidator { valid: false }),
+                        )],
+                    ),
+                    ActorBlock::BlockList(
+                        Context {
+                            start_line_number: 1,
+                            end_line_number: 3,
+                        },
+                        vec![ActorBlock::Alt(
+                            Context {
+                                start_line_number: 0,
+                                end_line_number: 1,
+                            },
+                            vec![
+                                ActorBlock::BlockList(
+                                    Context {
+                                        start_line_number: 1,
+                                        end_line_number: 3,
+                                    },
+                                    vec![ActorBlock::ClientMessageValidate(
+                                        Context {
+                                            start_line_number: 2,
+                                            end_line_number: 2,
+                                        },
+                                        Box::new(TestValidator { valid: false }),
+                                    )],
+                                ),
+                                ActorBlock::BlockList(
+                                    Context {
+                                        start_line_number: 1,
+                                        end_line_number: 3,
+                                    },
+                                    vec![ActorBlock::ClientMessageValidate(
+                                        Context {
+                                            start_line_number: 2,
+                                            end_line_number: 2,
+                                        },
+                                        Box::new(TestValidator { valid: true }),
+                                    )],
+                                ),
+                            ],
+                        )],
+                    ),
+                ],
+            );
+
+            let message = ClientMessage::new(0, vec![]);
+            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
+            assert!(res.is_ok());
+        }
+
+        #[test]
+        fn nested_failure() {
+            let test_block = ActorBlock::Alt(
+                Context {
+                    start_line_number: 0,
+                    end_line_number: 1,
+                },
+                vec![
+                    ActorBlock::BlockList(
+                        Context {
+                            start_line_number: 1,
+                            end_line_number: 3,
+                        },
+                        vec![ActorBlock::ClientMessageValidate(
+                            Context {
+                                start_line_number: 2,
+                                end_line_number: 2,
+                            },
+                            Box::new(TestValidator { valid: false }),
+                        )],
+                    ),
+                    ActorBlock::BlockList(
+                        Context {
+                            start_line_number: 1,
+                            end_line_number: 3,
+                        },
+                        vec![ActorBlock::Alt(
+                            Context {
+                                start_line_number: 0,
+                                end_line_number: 1,
+                            },
+                            vec![
+                                ActorBlock::BlockList(
+                                    Context {
+                                        start_line_number: 1,
+                                        end_line_number: 3,
+                                    },
+                                    vec![ActorBlock::ClientMessageValidate(
+                                        Context {
+                                            start_line_number: 2,
+                                            end_line_number: 2,
+                                        },
+                                        Box::new(TestValidator { valid: false }),
+                                    )],
+                                ),
+                                ActorBlock::BlockList(
+                                    Context {
+                                        start_line_number: 1,
+                                        end_line_number: 3,
+                                    },
+                                    vec![ActorBlock::ClientMessageValidate(
+                                        Context {
+                                            start_line_number: 2,
+                                            end_line_number: 2,
+                                        },
+                                        Box::new(TestValidator { valid: false }),
+                                    )],
+                                ),
+                            ],
+                        )],
+                    ),
+                ],
+            );
+
+            let message = ClientMessage::new(0, vec![]);
+            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
+            assert!(!res.is_ok());
         }
     }
 }
