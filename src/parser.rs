@@ -158,7 +158,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                         "Multiple BOLT version bang lines found",
                     ));
                 }
-                let bolt = BoltVersion::match_valid_version(*major, minor.unwrap_or_default())
+                let bolt = BoltVersion::match_valid_version(*major, minor)
                     .ok_or(ParseError::new_ctx(*ctx, "Invalid BOLT version"))?;
                 bolt_version = Some(bolt);
             }
