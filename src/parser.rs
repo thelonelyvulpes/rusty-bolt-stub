@@ -1,13 +1,13 @@
-use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
-};
-use crate::types::{ScanBlock, Script};
-use std::time::Duration;
-use anyhow::{anyhow, Context};
 use crate::bang_line::BangLine;
 use crate::bolt_version::BoltVersion;
 use crate::parse_error::ParseError;
 use crate::str_byte;
+use crate::types::actor_types::{
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
+};
+use crate::types::{ScanBlock, Script};
+use anyhow::{anyhow, Context};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct ActorScript {
@@ -164,7 +164,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 match str_byte::str_to_data(byte_str) {
                     Ok(data) => {
                         handshake = Some(data);
-                    },
+                    }
                     Err(e) => {
                         return Err(ParseError::new(e.to_string()));
                     }
@@ -178,7 +178,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
             }
         }
     }
-    
+
     if handshake.is_some() && bolt_version.is_some() {
         todo!("Report err")
     }

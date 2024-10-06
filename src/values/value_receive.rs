@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bolt_version::BoltVersion;
 use crate::values::{spatial, time};
 use std::collections::HashMap;
-use crate::bolt_version::BoltVersion;
 
 #[allow(unused)]
 #[derive(Debug, Clone, PartialEq)]

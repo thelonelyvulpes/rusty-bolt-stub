@@ -1,3 +1,5 @@
+use crate::bang_line::BangLine;
+use crate::context::Context;
 use crate::types::{ScanBlock, Script};
 use anyhow::anyhow;
 use nom::branch::alt;
@@ -11,8 +13,6 @@ use nom::{AsChar, InputLength, InputTakeAtPosition, Parser};
 use nom_span::Spanned;
 use nom_supreme::error::ErrorTree;
 use std::cmp::max;
-use crate::bang_line::BangLine;
-use crate::context::Context;
 
 type PError<I> = ErrorTree<I>;
 type Input<'a> = Spanned<&'a str>;
@@ -538,14 +538,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::scanner;
+    use super::{message, multi_message, Input};
+    use crate::bang_line::BangLine;
+    use crate::context::Context;
+    use crate::types::ScanBlock;
     use indoc::indoc;
     use nom_span::Spanned;
     use rstest::rstest;
-    use crate::bang_line::BangLine;
-    use crate::context::Context;
-    use super::super::scanner;
-    use super::{message, multi_message, Input};
-    use crate::types::{ScanBlock};
 
     #[test]
     fn test_scan_minimal_script() {

@@ -1,12 +1,12 @@
+use crate::bolt_version::BoltVersion;
 use crate::parser::ActorScript;
 use crate::types::actor_types::ActorBlock;
+use crate::values;
 use crate::values::ClientMessage;
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use crate::bolt_version::BoltVersion;
-use crate::values;
 
 pub struct NetActor<T> {
     ct: CancellationToken,
@@ -59,8 +59,12 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 todo!();
             }
             ActorBlock::Alt(ctx, alt_blocks) => {
-                let peeked_message =
-                    Self::peek_message(&mut self.conn, &mut self.peeked_message, &self.script.config.bolt_version).await?;
+                let peeked_message = Self::peek_message(
+                    &mut self.conn,
+                    &mut self.peeked_message,
+                    &self.script.config.bolt_version,
+                )
+                .await?;
                 for alt_block in alt_blocks {
                     if Self::simulate_block(alt_block, &peeked_message).is_ok() {
                         return Box::pin(self.run_block(alt_block)).await;
@@ -69,8 +73,12 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 Err(anyhow!("No blocks matched")).context(ctx)
             }
             ActorBlock::Optional(_, optional_block) => {
-                let peeked_message =
-                    Self::peek_message(&mut self.conn, &mut self.peeked_message, &self.script.config.bolt_version).await?;
+                let peeked_message = Self::peek_message(
+                    &mut self.conn,
+                    &mut self.peeked_message,
+                    &self.script.config.bolt_version,
+                )
+                .await?;
                 if Self::simulate_block(optional_block, &peeked_message).is_ok() {
                     return Box::pin(self.run_block(optional_block)).await;
                 }
@@ -79,8 +87,12 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             ActorBlock::Repeat(ctx, block, rep) => {
                 let mut c = 0;
                 loop {
-                    let peeked_message =
-                        Self::peek_message(&mut self.conn, &mut self.peeked_message, &self.script.config.bolt_version).await?;
+                    let peeked_message = Self::peek_message(
+                        &mut self.conn,
+                        &mut self.peeked_message,
+                        &self.script.config.bolt_version,
+                    )
+                    .await?;
                     if Self::simulate_block(block, &peeked_message).is_ok() {
                         Box::pin(self.run_block(block)).await?;
                         c += 1;
@@ -191,7 +203,10 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         Self::read_unbuffered_message(&mut self.conn, &self.script.config.bolt_version).await
     }
 
-    async fn read_unbuffered_message(data_stream: &'_ mut T, bolt_version: &BoltVersion) -> Result<ClientMessage> {
+    async fn read_unbuffered_message(
+        data_stream: &'_ mut T,
+        bolt_version: &BoltVersion,
+    ) -> Result<ClientMessage> {
         let mut nibble_buffer = [0u8; 2];
         let mut message_buffer = Vec::with_capacity(32);
         let mut curr_idx = 0usize;
@@ -214,7 +229,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
     async fn peek_message<'buf>(
         conn: &'_ mut T,
         message_buffer: &'buf mut Option<ClientMessage>,
-        bolt_version: &'_ BoltVersion
+        bolt_version: &'_ BoltVersion,
     ) -> Result<&'buf ClientMessage> {
         if message_buffer.is_none() {
             let a: ClientMessage = Self::read_unbuffered_message(conn, bolt_version).await?;
@@ -226,20 +241,21 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
 
 fn parse_message(data: Vec<u8>, bolt_version: &BoltVersion) -> Result<ClientMessage> {
     if data.len() <= 1 {
-        return Err(anyhow!("Message too short, less than or one byte was received."));
+        return Err(anyhow!(
+            "Message too short, less than or one byte was received."
+        ));
     }
 
     let marker = data.get(0).unwrap();
     let values = values::value_receive::ValueReceive::from_data(&data[1..], bolt_version)?;
     Ok(ClientMessage::new(marker.clone(), values))
-
 }
 #[cfg(test)]
 mod tests {
     mod simulate {
+        use crate::context::Context;
         use crate::net_actor::NetActor;
         use crate::types::actor_types::{ActorBlock, ClientMessageValidator, ScriptLine};
-        use crate::context::Context;
         use crate::values::ClientMessage;
         use anyhow::anyhow;
         use std::fmt::{Debug, Formatter};

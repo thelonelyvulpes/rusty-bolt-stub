@@ -1,5 +1,5 @@
-use std::fmt::Display;
 use std::cmp::{max, min};
+use std::fmt::Display;
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub struct Context {

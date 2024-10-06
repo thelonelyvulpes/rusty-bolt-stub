@@ -1,17 +1,17 @@
 // TODO: remove when rapid PoC phase is over
 #![allow(dead_code)]
 
-mod net;
-mod net_actor;
-mod parser;
-mod scanner;
-mod types;
-mod values;
 mod bang_line;
 mod bolt_version;
 mod context;
+mod net;
+mod net_actor;
 mod parse_error;
+mod parser;
+mod scanner;
 mod str_byte;
+mod types;
+mod values;
 
 use crate::parser::ActorScript;
 use anyhow::Context;

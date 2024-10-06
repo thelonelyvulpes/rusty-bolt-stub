@@ -25,7 +25,7 @@ impl BoltVersion {
                 3 => BoltVersion::V4_3,
                 4 => BoltVersion::V4_4,
                 _ => return None,
-            }
+            },
             (5, Some(x)) => match x {
                 0 => BoltVersion::V5_0,
                 1 => BoltVersion::V5_1,
@@ -34,7 +34,7 @@ impl BoltVersion {
                 4 => BoltVersion::V5_4,
                 5 => BoltVersion::V5_5,
                 _ => return None,
-            }
+            },
             _ => return None,
         })
     }
