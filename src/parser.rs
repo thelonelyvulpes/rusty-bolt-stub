@@ -2,13 +2,11 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
 };
 use crate::types::{BangLine, BoltVersion, Context, ScanBlock, Script};
-use itertools::Itertools;
 use std::error::Error;
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 #[derive(Debug)]
-pub struct Actor {
+pub struct ActorScript {
     pub config: ActorConfig,
     pub tree: ActorBlock,
     pub script: Script,
@@ -133,11 +131,11 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
     }
 }
 
-pub fn parse(script: Script) -> Result<Actor> {
+pub fn parse(script: Script) -> Result<ActorScript> {
     let config = parse_config(&script.bang_lines)?;
     let tree = parse_block(&script.body, &config)?;
 
-    Ok(Actor {
+    Ok(ActorScript {
         config,
         tree,
         script,
@@ -273,6 +271,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
         ScanBlock::ServerMessage(ctx, message_name, body_string) => {
+            // TODO: Implement parser for the special messages like S: <Sleep 2>
             let server_message_sender = create_message_sender(message_name, body_string, config)?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }

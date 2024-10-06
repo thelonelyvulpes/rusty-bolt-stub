@@ -40,7 +40,7 @@ impl BangLine {
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum BoltVersion {
-    V3_5,
+    V3_5, // TODO: Fix bolt 3.5 -> 3.0
     V4_0,
     V4_1,
     V4_2,
@@ -71,6 +71,40 @@ impl BoltVersion {
             (5, 5) => BoltVersion::V5_5,
             _ => return None,
         })
+    }
+
+    pub fn major(&self) -> u8 {
+        match self {
+            BoltVersion::V3_5 => 0,
+            BoltVersion::V4_0 => 4,
+            BoltVersion::V4_1 => 4,
+            BoltVersion::V4_2 => 4,
+            BoltVersion::V4_3 => 4,
+            BoltVersion::V4_4 => 4,
+            BoltVersion::V5_0 => 5,
+            BoltVersion::V5_1 => 5,
+            BoltVersion::V5_2 => 5,
+            BoltVersion::V5_3 => 5,
+            BoltVersion::V5_4 => 5,
+            BoltVersion::V5_5 => 5,
+        }
+    }
+
+    pub fn minor(&self) -> u8 {
+        match self {
+            BoltVersion::V3_5 => 0,
+            BoltVersion::V4_0 => 0,
+            BoltVersion::V4_1 => 1,
+            BoltVersion::V4_2 => 2,
+            BoltVersion::V4_3 => 3,
+            BoltVersion::V4_4 => 4,
+            BoltVersion::V5_0 => 0,
+            BoltVersion::V5_1 => 1,
+            BoltVersion::V5_2 => 2,
+            BoltVersion::V5_3 => 3,
+            BoltVersion::V5_4 => 4,
+            BoltVersion::V5_5 => 5,
+        }
     }
 }
 
@@ -141,18 +175,16 @@ pub mod actor_types {
 
     use std::fmt::Debug;
 
-    use tokio::net::TcpStream;
-
-    pub trait ScriptLine: Debug {
+    pub trait ScriptLine: Debug + Send + Sync {
         fn original_line(&self) -> &str;
     }
 
     pub trait ClientMessageValidator: ScriptLine {
-        fn validate(&self, message: ClientMessage) -> anyhow::Result<()>;
+        fn validate(&self, message: &ClientMessage) -> anyhow::Result<()>;
     }
 
-    pub trait ServerMessageSender: ScriptLine {
-        fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()>;
+    pub trait ServerMessageSender: ScriptLine + Send {
+        fn send(&self) -> anyhow::Result<Vec<u8>>;
     }
 
     // impl ScriptLine for () {
@@ -180,14 +212,14 @@ pub mod actor_types {
     }
 
     impl ClientMessageValidator for AutoMessageHandler {
-        fn validate(&self, message: ClientMessage) -> anyhow::Result<()> {
+        fn validate(&self, message: &ClientMessage) -> anyhow::Result<()> {
             self.client_validator.validate(message)
         }
     }
 
     impl ServerMessageSender for AutoMessageHandler {
-        fn send(&self, stream: &mut TcpStream) -> anyhow::Result<()> {
-            self.server_sender.send(stream)
+        fn send(&self) -> anyhow::Result<Vec<u8>> {
+            self.server_sender.send()
         }
     }
 

@@ -14,6 +14,7 @@
 
 use crate::values::{spatial, time};
 use std::collections::HashMap;
+use crate::types::BoltVersion;
 
 #[allow(unused)]
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +39,13 @@ pub enum ValueReceive {
     LocalDateTime(time::LocalDateTime),
     DateTime(time::DateTime),
     DateTimeFixed(time::DateTimeFixed),
+}
+
+impl ValueReceive {
+    pub(crate) fn from_data(p0: &[u8], p1: &BoltVersion) -> anyhow::Result<Vec<ValueReceive>> {
+
+        Ok(vec![])
+    }
 }
 
 impl ValueReceive {
