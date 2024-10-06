@@ -11,6 +11,7 @@ mod bang_line;
 mod bolt_version;
 mod context;
 mod parse_error;
+mod str_byte;
 
 use crate::parser::ActorScript;
 use anyhow::Context;

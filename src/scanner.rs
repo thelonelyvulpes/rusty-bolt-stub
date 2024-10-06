@@ -541,10 +541,11 @@ mod tests {
     use indoc::indoc;
     use nom_span::Spanned;
     use rstest::rstest;
+    use crate::bang_line::BangLine;
     use crate::context::Context;
     use super::super::scanner;
     use super::{message, multi_message, Input};
-    use crate::types::{BangLine, ScanBlock};
+    use crate::types::{ScanBlock};
 
     #[test]
     fn test_scan_minimal_script() {

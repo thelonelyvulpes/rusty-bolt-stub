@@ -43,7 +43,6 @@ pub enum ValueReceive {
 
 impl ValueReceive {
     pub(crate) fn from_data(p0: &[u8], p1: &BoltVersion) -> anyhow::Result<Vec<ValueReceive>> {
-
         Ok(vec![])
     }
 }

@@ -1,4 +1,3 @@
-use std::fmt::Display;
 use crate::bang_line::BangLine;
 use crate::context::Context;
 

@@ -262,7 +262,7 @@ mod tests {
         }
 
         impl ClientMessageValidator for TestValidator {
-            fn validate(&self, message: &ClientMessage) -> anyhow::Result<()> {
+            fn validate(&self, _: &ClientMessage) -> anyhow::Result<()> {
                 match self.valid {
                     true => Ok(()),
                     false => Err(anyhow!("Not valid")),

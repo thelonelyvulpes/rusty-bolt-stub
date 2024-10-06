@@ -3,9 +3,11 @@ use crate::types::actor_types::{
 };
 use crate::types::{ScanBlock, Script};
 use std::time::Duration;
+use anyhow::{anyhow, Context};
 use crate::bang_line::BangLine;
 use crate::bolt_version::BoltVersion;
 use crate::parse_error::ParseError;
+use crate::str_byte;
 
 #[derive(Debug)]
 pub struct ActorScript {
@@ -158,7 +160,15 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                         "Multiple handshake bang lines found",
                     ));
                 }
-                todo!("Parse handshake bytes")
+
+                match str_byte::str_to_data(byte_str) {
+                    Ok(data) => {
+                        handshake = Some(data);
+                    },
+                    Err(e) => {
+                        return Err(ParseError::new(e.to_string()));
+                    }
+                }
             }
             BangLine::HandshakeDelay(_, _) => {
                 todo!("Parse handshake delay")
@@ -167,6 +177,10 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 todo!("Python blocks are not yet supported in the actor")
             }
         }
+    }
+    
+    if handshake.is_some() && bolt_version.is_some() {
+        todo!("Report err")
     }
 
     let bolt_version = bolt_version.ok_or(ParseError::new("Bolt version not specified"))?;
