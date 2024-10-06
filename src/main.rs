@@ -7,6 +7,10 @@ mod parser;
 mod scanner;
 mod types;
 mod values;
+mod bang_line;
+mod bolt_version;
+mod context;
+mod parse_error;
 
 use crate::parser::ActorScript;
 use anyhow::Context;

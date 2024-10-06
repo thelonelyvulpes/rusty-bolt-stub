@@ -1,9 +1,11 @@
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
 };
-use crate::types::{BangLine, BoltVersion, Context, ScanBlock, Script};
-use std::error::Error;
+use crate::types::{ScanBlock, Script};
 use std::time::Duration;
+use crate::bang_line::BangLine;
+use crate::bolt_version::BoltVersion;
+use crate::parse_error::ParseError;
 
 #[derive(Debug)]
 pub struct ActorScript {
@@ -20,40 +22,6 @@ pub struct ActorConfig {
     pub handshake_delay: Option<Duration>,
     pub handshake: Option<Vec<u8>>,
 }
-
-#[derive(Debug)]
-pub struct ParseError {
-    pub message: String,
-    pub ctx: Option<Context>,
-}
-
-impl ParseError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            ctx: None,
-        }
-    }
-
-    pub fn new_ctx(ctx: Context, message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            ctx: Some(ctx),
-        }
-    }
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if let Some(ctx) = &self.ctx {
-            write!(f, "{}: {}", ctx, self.message)
-        } else {
-            write!(f, "{}", self.message)
-        }
-    }
-}
-
-impl Error for ParseError {}
 
 type Result<T> = std::result::Result<T, ParseError>;
 

@@ -5,7 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use crate::types::BoltVersion;
+use crate::bolt_version::BoltVersion;
 use crate::values;
 
 pub struct NetActor<T> {
@@ -239,7 +239,7 @@ mod tests {
     mod simulate {
         use crate::net_actor::NetActor;
         use crate::types::actor_types::{ActorBlock, ClientMessageValidator, ScriptLine};
-        use crate::types::Context;
+        use crate::context::Context;
         use crate::values::ClientMessage;
         use anyhow::anyhow;
         use std::fmt::{Debug, Formatter};

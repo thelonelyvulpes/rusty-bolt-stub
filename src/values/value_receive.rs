@@ -14,7 +14,7 @@
 
 use crate::values::{spatial, time};
 use std::collections::HashMap;
-use crate::types::BoltVersion;
+use crate::bolt_version::BoltVersion;
 
 #[allow(unused)]
 #[derive(Debug, Clone, PartialEq)]

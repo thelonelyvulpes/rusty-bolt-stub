@@ -1,143 +1,12 @@
-use std::cmp::{max, min};
 use std::fmt::Display;
-
-#[derive(Debug, PartialEq, Clone)]
-pub enum BangLine {
-    Version(Context, u8, Option<u8>),
-    AllowRestart(Context),
-    Auto(Context, String),
-    Concurrent(Context),
-    Handshake(Context, String),
-    HandshakeDelay(Context, f64),
-    Python(Context, String),
-}
-
-impl BangLine {
-    pub fn ctx(&self) -> &Context {
-        match self {
-            BangLine::Version(ctx, _, _) => ctx,
-            BangLine::AllowRestart(ctx) => ctx,
-            BangLine::Auto(ctx, _) => ctx,
-            BangLine::Concurrent(ctx) => ctx,
-            BangLine::Handshake(ctx, _) => ctx,
-            BangLine::HandshakeDelay(ctx, _) => ctx,
-            BangLine::Python(ctx, _) => ctx,
-        }
-    }
-
-    pub fn ctx_mut(&mut self) -> &mut Context {
-        match self {
-            BangLine::Version(ctx, _, _) => ctx,
-            BangLine::AllowRestart(ctx) => ctx,
-            BangLine::Auto(ctx, _) => ctx,
-            BangLine::Concurrent(ctx) => ctx,
-            BangLine::Handshake(ctx, _) => ctx,
-            BangLine::HandshakeDelay(ctx, _) => ctx,
-            BangLine::Python(ctx, _) => ctx,
-        }
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, Clone)]
-pub enum BoltVersion {
-    V3, // TODO: Fix bolt 3.5 -> 3.0
-    V4_0,
-    V4_1,
-    V4_2,
-    V4_3,
-    V4_4,
-    V5_0,
-    V5_1,
-    V5_2,
-    V5_3,
-    V5_4,
-    V5_5,
-}
-
-impl BoltVersion {
-    pub fn match_valid_version(major: u8, minor: &Option<u8>) -> Option<Self> {
-        Some(match (major, minor) {
-            (3, None) => BoltVersion::V3,
-            (4, Some(0)) => BoltVersion::V4_0,
-            (4, Some(1)) => BoltVersion::V4_1,
-            (4, Some(2)) => BoltVersion::V4_2,
-            (4, Some(3)) => BoltVersion::V4_3,
-            (4, Some(4)) => BoltVersion::V4_4,
-            (5, Some(0)) => BoltVersion::V5_0,
-            (5, Some(1)) => BoltVersion::V5_1,
-            (5, Some(2)) => BoltVersion::V5_2,
-            (5, Some(3)) => BoltVersion::V5_3,
-            (5, Some(4)) => BoltVersion::V5_4,
-            (5, Some(5)) => BoltVersion::V5_5,
-            _ => return None,
-        })
-    }
-
-    pub fn major(&self) -> u8 {
-        match self {
-            BoltVersion::V3 => 3,
-            BoltVersion::V4_0 => 4,
-            BoltVersion::V4_1 => 4,
-            BoltVersion::V4_2 => 4,
-            BoltVersion::V4_3 => 4,
-            BoltVersion::V4_4 => 4,
-            BoltVersion::V5_0 => 5,
-            BoltVersion::V5_1 => 5,
-            BoltVersion::V5_2 => 5,
-            BoltVersion::V5_3 => 5,
-            BoltVersion::V5_4 => 5,
-            BoltVersion::V5_5 => 5,
-        }
-    }
-
-    pub fn minor(&self) -> u8 {
-        match self {
-            BoltVersion::V3 => 0,
-            BoltVersion::V4_0 => 0,
-            BoltVersion::V4_1 => 1,
-            BoltVersion::V4_2 => 2,
-            BoltVersion::V4_3 => 3,
-            BoltVersion::V4_4 => 4,
-            BoltVersion::V5_0 => 0,
-            BoltVersion::V5_1 => 1,
-            BoltVersion::V5_2 => 2,
-            BoltVersion::V5_3 => 3,
-            BoltVersion::V5_4 => 4,
-            BoltVersion::V5_5 => 5,
-        }
-    }
-}
+use crate::bang_line::BangLine;
+use crate::context::Context;
 
 #[derive(Debug)]
 pub struct Script {
     pub(crate) name: String,
     pub(crate) bang_lines: Vec<BangLine>,
     pub(crate) body: ScanBlock,
-}
-
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
-pub struct Context {
-    pub(crate) start_line_number: usize,
-    pub(crate) end_line_number: usize,
-}
-
-impl Display for Context {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "lines {}-{}",
-            self.start_line_number, self.end_line_number
-        )
-    }
-}
-
-impl Context {
-    pub fn fuse(&self, other: &Context) -> Context {
-        Context {
-            start_line_number: min(self.start_line_number, other.start_line_number),
-            end_line_number: max(self.end_line_number, other.end_line_number),
-        }
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -170,7 +39,7 @@ pub struct ConditionBranch {
 }
 
 pub mod actor_types {
-    use super::Context;
+    use crate::context::Context;
     use crate::values::ClientMessage;
 
     use std::fmt::Debug;
