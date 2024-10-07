@@ -26,6 +26,6 @@ mod test {
     pub fn test() {
         let bytes = "FF 00 22FF ffa1";
         let bytes = str_to_data(bytes).unwrap();
-        assert_eq!(vec![255, 0, 34, 255, 255, 17], bytes);
+        assert_eq!(vec![255, 0, 34, 255, 255, 161], bytes);
     }
 }
