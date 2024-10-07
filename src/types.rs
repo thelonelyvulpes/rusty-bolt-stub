@@ -52,7 +52,7 @@ pub mod actor_types {
     }
 
     pub trait ServerMessageSender: ScriptLine + Send {
-        fn send(&self) -> anyhow::Result<Vec<u8>>;
+        fn send(&self) -> anyhow::Result<&[u8]>;
     }
 
     // impl ScriptLine for () {
@@ -86,7 +86,7 @@ pub mod actor_types {
     }
 
     impl ServerMessageSender for AutoMessageHandler {
-        fn send(&self) -> anyhow::Result<Vec<u8>> {
+        fn send(&self) -> anyhow::Result<&[u8]> {
             self.server_sender.send()
         }
     }

@@ -3,10 +3,11 @@ use crate::bolt_version::BoltVersion;
 use crate::parse_error::ParseError;
 use crate::str_byte;
 use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
 };
 use crate::types::{ScanBlock, Script};
-use anyhow::{anyhow, Context};
+use itertools::Itertools;
+use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -212,7 +213,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 0 => Ok(ActorBlock::NoOp(*ctx)),
                 1 => Ok(actor_blocks.remove(0)),
                 _ => {
-                    // TODO: if to sibling blocks are lists, merge them
+                    let actor_blocks = condense_actor_blocks(actor_blocks);
                     Ok(ActorBlock::BlockList(*ctx, actor_blocks))
                 }
             }
@@ -278,6 +279,10 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     }
 }
 
+fn condense_actor_blocks(p0: Vec<ActorBlock>) -> Vec<ActorBlock> {
+    todo!()
+}
+
 fn create_auto_message_sender(
     client_message_tag: &str,
     config: &ActorConfig,
@@ -292,7 +297,46 @@ fn create_message_sender(
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
     // return Ok(Box::new(()));
-    todo!()
+    let data = vec![];
+
+    Ok(Box::new(SenderBytes::new(data, message_name, message_body)))
+}
+
+struct SenderBytes {
+    pub data: Vec<u8>,
+    pub message_name: String,
+    pub message_body: Option<String>,
+}
+
+impl SenderBytes {
+    pub fn new(data: Vec<u8>, message_name: &str, message_body: &Option<String>) -> Self {
+        Self {
+            data,
+            message_name: message_name.to_string(),
+            message_body: message_body.clone(),
+        }
+    }
+}
+
+impl ScriptLine for SenderBytes {
+    fn original_line(&self) -> &str {
+        ""
+    }
+}
+
+impl Debug for SenderBytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.message_body {
+            None => write!(f, "{}", self.message_name),
+            Some(body) => write!(f, "{} {}", self.message_name, body),
+        }
+    }
+}
+
+impl ServerMessageSender for SenderBytes {
+    fn send(&self) -> anyhow::Result<&[u8]> {
+        Ok(&self.data)
+    }
 }
 
 fn create_validator(
