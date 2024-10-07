@@ -1,9 +1,11 @@
-use crate::types::actor_types::{ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender};
+use crate::types::actor_types::{
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
+};
 use crate::types::{BangLine, BoltVersion, Context, ScanBlock, Script};
+use itertools::Itertools;
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::time::Duration;
-use itertools::Itertools;
 
 #[derive(Debug)]
 pub struct ActorScript {
@@ -315,22 +317,42 @@ fn create_message_sender(
 ) -> Result<Box<dyn ServerMessageSender>> {
     // return Ok(Box::new(()));
     let data = vec![];
-    Ok(Box::new(SenderBytes {data}))
+
+    Ok(Box::new(SenderBytes::new(
+        data,
+        message_name,
+        message_body,
+    )))
 }
 
 struct SenderBytes {
-    pub data: Vec<u8>
+    pub data: Vec<u8>,
+    pub message_name: String,
+    pub message_body: Option<String>,
+}
+
+impl SenderBytes {
+    pub fn new(data: Vec<u8>, message_name: &str, message_body: &Option<String>) -> Self {
+        Self {
+            data,
+            message_name: message_name.to_string(),
+            message_body: message_body.clone(),
+        }
+    }
 }
 
 impl ScriptLine for SenderBytes {
     fn original_line(&self) -> &str {
-        todo!()
+        ""
     }
 }
 
 impl Debug for SenderBytes {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        match &self.message_body {
+            None => write!(f, "{}", self.message_name),
+            Some(body) => write!(f, "{} {}", self.message_name, body),
+        }
     }
 }
 

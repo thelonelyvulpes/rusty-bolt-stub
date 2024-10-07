@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::types::BoltVersion;
 use crate::values::{spatial, time};
 use std::collections::HashMap;
-use crate::types::BoltVersion;
 
 #[allow(unused)]
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +43,6 @@ pub enum ValueReceive {
 
 impl ValueReceive {
     pub(crate) fn from_data(p0: &[u8], p1: &BoltVersion) -> anyhow::Result<Vec<ValueReceive>> {
-
         Ok(vec![])
     }
 }
