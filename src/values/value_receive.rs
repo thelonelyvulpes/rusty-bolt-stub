@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::bolt_version::BoltVersion;
-use crate::values::{spatial, time};
+use anyhow::{anyhow, Result};
+use nom::{Parser, ToUsize};
 use std::collections::HashMap;
 
 #[allow(unused)]
@@ -28,21 +29,11 @@ pub enum ValueReceive {
     String(String),
     List(Vec<ValueReceive>),
     Map(HashMap<String, ValueReceive>),
-    Cartesian2D(spatial::Cartesian2D),
-    Cartesian3D(spatial::Cartesian3D),
-    WGS84_2D(spatial::WGS84_2D),
-    WGS84_3D(spatial::WGS84_3D),
-    Duration(time::Duration),
-    LocalTime(time::LocalTime),
-    Time(time::Time),
-    Date(time::Date),
-    LocalDateTime(time::LocalDateTime),
-    DateTime(time::DateTime),
-    DateTimeFixed(time::DateTimeFixed),
+    Struct(u8, Vec<ValueReceive>),
 }
 
 impl ValueReceive {
-    pub(crate) fn from_data(p0: &[u8], p1: &BoltVersion) -> anyhow::Result<Vec<ValueReceive>> {
+    pub(crate) fn from_data(data: &[u8], version: &BoltVersion) -> Result<Vec<ValueReceive>> {
         Ok(vec![])
     }
 }
@@ -72,29 +63,14 @@ impl ValueReceive {
                     .all(|((k1, v1), (k2, v2))| k1 == k2 && v1.eq_data(v2)),
                 _ => false,
             },
-            ValueReceive::Cartesian2D(v1) => {
-                matches!(other, ValueReceive::Cartesian2D(v2) if v1.eq_data(v2))
-            }
-            ValueReceive::Cartesian3D(v1) => {
-                matches!(other, ValueReceive::Cartesian3D(v2) if v1.eq_data(v2))
-            }
-            ValueReceive::WGS84_2D(v1) => {
-                matches!(other, ValueReceive::WGS84_2D(v2) if v1.eq_data(v2))
-            }
-            ValueReceive::WGS84_3D(v1) => {
-                matches!(other, ValueReceive::WGS84_3D(v2) if v1.eq_data(v2))
-            }
-            ValueReceive::Duration(v1) => matches!(other, ValueReceive::Duration(v2) if v1 == v2),
-            ValueReceive::LocalTime(v1) => matches!(other, ValueReceive::LocalTime(v2) if v1 == v2),
-            ValueReceive::Time(v1) => matches!(other, ValueReceive::Time(v2) if v1 == v2),
-            ValueReceive::Date(v1) => matches!(other, ValueReceive::Date(v2) if v1 == v2),
-            ValueReceive::LocalDateTime(v1) => {
-                matches!(other, ValueReceive::LocalDateTime(v2) if v1 == v2)
-            }
-            ValueReceive::DateTime(v1) => matches!(other, ValueReceive::DateTime(v2) if v1 == v2),
-            ValueReceive::DateTimeFixed(v1) => {
-                matches!(other, ValueReceive::DateTimeFixed(v2) if v1 == v2)
-            }
+            ValueReceive::Struct(t1, v1) => match other {
+                ValueReceive::Struct(t2, v2) => {
+                    t1 == t2 && v1.len() == v2.len() && {
+                        v1.iter().zip(v2.iter()).all(|(v1, v2)| v1.eq_data(v2))
+                    }
+                }
+                _ => false,
+            },
         }
     }
 }
@@ -127,22 +103,11 @@ impl_value_from_into!(ValueReceive::Boolean, bool);
 impl_value_from_into!(ValueReceive::Integer, u8, u16, u32, i8, i16, i32, i64);
 impl_value_from_into!(ValueReceive::Float, f32, f64);
 impl_value_from_into!(ValueReceive::String, &str);
+impl_value_from_into!(ValueReceive::Bytes, &[u8]);
 
 impl_value_from_owned!(ValueReceive::String, String);
-// impl_value_from_owned!(Value::List, Vec<Value>);
+// impl_value_from_owned!(ValueReceive::List, Vec<ValueReceive>);
 // impl_value_from_owned!(Value::Map, HashMap<String, Value>);
-impl_value_from_owned!(ValueReceive::Cartesian2D, spatial::Cartesian2D);
-impl_value_from_owned!(ValueReceive::Cartesian3D, spatial::Cartesian3D);
-impl_value_from_owned!(ValueReceive::WGS84_2D, spatial::WGS84_2D);
-impl_value_from_owned!(ValueReceive::WGS84_3D, spatial::WGS84_3D);
-impl_value_from_owned!(ValueReceive::Duration, time::Duration);
-impl_value_from_owned!(ValueReceive::LocalTime, time::LocalTime);
-impl_value_from_owned!(ValueReceive::Time, time::Time);
-impl_value_from_owned!(ValueReceive::Date, time::Date);
-impl_value_from_owned!(ValueReceive::LocalDateTime, time::LocalDateTime);
-impl_value_from_owned!(ValueReceive::DateTime, time::DateTime);
-impl_value_from_owned!(ValueReceive::DateTimeFixed, time::DateTimeFixed);
-
 impl<T: Into<ValueReceive>> From<HashMap<String, T>> for ValueReceive {
     fn from(value: HashMap<String, T>) -> Self {
         ValueReceive::Map(value.into_iter().map(|(k, v)| (k, v.into())).collect())
@@ -402,365 +367,234 @@ impl ValueReceive {
     }
 }
 
-impl TryFrom<ValueReceive> for spatial::Cartesian2D {
-    type Error = ValueReceive;
+const TINY_STRING: u8 = 0x80;
+const TINY_LIST: u8 = 0x90;
+const TINY_MAP: u8 = 0xA0;
+const TINY_STRUCT: u8 = 0xB0;
+const NULL: u8 = 0xC0;
+const FALSE: u8 = 0xC2;
+const TRUE: u8 = 0xC3;
+const INT_8: u8 = 0xC8;
+const INT_16: u8 = 0xC9;
+const INT_32: u8 = 0xCA;
+const INT_64: u8 = 0xCB;
+const FLOAT_64: u8 = 0xC1;
+const STRING_8: u8 = 0xD0;
+const STRING_16: u8 = 0xD1;
+const STRING_32: u8 = 0xD2;
+const LIST_8: u8 = 0xD4;
+const LIST_16: u8 = 0xD5;
+const LIST_32: u8 = 0xD6;
+const MAP_8: u8 = 0xD8;
+const MAP_16: u8 = 0xD9;
+const MAP_32: u8 = 0xDA;
+const BYTES_8: u8 = 0xCC;
+const BYTES_16: u8 = 0xCD;
+const BYTES_32: u8 = 0xCE;
 
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::Cartesian2D(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
+struct PackStreamDecoder<'a> {
+    bytes: &'a [u8],
+    index: usize,
 }
 
-impl ValueReceive {
-    #[inline]
-    pub fn is_cartesian_2d(&self) -> bool {
-        matches!(self, ValueReceive::Cartesian2D(_))
+impl<'a> PackStreamDecoder<'a> {
+    fn new(bytes: &'a [u8], idx: usize) -> Self {
+        Self { bytes, index: idx }
     }
 
-    #[inline]
-    pub fn as_cartesian_2d(&self) -> Option<&spatial::Cartesian2D> {
-        match self {
-            ValueReceive::Cartesian2D(v) => Some(v),
-            _ => None,
+    fn read(&mut self) -> Result<ValueReceive> {
+        let marker = self.read_byte()?;
+        self.read_value(marker)
+    }
+
+    fn read_value(&mut self, marker: u8) -> Result<ValueReceive> {
+        let high_nibble = marker & 0xF0;
+
+        Ok(match marker {
+            // tiny int
+            _ if marker as i8 >= -16 => marker.into(),
+            NULL => ValueReceive::Null,
+            FLOAT_64 => self.read_f64()?.into(),
+            FALSE => false.into(),
+            TRUE => true.into(),
+            INT_8 => self.read_i8()?.into(),
+            INT_16 => self.read_i16()?.into(),
+            INT_32 => self.read_i32()?.into(),
+            INT_64 => self.read_i64()?.into(),
+            BYTES_8 => {
+                let len = self.read_u8()?;
+                self.read_bytes(len)?
+            }
+            BYTES_16 => {
+                let len = self.read_u16()?;
+                self.read_bytes(len)?
+            }
+            BYTES_32 => {
+                let len = self.read_u32()?;
+                self.read_bytes(len)?
+            }
+            _ if high_nibble == TINY_STRING => self.read_string((marker & 0x0F).into())?,
+            STRING_8 => {
+                let len = self.read_u8()?;
+                self.read_string(len)?
+            }
+            STRING_16 => {
+                let len = self.read_u16()?;
+                self.read_string(len)?
+            }
+            STRING_32 => {
+                let len = self.read_u32()?;
+                self.read_string(len)?
+            }
+            _ if high_nibble == TINY_LIST => self.read_list((marker & 0x0F).into())?,
+            LIST_8 => {
+                let len = self.read_u8()?;
+                self.read_list(len)?
+            }
+            LIST_16 => {
+                let len = self.read_u16()?;
+                self.read_list(len)?
+            }
+            LIST_32 => {
+                let len = self.read_u32()?;
+                self.read_list(len)?
+            }
+            _ if high_nibble == TINY_MAP => self.read_map((marker & 0x0F).into())?,
+            MAP_8 => {
+                let len = self.read_u8()?;
+                self.read_map(len)?
+            }
+            MAP_16 => {
+                let len = self.read_u16()?;
+                self.read_map(len)?
+            }
+            MAP_32 => {
+                let len = self.read_u32()?;
+                self.read_map(len)?
+            }
+            _ if high_nibble == TINY_STRUCT => self.read_struct((marker & 0x0F).into())?,
+            _ => {
+                // raise ValueError("Unknown PackStream marker %02X" % marker)
+                return Err(anyhow!("Unknown PackStream marker {:02X}", marker));
+            }
+        })
+    }
+
+    fn read_list(&mut self, length: usize) -> Result<ValueReceive> {
+        let mut items = Vec::with_capacity(length);
+        for _ in 0..length {
+            items.push(self.read()?);
+        }
+        Ok(items.into())
+    }
+
+    fn read_string(&mut self, length: usize) -> Result<ValueReceive> {
+        self.read_raw_string(length).map(Into::into)
+    }
+
+    fn read_map(&mut self, length: usize) -> Result<ValueReceive> {
+        let mut key_value_pairs = HashMap::with_capacity(length);
+        for _ in 0..length {
+            let len = self.read_string_length()?;
+            let key = self.read_raw_string(len)?;
+            let value = self.read()?;
+            key_value_pairs.insert(key, value);
+        }
+        Ok(key_value_pairs.into())
+    }
+
+    fn read_bytes(&mut self, length: usize) -> Result<ValueReceive> {
+        let data = self.bytes.get(self.index..self.index + length);
+        self.index += length;
+        Ok(data.into())
+    }
+
+    fn read_struct(&mut self, length: usize) -> Result<ValueReceive> {
+        let tag = self.read_byte()?;
+        let mut fields = Vec::with_capacity(length);
+        for _ in 0..length {
+            fields.push(self.read()?)
+        }
+        let bolt_struct = ValueReceive::Struct(tag, fields);
+        Ok(bolt_struct)
+    }
+
+    fn read_string_length(&mut self) -> Result<usize> {
+        let marker = self.read_byte()?;
+        let high_nibble = marker & 0xF0;
+        match high_nibble {
+            TINY_STRING => Ok((marker & 0x0F) as usize),
+            STRING_8 => self.read_u8(),
+            STRING_16 => self.read_u16(),
+            STRING_32 => self.read_u32(),
+            _ => Err(anyhow!("Invalid string length marker: {}", marker)),
         }
     }
 
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_cartesian_2d(self) -> Result<spatial::Cartesian2D, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for spatial::Cartesian3D {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::Cartesian3D(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_cartesian_3d(&self) -> bool {
-        matches!(self, ValueReceive::Cartesian3D(_))
+    fn read_byte(&mut self) -> Result<u8> {
+        let byte = *self
+            .bytes
+            .get(self.index)
+            .ok_or_else(|| anyhow!("Nothing to unpack"))?;
+        self.index += 1;
+        Ok(byte)
     }
 
-    #[inline]
-    pub fn as_cartesian_3d(&self) -> Option<&spatial::Cartesian3D> {
-        match self {
-            ValueReceive::Cartesian3D(v) => Some(v),
-            _ => None,
+    fn read_n_bytes<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let to = self.index + N;
+        match self.bytes.get(self.index..to) {
+            Some(b) => {
+                self.index = to;
+                Ok(<[u8; N]>::try_from(b).expect("we know the slice has exactly N values"))
+            }
+            None => Err(anyhow!("no me gusta")),
         }
     }
 
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_cartesian_3d(self) -> Result<spatial::Cartesian3D, Self> {
-        self.try_into()
+    fn read_u8(&mut self) -> Result<usize> {
+        self.read_byte().map(Into::into)
     }
-}
 
-impl TryFrom<ValueReceive> for spatial::WGS84_2D {
-    type Error = ValueReceive;
+    fn read_u16(&mut self) -> Result<usize> {
+        let data = self.read_n_bytes()?;
+        Ok(u16::from_be_bytes(data).to_usize())
+    }
 
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::WGS84_2D(v) => Ok(v),
-            _ => Err(value),
+    fn read_u32(&mut self) -> Result<usize> {
+        let data = self.read_n_bytes()?;
+        Ok(u32::from_be_bytes(data).to_usize())
+    }
+
+    fn read_i8(&mut self) -> Result<i8> {
+        self.read_byte().map(|b| i8::from_be_bytes([b]))
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        self.read_n_bytes().map(i16::from_be_bytes)
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        self.read_n_bytes().map(i32::from_be_bytes)
+    }
+
+    fn read_i64(&mut self) -> Result<i64> {
+        self.read_n_bytes().map(i64::from_be_bytes)
+    }
+
+    fn read_f64(&mut self) -> Result<f64> {
+        self.read_n_bytes().map(f64::from_be_bytes)
+    }
+
+    fn read_raw_string(&mut self, length: usize) -> Result<String> {
+        if length == 0 {
+            return Ok("".into());
         }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_wgs84_2d(&self) -> bool {
-        matches!(self, ValueReceive::WGS84_2D(_))
-    }
-
-    #[inline]
-    pub fn as_wgs84_2d(&self) -> Option<&spatial::WGS84_2D> {
-        match self {
-            ValueReceive::WGS84_2D(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_wgs84_2d(self) -> Result<spatial::WGS84_2D, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for spatial::WGS84_3D {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::WGS84_3D(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_wgs84_3d(&self) -> bool {
-        matches!(self, ValueReceive::WGS84_3D(_))
-    }
-
-    #[inline]
-    pub fn as_wgs84_3d(&self) -> Option<&spatial::WGS84_3D> {
-        match self {
-            ValueReceive::WGS84_3D(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_wgs84_3d(self) -> Result<spatial::WGS84_3D, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for time::Duration {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::Duration(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_duration(&self) -> bool {
-        matches!(self, ValueReceive::Duration(_))
-    }
-
-    #[inline]
-    pub fn as_duration(&self) -> Option<&time::Duration> {
-        match self {
-            ValueReceive::Duration(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_duration(self) -> Result<time::Duration, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for time::LocalTime {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::LocalTime(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_local_time(&self) -> bool {
-        matches!(self, ValueReceive::LocalTime(_))
-    }
-
-    #[inline]
-    pub fn as_local_time(&self) -> Option<&time::LocalTime> {
-        match self {
-            ValueReceive::LocalTime(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_local_time(self) -> Result<time::LocalTime, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for time::Time {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::Time(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_time(&self) -> bool {
-        matches!(self, ValueReceive::Time(_))
-    }
-
-    #[inline]
-    pub fn as_time(&self) -> Option<&time::Time> {
-        match self {
-            ValueReceive::Time(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_time(self) -> Result<time::Time, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for time::Date {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::Date(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_date(&self) -> bool {
-        matches!(self, ValueReceive::Date(_))
-    }
-
-    #[inline]
-    pub fn as_date(&self) -> Option<&time::Date> {
-        match self {
-            ValueReceive::Date(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_date(self) -> Result<time::Date, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for time::LocalDateTime {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::LocalDateTime(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_local_date_time(&self) -> bool {
-        matches!(self, ValueReceive::LocalDateTime(_))
-    }
-
-    #[inline]
-    pub fn as_local_date_time(&self) -> Option<&time::LocalDateTime> {
-        match self {
-            ValueReceive::LocalDateTime(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_local_date_time(self) -> Result<time::LocalDateTime, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for time::DateTime {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::DateTime(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_date_time(&self) -> bool {
-        matches!(self, ValueReceive::DateTime(_))
-    }
-
-    #[inline]
-    pub fn as_date_time(&self) -> Option<&time::DateTime> {
-        match self {
-            ValueReceive::DateTime(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_date_time(self) -> Result<time::DateTime, Self> {
-        self.try_into()
-    }
-}
-
-impl TryFrom<ValueReceive> for time::DateTimeFixed {
-    type Error = ValueReceive;
-
-    #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
-        match value {
-            ValueReceive::DateTimeFixed(v) => Ok(v),
-            _ => Err(value),
-        }
-    }
-}
-
-impl ValueReceive {
-    #[inline]
-    pub fn is_date_time_fixed(&self) -> bool {
-        matches!(self, ValueReceive::DateTimeFixed(_))
-    }
-
-    #[inline]
-    pub fn as_date_time_fixed(&self) -> Option<&time::DateTimeFixed> {
-        match self {
-            ValueReceive::DateTimeFixed(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    #[allow(clippy::result_large_err)]
-    pub fn try_into_date_time_fixed(self) -> Result<time::DateTimeFixed, Self> {
-        self.try_into()
+        let data = self
+            .bytes
+            .get(self.index..self.index + length)
+            .ok_or(anyhow!("expected some bytes"))?;
+        let parsed = String::from_utf8(data.into())?;
+        self.index += length;
+        Ok(parsed)
     }
 }

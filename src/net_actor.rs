@@ -250,6 +250,7 @@ fn parse_message(data: Vec<u8>, bolt_version: &BoltVersion) -> Result<ClientMess
     let values = values::value_receive::ValueReceive::from_data(&data[1..], bolt_version)?;
     Ok(ClientMessage::new(marker.clone(), values))
 }
+
 #[cfg(test)]
 mod tests {
     mod simulate {
