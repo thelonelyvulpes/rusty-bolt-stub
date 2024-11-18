@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bolt_version::BoltVersion;
 use anyhow::{anyhow, Result};
 use nom::{Parser, ToUsize};
 use std::collections::HashMap;
@@ -33,8 +32,18 @@ pub enum ValueReceive {
 }
 
 impl ValueReceive {
-    pub(crate) fn from_data(data: &[u8], version: &BoltVersion) -> Result<Vec<ValueReceive>> {
-        Ok(vec![])
+    pub(crate) fn from_data_consume_all(data: &[u8]) -> Result<ValueReceive> {
+        let mut decoder = PackStreamDecoder::new(data, 0);
+        let value = decoder.read()?;
+        if decoder.index != data.len() {
+            return Err(anyhow!(
+                "Unconsumed data ({} byes) {:?} read: {:?}",
+                data.len() - decoder.index,
+                data,
+                value
+            ));
+        }
+        Ok(value)
     }
 }
 
@@ -363,6 +372,39 @@ impl ValueReceive {
     #[inline]
     #[allow(clippy::result_large_err)]
     pub fn try_into_map(self) -> Result<HashMap<String, ValueReceive>, Self> {
+        self.try_into()
+    }
+}
+
+impl TryFrom<ValueReceive> for (u8, Vec<ValueReceive>) {
+    type Error = ValueReceive;
+
+    #[inline]
+    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+        match value {
+            ValueReceive::Struct(tag, values) => Ok((tag, values)),
+            _ => Err(value),
+        }
+    }
+}
+
+impl ValueReceive {
+    #[inline]
+    pub fn is_struct(&self) -> bool {
+        matches!(self, ValueReceive::Struct(_, _))
+    }
+
+    #[inline]
+    pub fn as_struct(&self) -> Option<(u8, &Vec<ValueReceive>)> {
+        match self {
+            ValueReceive::Struct(tag, values) => Some((*tag, values)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::result_large_err)]
+    pub fn try_into_struct(self) -> Result<(u8, Vec<ValueReceive>), Self> {
         self.try_into()
     }
 }

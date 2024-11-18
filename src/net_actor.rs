@@ -246,9 +246,12 @@ fn parse_message(data: Vec<u8>, bolt_version: &BoltVersion) -> Result<ClientMess
         ));
     }
 
-    let marker = data.get(0).unwrap();
-    let values = values::value_receive::ValueReceive::from_data(&data[1..], bolt_version)?;
-    Ok(ClientMessage::new(marker.clone(), values))
+    let value = values::value_receive::ValueReceive::from_data_consume_all(&data)
+        .context("arsing bolt message")?;
+    let values::value_receive::ValueReceive::Struct(tag, fields) = value else {
+        return Err(anyhow!("Expected a bolt message but got: {:?}.", value));
+    };
+    Ok(ClientMessage::new(tag, fields))
 }
 
 #[cfg(test)]

@@ -6,7 +6,6 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
 };
 use crate::types::{ScanBlock, Script};
-use itertools::Itertools;
 use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
