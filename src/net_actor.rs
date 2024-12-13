@@ -247,16 +247,17 @@ fn parse_message(data: Vec<u8>, bolt_version: &BoltVersion) -> Result<ClientMess
     }
 
     let value = values::value_receive::ValueReceive::from_data_consume_all(&data)
-        .context("arsing bolt message")?;
+        .context("Parsing bolt message")?;
     let values::value_receive::ValueReceive::Struct(tag, fields) = value else {
         return Err(anyhow!("Expected a bolt message but got: {:?}.", value));
     };
-    Ok(ClientMessage::new(tag, fields))
+    Ok(ClientMessage::new(tag, fields, *bolt_version))
 }
 
 #[cfg(test)]
 mod tests {
     mod simulate {
+        use crate::bolt_version::BoltVersion;
         use crate::context::Context;
         use crate::net_actor::NetActor;
         use crate::types::actor_types::{ActorBlock, ClientMessageValidator, ScriptLine};
@@ -311,7 +312,7 @@ mod tests {
                     )],
                 )],
             );
-            let message = ClientMessage::new(0, vec![]);
+            let message = ClientMessage::new(0, vec![], BoltVersion::V4_4);
             let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
             assert!(res.is_ok());
         }
@@ -338,7 +339,7 @@ mod tests {
                 )],
             );
 
-            let message = ClientMessage::new(0, vec![]);
+            let message = ClientMessage::new(0, vec![], BoltVersion::V4_4);
             let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
             assert!(res.is_err());
         }
@@ -407,7 +408,7 @@ mod tests {
                 ],
             );
 
-            let message = ClientMessage::new(0, vec![]);
+            let message = ClientMessage::new(0, vec![], BoltVersion::V4_4);
             let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
             assert!(res.is_ok());
         }
@@ -476,7 +477,7 @@ mod tests {
                 ],
             );
 
-            let message = ClientMessage::new(0, vec![]);
+            let message = ClientMessage::new(0, vec![], BoltVersion::V4_4);
             let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
             assert!(!res.is_ok());
         }

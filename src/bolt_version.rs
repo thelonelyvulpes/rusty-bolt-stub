@@ -1,4 +1,4 @@
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum BoltVersion {
     V3,
     V4_0,

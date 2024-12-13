@@ -287,7 +287,7 @@ fn create_auto_message_sender(
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
     // return Ok(Box::new(()));
-    todo!()
+    todo!("Create the auto message sending component, composed with a validator by caller")
 }
 
 fn create_message_sender(
@@ -344,11 +344,11 @@ fn create_validator(
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
     // return Ok(Box::new(()));
-    todo!()
+    todo!("See first item on readme todo list")
 }
 
 fn message_tag_from_name(tag_name: &str, config: &ActorConfig) -> Result<u8> {
-    todo!()
+    todo!("Take a message name, and return the byte dependent on the bolt version, as pull and pullall both use the same tag byte.")
 }
 
 fn is_skippable(block: &ActorBlock) -> bool {
