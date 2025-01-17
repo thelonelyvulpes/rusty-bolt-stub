@@ -6,6 +6,9 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
 };
 use crate::types::{ScanBlock, Script};
+use crate::values::value_receive::ValueReceive;
+use crate::values::ClientMessage;
+use anyhow::anyhow;
 use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
@@ -16,7 +19,7 @@ pub struct ActorScript {
     pub script: Script,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ActorConfig {
     pub bolt_version: BoltVersion,
     pub allow_restart: bool,
@@ -249,7 +252,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
         }
         ScanBlock::ClientMessage(ctx, message_name, body_string) => {
-            let validator = create_validator(message_name, body_string, config)?;
+            let validator = create_validator(message_name, body_string.as_deref(), config)?;
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
         ScanBlock::ServerMessage(ctx, message_name, body_string) => {
@@ -258,7 +261,8 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
         ScanBlock::AutoMessage(ctx, client_message_name, client_body_string) => {
-            let validator = create_validator(client_message_name, client_body_string, config)?;
+            let validator =
+                create_validator(client_message_name, client_body_string.as_deref(), config)?;
             let server_message_sender = create_auto_message_sender(client_message_name, config)?;
             Ok(ActorBlock::AutoMessage(
                 *ctx,
@@ -338,13 +342,58 @@ impl ServerMessageSender for SenderBytes {
     }
 }
 
+struct ValidatorImpl<T> {
+    pub func: T,
+}
+
+impl<T: Fn(&ClientMessage) -> anyhow::Result<()> + Send + Sync> Debug for ValidatorImpl<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+impl<T: Fn(&ClientMessage) -> anyhow::Result<()> + Send + Sync> ScriptLine for ValidatorImpl<T> {
+    fn original_line(&self) -> &str {
+        todo!()
+    }
+}
+
+impl<T: Fn(&ClientMessage) -> anyhow::Result<()> + Send + Sync> ClientMessageValidator
+    for ValidatorImpl<T>
+{
+    fn validate(&self, message: &ClientMessage) -> anyhow::Result<()> {
+        (self.func)(message)
+    }
+}
+
 fn create_validator(
     expected_tag: &str,
-    expected_body_string: &Option<String>,
+    expected_body_string: Option<&str>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
-    // return Ok(Box::new(()));
-    todo!("See first item on readme todo list")
+    let expected_tag = message_tag_from_name(expected_tag, config)?;
+    let expected_body_behavior = build(expected_body_string)?;
+    Ok(Box::new(ValidatorImpl {
+        func: |client_message| {
+            if client_message.tag != expected_tag {
+                return Err(anyhow!("the tags did not match."));
+            }
+            expected_body_behavior(client_message.fields)
+        },
+    }))
+}
+fn validate_none(message: &Vec<ValueReceive>) -> anyhow::Result<()> {
+    match message.len() {
+        0 => Err(anyhow!("Expected 0 fields")),
+        _ => Ok(())
+    }
+}
+
+fn build(p0: Option<&str>) -> Result<impl Fn(&Vec<ValueReceive>) -> anyhow::Result<()>> {
+    if p0.is_none() {
+        return Ok(validate_none)
+    }
+    Ok(|_| Ok(()))
 }
 
 fn message_tag_from_name(tag_name: &str, config: &ActorConfig) -> Result<u8> {
@@ -447,4 +496,28 @@ fn validate_alt_child(b: &ActorBlock) -> Result<()> {
     validate_non_empty(b, Some("as an Alt block branch"))?;
     validate_non_action(b, Some("as an Alt block child"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use crate::bolt_version::BoltVersion;
+    use crate::parser::{create_validator, ActorConfig};
+    use crate::values::ClientMessage;
+
+    fn should_validate_any_hello() {
+        let tag = "HELLO";
+        let body = "{\"{}\": \"*\"}";
+        let cfg = ActorConfig {
+            bolt_version: BoltVersion::V5_0,
+            allow_restart: false,
+            allow_concurrent: false,
+            handshake: None,
+            handshake_delay: None,
+        };
+        let validator = create_validator(tag, Some(body), &cfg).unwrap();
+
+        let cm = ClientMessage::new(0x00, vec![], BoltVersion::V5_0);
+
+        assert!(validator.validate(&cm).unwrap());
+    }
 }

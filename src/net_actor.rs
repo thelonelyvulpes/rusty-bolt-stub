@@ -185,6 +185,9 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                         return Ok(());
                     }
                 }
+                // todo: improve the way that we report the alt block failure, none of the branches
+                //  match and we should print the first line of each block to report none matched
+                //  like in existing test kit.
                 Err(anyhow!("No blocks matched"))
             }
             ActorBlock::Optional(_, optional_block) => {

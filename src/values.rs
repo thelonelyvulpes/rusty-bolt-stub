@@ -8,9 +8,9 @@ pub mod value_send;
 
 #[derive(Debug)]
 pub struct ClientMessage {
-    tag: u8,
-    fields: Vec<value_receive::ValueReceive>,
-    bolt_version: BoltVersion,
+    pub tag: u8,
+    pub fields: Vec<value_receive::ValueReceive>,
+    pub bolt_version: BoltVersion,
 }
 
 impl ClientMessage {

@@ -1,3 +1,5 @@
+use crate::bolt_version::BoltVersion::V5_5;
+
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum BoltVersion {
     V3,
@@ -12,6 +14,12 @@ pub enum BoltVersion {
     V5_3,
     V5_4,
     V5_5,
+}
+
+impl Default for BoltVersion {
+    fn default() -> Self {
+        V5_5
+    }
 }
 
 impl BoltVersion {
