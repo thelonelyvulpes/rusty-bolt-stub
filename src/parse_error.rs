@@ -34,3 +34,9 @@ impl std::fmt::Display for ParseError {
 }
 
 impl Error for ParseError {}
+
+impl From<serde_json::Error> for ParseError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::new(err.to_string())
+    }
+}

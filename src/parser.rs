@@ -9,7 +9,10 @@ use crate::types::{ScanBlock, Script};
 use crate::values::value_receive::ValueReceive;
 use crate::values::ClientMessage;
 use anyhow::anyhow;
+use nom::Parser;
+use serde_json::{Deserializer, Value as JsonValue, Value};
 use std::fmt::{Debug, Formatter};
+use std::result::Result as StdResult;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -28,7 +31,7 @@ pub struct ActorConfig {
     pub handshake: Option<Vec<u8>>,
 }
 
-type Result<T> = std::result::Result<T, ParseError>;
+type Result<T> = StdResult<T, ParseError>;
 
 pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
     fn script_excerpt(script: &str, start: usize, end: usize) -> String {
@@ -342,7 +345,7 @@ impl ServerMessageSender for SenderBytes {
     }
 }
 
-struct ValidatorImpl<T> {
+struct ValidatorImpl<T: Fn(&ClientMessage) -> anyhow::Result<()> + Send + Sync> {
     pub func: T,
 }
 
@@ -372,28 +375,105 @@ fn create_validator(
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
     let expected_tag = message_tag_from_name(expected_tag, config)?;
-    let expected_body_behavior = build(expected_body_string)?;
+    let expected_body_behavior = build(expected_body_string, config)?;
     Ok(Box::new(ValidatorImpl {
-        func: |client_message| {
+        func: move |client_message| {
             if client_message.tag != expected_tag {
                 return Err(anyhow!("the tags did not match."));
             }
-            expected_body_behavior(client_message.fields)
+            expected_body_behavior(&client_message.fields)
         },
     }))
 }
-fn validate_none(message: &Vec<ValueReceive>) -> anyhow::Result<()> {
+fn validate_none(message: &[ValueReceive]) -> anyhow::Result<()> {
     match message.len() {
         0 => Err(anyhow!("Expected 0 fields")),
-        _ => Ok(())
+        _ => Ok(()),
     }
 }
 
-fn build(p0: Option<&str>) -> Result<impl Fn(&Vec<ValueReceive>) -> anyhow::Result<()>> {
-    if p0.is_none() {
-        return Ok(validate_none)
-    }
-    Ok(|_| Ok(()))
+fn build_field(
+    field: JsonValue,
+    config: &ActorConfig,
+) -> Result<Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>> {
+    Ok(match field {
+        Value::Null => Box::new(|msg| match msg {
+            ValueReceive::Null => Ok(()),
+            _ => Err(anyhow!("Expected null")),
+        }),
+        Value::Bool(expected) => Box::new(move |msg| match msg {
+            ValueReceive::Boolean(received) if received == &expected => Ok(()),
+            _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+        }),
+        Value::Number(expected) if expected.is_i64() => {
+            let expected = expected.as_i64().expect("checked in match arm");
+            Box::new(move |msg| match msg {
+                ValueReceive::Integer(received) if received == &expected => Ok(()),
+                _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+            })
+        }
+        Value::Number(expected) if expected.is_f64() => {
+            let expected = expected.as_f64().expect("checked in match arm");
+            Box::new(move |msg| match msg {
+                ValueReceive::Float(received) if received == &expected => Ok(()),
+                _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+            })
+        }
+        Value::Number(expected) => {
+            return Err(ParseError::new(format!(
+                "Can't parse number (must be i64 or f64) {:?}",
+                expected
+            )));
+        }
+        Value::String(expected) => Box::new(move |msg| match msg {
+            ValueReceive::String(received) if received == &expected => Ok(()),
+            _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+        }),
+        Value::Array(_) => {
+            todo!()
+        }
+        Value::Object(_) => {
+            todo!()
+        }
+    })
+}
+
+fn build(
+    msg_body: Option<&str>,
+    config: &ActorConfig,
+) -> Result<Box<dyn Fn(&[ValueReceive]) -> anyhow::Result<()> + 'static + Send + Sync>> {
+    let Some(line) = msg_body else {
+        return Ok(Box::new(|msg| validate_none(msg)));
+    };
+    // RUN "RETURN $n AS n" {"n": 1}
+    let fields: Vec<_> = Deserializer::from_str(line)
+        .into_iter()
+        .collect::<StdResult<Vec<JsonValue>, _>>()?
+        .into_iter()
+        .map(|field| build_field(field, config))
+        .collect::<Result<_>>()?;
+    let field_validators = fields;
+
+    todo!();
+
+    // Ok(Box::new(move |msg| {
+    //     for field in fields {
+    //
+    //     }
+    // })
+
+    // for field in Deserializer::from_str(line).into_iter() {
+    //     let field = field?;
+    //     validate_field(field)?;
+    // }
+    // let v: Vec<StdResult<Value, _>> =
+    //     Deserializer::from_str("[1, 2] [3] null 1 false {\"a\": null}")
+    //         .into_iter()
+    //         .collect();
+    // dbg!(v);
+    // [1, 2] "h ello" {"a": false}
+    // let v: Value = serde_json::from_str(line)?;
+    Ok(Box::new(|_| Ok(())))
 }
 
 fn message_tag_from_name(tag_name: &str, config: &ActorConfig) -> Result<u8> {
@@ -500,10 +580,13 @@ fn validate_alt_child(b: &ActorBlock) -> Result<()> {
 
 #[cfg(test)]
 mod test {
+    use super::*;
     use crate::bolt_version::BoltVersion;
     use crate::parser::{create_validator, ActorConfig};
     use crate::values::ClientMessage;
+    use serde_json::Number;
 
+    #[test]
     fn should_validate_any_hello() {
         let tag = "HELLO";
         let body = "{\"{}\": \"*\"}";
@@ -518,6 +601,20 @@ mod test {
 
         let cm = ClientMessage::new(0x00, vec![], BoltVersion::V5_0);
 
-        assert!(validator.validate(&cm).unwrap());
+        todo!();
+        // assert_!(validator.validate(&cm).unwrap());
+    }
+
+    #[test]
+    fn json_test() {
+        let mut v: Vec<StdResult<JsonValue, _>> = Deserializer::from_str("1").into_iter().collect();
+        let JsonValue::Number(n) = v.pop().unwrap().unwrap() else {
+            panic!("Expected number");
+        };
+        dbg!(&n);
+        match n {
+            Number { .. } => {}
+        }
+        dbg!(n.as_i64());
     }
 }
