@@ -10,7 +10,7 @@ use crate::values::value_receive::ValueReceive;
 use crate::values::ClientMessage;
 use anyhow::anyhow;
 use nom::Parser;
-use serde_json::{Deserializer, Value as JsonValue, Value};
+use serde_json::{Deserializer, Number, Value as JsonValue, Value};
 use std::fmt::{Debug, Formatter};
 use std::result::Result as StdResult;
 use std::time::Duration;
@@ -393,16 +393,13 @@ fn validate_none(message: &[ValueReceive]) -> anyhow::Result<()> {
 }
 
 fn build_field(
-    field: JsonValue,
+    field: &'static JsonValue,
     config: &ActorConfig,
 ) -> Result<Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>> {
     Ok(match field {
-        Value::Null => Box::new(|msg| match msg {
-            ValueReceive::Null => Ok(()),
-            _ => Err(anyhow!("Expected null")),
-        }),
+        Value::Null => build_bool_validator(),
         Value::Bool(expected) => Box::new(move |msg| match msg {
-            ValueReceive::Boolean(received) if received == &expected => Ok(()),
+            ValueReceive::Boolean(received) if received == expected => Ok(()),
             _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
         }),
         Value::Number(expected) if expected.is_i64() => {
@@ -425,17 +422,60 @@ fn build_field(
                 expected
             )));
         }
-        Value::String(expected) => Box::new(move |msg| match msg {
-            ValueReceive::String(received) if received == &expected => Ok(()),
-            _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
-        }),
-        Value::Array(_) => {
-            todo!()
-        }
-        Value::Object(_) => {
+        Value::String(expected) => create_string_value_validator(expected.clone()),
+        Value::Array(expected) => {
+            let validations = expected
+                .iter()
+                .map(|x| build_field(x, config))
+                .collect::<Result<Vec<_>>>()?;
+            let exact = true;
+            match exact {
+                true => Box::new(move |msg| validate_list_exact_match(msg, validations)),
+                _ => todo!("Implement not needing to match on order")
+            }
+        },
+        Value::Object(expected) => {
             todo!()
         }
     })
+}
+
+fn build_bool_validator() -> Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync> {
+    Box::new(|msg| match msg {
+        ValueReceive::Null => Ok(()),
+        _ => Err(anyhow!("Expected null")),
+    })
+}
+
+fn create_string_value_validator(expected: String) -> Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync> {
+    Box::new(move |msg| match msg {
+        ValueReceive::String(received) if received == &expected => Ok(()),
+        _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+    })
+}
+
+fn validate_list_exact_match(p0: &ValueReceive, p1: &Vec<Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + Send + Sync + 'static>>) -> anyhow::Result<()> {
+    todo!()
+}
+
+fn validate_value(received: &ValueReceive, expected: &Value) -> anyhow::Result<()> {
+    match expected {
+        Value::Null => Ok(()),
+        Value::Bool(expected) if received.as_bool().is_some_and(|ref x| x == expected) => Ok(()),
+        Value::Number(expected) => validate_number(expected, received),
+        Value::String(expected) if received.is_string() && expected.eq(received.as_string().expect("checked")) => Ok(()),
+        Value::Array(_) => Ok(()),
+        Value::Object(_) => Ok(()),
+        _  => Err(anyhow!("Expected {:?} found {:?}", expected, received)),
+    }
+}
+
+fn validate_number(p0: &Number, received: &ValueReceive) -> anyhow::Result<()> {
+    match received {
+        ValueReceive::Integer(received) if p0.is_i64() && received.eq(&p0.as_i64().expect("checked")) => Ok(()),
+        ValueReceive::Float(received) if p0.is_f64() && received.eq(&p0.as_f64().expect("checked")) => Ok(()),
+        _ => Err(anyhow!("Expected {:?} found {:?}", received, received)),
+    }
 }
 
 fn build(
@@ -446,13 +486,14 @@ fn build(
         return Ok(Box::new(|msg| validate_none(msg)));
     };
     // RUN "RETURN $n AS n" {"n": 1}
-    let fields: Vec<_> = Deserializer::from_str(line)
+    let field_validators: Vec<_> = Deserializer::from_str(line)
         .into_iter()
-        .collect::<StdResult<Vec<JsonValue>, _>>()?
+        .collect::<StdResult<Vec<JsonValue>, _>>()?;
+
+    let validation = field_validators
         .into_iter()
-        .map(|field| build_field(field, config))
-        .collect::<Result<_>>()?;
-    let field_validators = fields;
+        .map(|field| build_field(&field, config))
+        .collect::<Result<_>>();
 
     todo!();
 
@@ -614,6 +655,7 @@ mod test {
         dbg!(&n);
         match n {
             Number { .. } => {}
+
         }
         dbg!(n.as_i64());
     }
