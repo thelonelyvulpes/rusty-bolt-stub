@@ -426,16 +426,65 @@ fn build_field(
             )));
         }
         Value::String(expected) => Box::new(move |msg| match msg {
-            ValueReceive::String(received) if received == &expected => Ok(()),
+            _ if expected == "*" => Ok(()),
+            ValueReceive::String(received) => validate_string_match(&expected, received),
             _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
         }),
-        Value::Array(_) => {
-            todo!()
+        Value::Array(expected) => {
+            let validators = expected
+                .into_iter()
+                .map(|value| build_field(value, config))
+                .collect::<Result<Vec<_>>>()?;
+            Box::new(move |msg| {
+                let ValueReceive::List(received) = msg else {
+                    return Err(anyhow!("Expected list, found {:?}", msg));
+                };
+                if validators.len() != received.len() {
+                    return Err(anyhow!(
+                        "Expected {} fields, found {}",
+                        validators.len(),
+                        received.len()
+                    ));
+                }
+                for (validator, received) in validators.iter().zip(received.iter()) {
+                    validator(received)?;
+                }
+                Ok(())
+            })
         }
-        Value::Object(_) => {
+        Value::Object(expected) => {
+            // try to build jolt matcher (incl. Structs like datetime)
+            //   * if has 1 key-value pair
+            //   * && key is known sigil
+            //   * Special string "*" applies: E.g., `C: RUN {"Z": "*"}` will match any integer: `C: RUN 1` and `C: RUN 2`, but not `C: RUN 1.2` or `C: RUN "*"`.
+            //  JSON object keys:
+            //    * The key will be **unescaped** before it is matched:
+            //      `\\`, `\[`, `\]`, `\{`, and `\}` are turned into `\`, `[`, `]`, `{`, and `}` respectively.
+            //    * If the escaped key starts with `[` and ends with `]`, the corresponding key/value pair is **optional**.
+            //      E.g., `C: PULL {"[n]": 1000}` matches `C: PULL {}` and `C: PULL {"n": 1000}`, but not `C: PULL {"n": 1000, "m": 1001}`,  `C: PULL {"n": 1}`, or  `C: PULL null`.
+            //    * If the escaped key ends on `{}` after potential optional-brackets (s. above) have been stripped, the corresponding value will be compared **sorted** if it's a list.
+            //      E.g., `C: MSG {"foo{}": [1, 2]}` will match `C: MSG {"foo": [1, 2]}` and `C: MSG {"foo": [2, 1]}`, but `C: MSG {"foo{}": "ba"}` will not match `C: MSG {"foo": "ab"}`.
+            //    * Example for **optional** and **sorted**: `C: MSG {"[foo{}]": [1, 2]}`.
             todo!()
         }
     })
+}
+
+fn validate_string_match(expected: &str, received: &str) -> anyhow::Result<()> {
+    #[inline]
+    fn match_(expected: &str, received: &str) -> anyhow::Result<()> {
+        if expected == received {
+            Ok(())
+        } else {
+            Err(anyhow!("Expected {:?} found {:?}", expected, received))
+        }
+    }
+    if !expected.contains(r"\") {
+        match_(expected, received)
+    } else {
+        let escaped = expected.replace(r"\\", r"\");
+        match_(&escaped, received)
+    }
 }
 
 fn build(
