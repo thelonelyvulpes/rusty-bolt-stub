@@ -34,7 +34,8 @@ pub struct ActorConfig {
 }
 
 type Result<T> = StdResult<T, ParseError>;
-type ValidateFn = Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>;
+type ValidateValueFn = Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>;
+type ValidateValuesFn = Box<dyn Fn(&[ValueReceive]) -> anyhow::Result<()> + 'static + Send + Sync>;
 
 pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
     fn script_excerpt(script: &str, start: usize, end: usize) -> String {
@@ -378,7 +379,7 @@ fn create_validator(
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
     let expected_tag = message_tag_from_name(expected_tag, config)?;
-    let expected_body_behavior = build(expected_body_string, config)?;
+    let expected_body_behavior = build_fields_validator(expected_body_string, config)?;
     Ok(Box::new(ValidatorImpl {
         func: move |client_message| {
             if client_message.tag != expected_tag {
@@ -388,14 +389,15 @@ fn create_validator(
         },
     }))
 }
-fn validate_none(message: &[ValueReceive]) -> anyhow::Result<()> {
+
+fn build_no_fields_validator(message: &[ValueReceive]) -> anyhow::Result<()> {
     match message.len() {
         0 => Err(anyhow!("Expected 0 fields")),
         _ => Ok(()),
     }
 }
 
-fn build_field(field: JsonValue, config: &ActorConfig) -> Result<ValidateFn> {
+fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<ValidateValueFn> {
     Ok(match field {
         JsonValue::Null => Box::new(|msg| match msg {
             ValueReceive::Null => Ok(()),
@@ -414,6 +416,7 @@ fn build_field(field: JsonValue, config: &ActorConfig) -> Result<ValidateFn> {
         }
         JsonValue::Number(expected) if expected.is_f64() => {
             let expected = expected.as_f64().expect("checked in match arm");
+            todo!("Fix NaN, Inf, etc. comparison");
             Box::new(move |msg| match msg {
                 ValueReceive::Float(received) if received == &expected => Ok(()),
                 _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
@@ -427,13 +430,13 @@ fn build_field(field: JsonValue, config: &ActorConfig) -> Result<ValidateFn> {
         }
         JsonValue::String(expected) => Box::new(move |msg| match msg {
             _ if expected == "*" => Ok(()),
-            ValueReceive::String(received) => validate_string_match(&expected, received),
+            ValueReceive::String(received) => validate_str_field_eq(&expected, received),
             _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
         }),
         JsonValue::Array(expected) => {
             let validators = expected
                 .into_iter()
-                .map(|value| build_field(value, config))
+                .map(|value| build_field_validator(value, config))
                 .collect::<Result<Vec<_>>>()?;
             Box::new(move |msg| {
                 let ValueReceive::List(received) = msg else {
@@ -458,7 +461,8 @@ fn build_field(field: JsonValue, config: &ActorConfig) -> Result<ValidateFn> {
             let validators = expected
                 .into_iter()
                 .map(|(key, expect_for_key)| {
-                    let (key, validator, req) = build_foo(&key, expect_for_key, config)?;
+                    let (key, validator, req) =
+                        build_map_entry_validator(&key, expect_for_key, config)?;
                     if req {
                         required_keys.insert(key.clone());
                     }
@@ -477,7 +481,7 @@ fn build_field(field: JsonValue, config: &ActorConfig) -> Result<ValidateFn> {
                     return Err(anyhow!("Expected map, found {:?}", msg));
                 };
 
-                let mut matched_keys: HashSet<String> = HashSet::new();
+                let mut matched_keys = HashSet::new();
 
                 for (key, value) in received {
                     let Some(validator) = validators.get(key) else {
@@ -506,12 +510,15 @@ fn build_field(field: JsonValue, config: &ActorConfig) -> Result<ValidateFn> {
     })
 }
 
-/// Return bool is if value is required.
-fn build_foo<'a>(
+/// # Returns
+///  * String: the map key this validator should be applied to
+///  * ValidateValueFn: the validator function
+///  * bool: whether the key is required (`true`), or optional (`false`).
+fn build_map_entry_validator(
     key: &str,
     expected: JsonValue,
     config: &ActorConfig,
-) -> Result<(String, ValidateFn, bool)> {
+) -> Result<(String, ValidateValueFn, bool)> {
     //  JSON object keys:
     //    * The key will be **unescaped** before it is matched:
     //      `\\`, `\[`, `\]`, `\{`, and `\}` are turned into `\`, `[`, `]`, `{`, and `}` respectively.
@@ -530,13 +537,12 @@ fn build_foo<'a>(
     todo!("implement")
 }
 
-fn validate_string_match(expected: &str, received: &str) -> anyhow::Result<()> {
+fn validate_str_field_eq(expected: &str, received: &str) -> anyhow::Result<()> {
     #[inline]
     fn match_(expected: &str, received: &str) -> anyhow::Result<()> {
-        if expected == received {
-            Ok(())
-        } else {
-            Err(anyhow!("Expected {:?} found {:?}", expected, received))
+        match expected == received {
+            true => Ok(()),
+            false => Err(anyhow!("Expected {:?} found {:?}", expected, received)),
         }
     }
     if !expected.contains(r"\") {
@@ -547,19 +553,19 @@ fn validate_string_match(expected: &str, received: &str) -> anyhow::Result<()> {
     }
 }
 
-fn build(
+fn build_fields_validator(
     msg_body: Option<&str>,
     config: &ActorConfig,
-) -> Result<Box<dyn Fn(&[ValueReceive]) -> anyhow::Result<()> + 'static + Send + Sync>> {
+) -> Result<ValidateValuesFn> {
     let Some(line) = msg_body else {
-        return Ok(Box::new(|msg| validate_none(msg)));
+        return Ok(Box::new(|msg| build_no_fields_validator(msg)));
     };
     // RUN "RETURN $n AS n" {"n": 1}
     let fields: Vec<_> = Deserializer::from_str(line)
         .into_iter()
         .collect::<StdResult<Vec<JsonValue>, _>>()?
         .into_iter()
-        .map(|field| build_field(field, config))
+        .map(|field| build_field_validator(field, config))
         .collect::<Result<_>>()?;
     let field_validators = fields;
 
