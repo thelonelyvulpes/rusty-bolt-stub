@@ -9,8 +9,10 @@ use crate::types::{ScanBlock, Script};
 use crate::values::value_receive::ValueReceive;
 use crate::values::ClientMessage;
 use anyhow::anyhow;
+use itertools::Itertools;
 use nom::Parser;
-use serde_json::{Deserializer, Value as JsonValue, Value};
+use serde_json::{Deserializer, Value as JsonValue};
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::result::Result as StdResult;
 use std::time::Duration;
@@ -32,6 +34,7 @@ pub struct ActorConfig {
 }
 
 type Result<T> = StdResult<T, ParseError>;
+type ValidateFn = Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>;
 
 pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
     fn script_excerpt(script: &str, start: usize, end: usize) -> String {
@@ -392,45 +395,42 @@ fn validate_none(message: &[ValueReceive]) -> anyhow::Result<()> {
     }
 }
 
-fn build_field(
-    field: JsonValue,
-    config: &ActorConfig,
-) -> Result<Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>> {
+fn build_field(field: JsonValue, config: &ActorConfig) -> Result<ValidateFn> {
     Ok(match field {
-        Value::Null => Box::new(|msg| match msg {
+        JsonValue::Null => Box::new(|msg| match msg {
             ValueReceive::Null => Ok(()),
             _ => Err(anyhow!("Expected null")),
         }),
-        Value::Bool(expected) => Box::new(move |msg| match msg {
+        JsonValue::Bool(expected) => Box::new(move |msg| match msg {
             ValueReceive::Boolean(received) if received == &expected => Ok(()),
             _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
         }),
-        Value::Number(expected) if expected.is_i64() => {
+        JsonValue::Number(expected) if expected.is_i64() => {
             let expected = expected.as_i64().expect("checked in match arm");
             Box::new(move |msg| match msg {
                 ValueReceive::Integer(received) if received == &expected => Ok(()),
                 _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
             })
         }
-        Value::Number(expected) if expected.is_f64() => {
+        JsonValue::Number(expected) if expected.is_f64() => {
             let expected = expected.as_f64().expect("checked in match arm");
             Box::new(move |msg| match msg {
                 ValueReceive::Float(received) if received == &expected => Ok(()),
                 _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
             })
         }
-        Value::Number(expected) => {
+        JsonValue::Number(expected) => {
             return Err(ParseError::new(format!(
                 "Can't parse number (must be i64 or f64) {:?}",
                 expected
             )));
         }
-        Value::String(expected) => Box::new(move |msg| match msg {
+        JsonValue::String(expected) => Box::new(move |msg| match msg {
             _ if expected == "*" => Ok(()),
             ValueReceive::String(received) => validate_string_match(&expected, received),
             _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
         }),
-        Value::Array(expected) => {
+        JsonValue::Array(expected) => {
             let validators = expected
                 .into_iter()
                 .map(|value| build_field(value, config))
@@ -452,22 +452,82 @@ fn build_field(
                 Ok(())
             })
         }
-        Value::Object(expected) => {
+        JsonValue::Object(expected) => {
+            let mut required_keys = HashSet::new();
+            let mut unique_keys = HashSet::new();
+            let validators = expected
+                .into_iter()
+                .map(|(key, expect_for_key)| {
+                    let (key, validator, req) = build_foo(&key, expect_for_key, config)?;
+                    if req {
+                        required_keys.insert(key.clone());
+                    }
+                    if !unique_keys.insert(key.clone()) {
+                        return Err(ParseError::new(format!(
+                            "contains same unescaped key twice {key}"
+                        )));
+                    }
+                    Ok((key, validator))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+
+            Box::new(move |msg| {
+                //TODO: Consider optimizing string cloning, consider Ref counting(RC)
+                let ValueReceive::Map(received) = msg else {
+                    return Err(anyhow!("Expected map, found {:?}", msg));
+                };
+
+                let mut matched_keys: HashSet<String> = HashSet::new();
+
+                for (key, value) in received {
+                    let Some(validator) = validators.get(key) else {
+                        return Err(anyhow!("Unexpected Key:{key} was received."));
+                    };
+                    validator(value)?;
+                    matched_keys.insert(key.clone());
+                }
+
+                match matched_keys.is_superset(&required_keys) {
+                    true => Ok(()),
+                    false => {
+                        let mut missing_keys = required_keys.difference(&matched_keys);
+                        Err(anyhow!(
+                            "Received message with missing keys: {:?}",
+                            missing_keys.join(", ")
+                        ))
+                    }
+                }
+            })
             // try to build jolt matcher (incl. Structs like datetime)
             //   * if has 1 key-value pair
             //   * && key is known sigil
             //   * Special string "*" applies: E.g., `C: RUN {"Z": "*"}` will match any integer: `C: RUN 1` and `C: RUN 2`, but not `C: RUN 1.2` or `C: RUN "*"`.
-            //  JSON object keys:
-            //    * The key will be **unescaped** before it is matched:
-            //      `\\`, `\[`, `\]`, `\{`, and `\}` are turned into `\`, `[`, `]`, `{`, and `}` respectively.
-            //    * If the escaped key starts with `[` and ends with `]`, the corresponding key/value pair is **optional**.
-            //      E.g., `C: PULL {"[n]": 1000}` matches `C: PULL {}` and `C: PULL {"n": 1000}`, but not `C: PULL {"n": 1000, "m": 1001}`,  `C: PULL {"n": 1}`, or  `C: PULL null`.
-            //    * If the escaped key ends on `{}` after potential optional-brackets (s. above) have been stripped, the corresponding value will be compared **sorted** if it's a list.
-            //      E.g., `C: MSG {"foo{}": [1, 2]}` will match `C: MSG {"foo": [1, 2]}` and `C: MSG {"foo": [2, 1]}`, but `C: MSG {"foo{}": "ba"}` will not match `C: MSG {"foo": "ab"}`.
-            //    * Example for **optional** and **sorted**: `C: MSG {"[foo{}]": [1, 2]}`.
-            todo!()
         }
     })
+}
+
+/// Return bool is if value is required.
+fn build_foo<'a>(
+    key: &str,
+    expected: JsonValue,
+    config: &ActorConfig,
+) -> Result<(String, ValidateFn, bool)> {
+    //  JSON object keys:
+    //    * The key will be **unescaped** before it is matched:
+    //      `\\`, `\[`, `\]`, `\{`, and `\}` are turned into `\`, `[`, `]`, `{`, and `}` respectively.
+    //    * If the escaped key starts with `[` and ends with `]`, the corresponding key/value pair is **optional**.
+    //      E.g., `C: PULL {"[n]": 1000}` matches `C: PULL {}` and `C: PULL {"n": 1000}`, but not `C: PULL {"n": 1000, "m": 1001}`,  `C: PULL {"n": 1}`, or  `C: PULL null`.
+    //    * If the escaped key ends on `{}` after potential optional-brackets (s. above) have been stripped, the corresponding value will be compared **sorted** if it's a list.
+    //      E.g., `C: MSG {"foo{}": [1, 2]}` will match `C: MSG {"foo": [1, 2]}` and `C: MSG {"foo": [2, 1]}`, but `C: MSG {"foo{}": "ba"}` will not match `C: MSG {"foo": "ab"}`.
+    //    * Example for **optional** and **sorted**: `C: MSG {"[foo{}]": [1, 2]}`.
+
+    let is_optional = key.starts_with('[') && key.ends_with(']');
+    let ordered = if is_optional {
+        key.ends_with("{}]")
+    } else {
+        key.ends_with("{}")
+    };
+    todo!("implement")
 }
 
 fn validate_string_match(expected: &str, received: &str) -> anyhow::Result<()> {
@@ -665,5 +725,14 @@ mod test {
             Number { .. } => {}
         }
         dbg!(n.as_i64());
+    }
+
+    #[test]
+    fn collect() {
+        let res = vec![("a", 1), ("a", 2)]
+            .into_iter()
+            .collect::<HashMap<&str, i32>>();
+
+        assert_eq!(1, res.len());
     }
 }
