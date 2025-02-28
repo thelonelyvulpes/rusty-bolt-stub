@@ -10,12 +10,14 @@ use crate::values::value_receive::ValueReceive;
 use crate::values::ClientMessage;
 use anyhow::anyhow;
 use itertools::Itertools;
-use nom::Parser;
+use nom::{Parser, Slice};
 use serde_json::{Deserializer, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::result::Result as StdResult;
 use std::time::Duration;
+use std::sync::LazyLock;
+use regex::Regex;
 
 #[derive(Debug)]
 pub struct ActorScript {
@@ -36,6 +38,7 @@ pub struct ActorConfig {
 type Result<T> = StdResult<T, ParseError>;
 type ValidateValueFn = Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>;
 type ValidateValuesFn = Box<dyn Fn(&[ValueReceive]) -> anyhow::Result<()> + 'static + Send + Sync>;
+
 
 pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
     fn script_excerpt(script: &str, start: usize, end: usize) -> String {
@@ -511,7 +514,7 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
 }
 
 /// # Returns
-///  * String: the map key this validator should be applied to
+///  * String: the map key this validator should be applied to with markers stripped from it.
 ///  * ValidateValueFn: the validator function
 ///  * bool: whether the key is required (`true`), or optional (`false`).
 fn build_map_entry_validator(
@@ -528,15 +531,38 @@ fn build_map_entry_validator(
     //      E.g., `C: MSG {"foo{}": [1, 2]}` will match `C: MSG {"foo": [1, 2]}` and `C: MSG {"foo": [2, 1]}`, but `C: MSG {"foo{}": "ba"}` will not match `C: MSG {"foo": "ab"}`.
     //    * Example for **optional** and **sorted**: `C: MSG {"[foo{}]": [1, 2]}`.
 
-    let is_optional = key.starts_with('[') && key.ends_with(']');
-    let ordered = if is_optional {
-        key.ends_with("{}]")
-    } else {
-        key.ends_with("{}")
-    };
+
     todo!("implement")
 }
+struct ParsedMapKey {
+    pub is_optional: bool,
+    pub is_ordered: bool,
+    pub unescaped: String
+}
+impl ParsedMapKey {
+    fn parse(key: &str) -> Self {
+        static UNESCAPE_RE:LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\[)?(?:\\[\\\{}\}\[\]]|[^\\])*?(\{\})?(\])?$").unwrap());
+        let unescaped = UNESCAPE_RE.replace_all(key, r"$1");
+        
+        let mut unescaped_ref = unescaped.as_ref();
+        let is_optional = key.starts_with('[') && key.ends_with(']');
+        let is_ordered = if is_optional {
+            key.ends_with("{}]")
+        } else {
+            key.ends_with("{}")
+        };
+        
+        if is_optional {
+            unescaped_ref = &unescaped_ref[1..unescaped.len() - 1]
+        }
+        if is_ordered {
+            unescaped_ref = &unescaped_ref[..unescaped_ref.len() - 2]
+        }
 
+        Self{is_optional, is_ordered, unescaped: unescaped_ref.to_string()}
+    }
+
+}
 fn validate_str_field_eq(expected: &str, received: &str) -> anyhow::Result<()> {
     #[inline]
     fn match_(expected: &str, received: &str) -> anyhow::Result<()> {
@@ -734,11 +760,38 @@ mod test {
     }
 
     #[test]
-    fn collect() {
-        let res = vec![("a", 1), ("a", 2)]
-            .into_iter()
-            .collect::<HashMap<&str, i32>>();
+    fn remove_optional_marker() {
+        let key = "[jeff]";
+        let escaped = ParsedMapKey::parse(key);
+        assert_eq!(escaped.unescaped, "jeff")
+    }
 
-        assert_eq!(1, res.len());
+    #[test]
+    fn remove_ordered_marker() {
+        let key = "jeff{}";
+        let escaped = ParsedMapKey::parse(key);
+        assert_eq!(escaped.unescaped, "jeff")
+    }
+
+    #[test]
+    fn remove_both_marker() {
+        let key = "[jeff{}]";
+
+        let escaped = ParsedMapKey::parse(key);
+        assert_eq!(escaped.unescaped, "jeff")
+    }
+
+    #[test]
+    fn remove_optional_marker_with_escaped() {
+        let key = r"[jeff\{\}]";
+        let escaped = ParsedMapKey::parse(key);
+        assert_eq!(escaped.unescaped, "jeff{}")
+    }
+
+    #[test]
+    fn handle_doubled_slash() {
+        let key = r"jeff\{}";
+        let escaped = ParsedMapKey::parse(key);
+        assert_eq!(escaped.unescaped, "jeff")
     }
 }
