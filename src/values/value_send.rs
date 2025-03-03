@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
+use indexmap::IndexMap;
 use itertools::Itertools;
 
 use super::graph;
@@ -31,7 +32,7 @@ pub enum ValueSend {
     Bytes(Vec<u8>),
     String(String),
     List(Vec<ValueSend>),
-    Map(HashMap<String, ValueSend>),
+    Map(IndexMap<String, ValueSend>),
     Node(graph::Node),
     Relationship(graph::Relationship),
     Path(graph::Path),
@@ -259,7 +260,7 @@ impl ValueSend {
     }
 }
 
-impl TryFrom<ValueSend> for HashMap<String, ValueSend> {
+impl TryFrom<ValueSend> for IndexMap<String, ValueSend> {
     type Error = ValueSend;
 
     #[inline]
@@ -278,7 +279,7 @@ impl ValueSend {
     }
 
     #[inline]
-    pub fn as_map(&self) -> Option<&HashMap<String, ValueSend>> {
+    pub fn as_map(&self) -> Option<&IndexMap<String, ValueSend>> {
         match self {
             ValueSend::Map(v) => Some(v),
             _ => None,
@@ -287,7 +288,7 @@ impl ValueSend {
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_map(self) -> Result<HashMap<String, ValueSend>, Self> {
+    pub fn try_into_map(self) -> Result<IndexMap<String, ValueSend>, Self> {
         self.try_into()
     }
 }

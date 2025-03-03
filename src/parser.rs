@@ -1,3 +1,15 @@
+use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
+use std::result::Result as StdResult;
+use std::sync::LazyLock;
+use std::time::Duration;
+
+use anyhow::anyhow;
+use itertools::Itertools;
+use nom::{Parser, Slice};
+use regex::Regex;
+use serde_json::{Deserializer, Value as JsonValue};
+
 use crate::bang_line::BangLine;
 use crate::bolt_version::BoltVersion;
 use crate::parse_error::ParseError;
@@ -8,16 +20,6 @@ use crate::types::actor_types::{
 use crate::types::{ScanBlock, Script};
 use crate::values::value_receive::ValueReceive;
 use crate::values::ClientMessage;
-use anyhow::anyhow;
-use itertools::Itertools;
-use nom::{Parser, Slice};
-use serde_json::{Deserializer, Value as JsonValue};
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Formatter};
-use std::result::Result as StdResult;
-use std::time::Duration;
-use std::sync::LazyLock;
-use regex::Regex;
 
 #[derive(Debug)]
 pub struct ActorScript {
@@ -38,7 +40,6 @@ pub struct ActorConfig {
 type Result<T> = StdResult<T, ParseError>;
 type ValidateValueFn = Box<dyn Fn(&ValueReceive) -> anyhow::Result<()> + 'static + Send + Sync>;
 type ValidateValuesFn = Box<dyn Fn(&[ValueReceive]) -> anyhow::Result<()> + 'static + Send + Sync>;
-
 
 pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
     fn script_excerpt(script: &str, start: usize, end: usize) -> String {
@@ -531,19 +532,22 @@ fn build_map_entry_validator(
     //      E.g., `C: MSG {"foo{}": [1, 2]}` will match `C: MSG {"foo": [1, 2]}` and `C: MSG {"foo": [2, 1]}`, but `C: MSG {"foo{}": "ba"}` will not match `C: MSG {"foo": "ab"}`.
     //    * Example for **optional** and **sorted**: `C: MSG {"[foo{}]": [1, 2]}`.
 
-
     todo!("implement")
 }
+
 struct ParsedMapKey {
     pub is_optional: bool,
     pub is_ordered: bool,
-    pub unescaped: String
+    pub unescaped: String,
 }
+
 impl ParsedMapKey {
     fn parse(key: &str) -> Self {
-        static UNESCAPE_RE:LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\[)?(?:\\[\\\{}\}\[\]]|[^\\])*?(\{\})?(\])?$").unwrap());
+        static UNESCAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^(\[)?(?:\\[\\\{}\}\[\]]|[^\\])*?(\{\})?(\])?$").unwrap()
+        });
         let unescaped = UNESCAPE_RE.replace_all(key, r"$1");
-        
+
         let mut unescaped_ref = unescaped.as_ref();
         let is_optional = key.starts_with('[') && key.ends_with(']');
         let is_ordered = if is_optional {
@@ -551,7 +555,7 @@ impl ParsedMapKey {
         } else {
             key.ends_with("{}")
         };
-        
+
         if is_optional {
             unescaped_ref = &unescaped_ref[1..unescaped.len() - 1]
         }
@@ -559,9 +563,12 @@ impl ParsedMapKey {
             unescaped_ref = &unescaped_ref[..unescaped_ref.len() - 2]
         }
 
-        Self{is_optional, is_ordered, unescaped: unescaped_ref.to_string()}
+        Self {
+            is_optional,
+            is_ordered,
+            unescaped: unescaped_ref.to_string(),
+        }
     }
-
 }
 fn validate_str_field_eq(expected: &str, received: &str) -> anyhow::Result<()> {
     #[inline]

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use anyhow::{anyhow, Result};
+use indexmap::IndexMap;
 use nom::{Parser, ToUsize};
-use std::collections::HashMap;
 
 #[allow(unused)]
 #[derive(Debug, Clone, PartialEq)]
@@ -27,7 +27,7 @@ pub enum ValueReceive {
     Bytes(Vec<u8>),
     String(String),
     List(Vec<ValueReceive>),
-    Map(HashMap<String, ValueReceive>),
+    Map(IndexMap<String, ValueReceive>),
     Struct(u8, Vec<ValueReceive>),
 }
 
@@ -117,8 +117,8 @@ impl_value_from_into!(ValueReceive::Bytes, &[u8]);
 impl_value_from_owned!(ValueReceive::String, String);
 // impl_value_from_owned!(ValueReceive::List, Vec<ValueReceive>);
 // impl_value_from_owned!(Value::Map, HashMap<String, Value>);
-impl<T: Into<ValueReceive>> From<HashMap<String, T>> for ValueReceive {
-    fn from(value: HashMap<String, T>) -> Self {
+impl<T: Into<ValueReceive>> From<IndexMap<String, T>> for ValueReceive {
+    fn from(value: IndexMap<String, T>) -> Self {
         ValueReceive::Map(value.into_iter().map(|(k, v)| (k, v.into())).collect())
     }
 }
@@ -343,7 +343,7 @@ impl ValueReceive {
     }
 }
 
-impl TryFrom<ValueReceive> for HashMap<String, ValueReceive> {
+impl TryFrom<ValueReceive> for IndexMap<String, ValueReceive> {
     type Error = ValueReceive;
 
     #[inline]
@@ -362,7 +362,7 @@ impl ValueReceive {
     }
 
     #[inline]
-    pub fn as_map(&self) -> Option<&HashMap<String, ValueReceive>> {
+    pub fn as_map(&self) -> Option<&IndexMap<String, ValueReceive>> {
         match self {
             ValueReceive::Map(v) => Some(v),
             _ => None,
@@ -371,7 +371,7 @@ impl ValueReceive {
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_map(self) -> Result<HashMap<String, ValueReceive>, Self> {
+    pub fn try_into_map(self) -> Result<IndexMap<String, ValueReceive>, Self> {
         self.try_into()
     }
 }
@@ -535,7 +535,7 @@ impl<'a> PackStreamDecoder<'a> {
     }
 
     fn read_map(&mut self, length: usize) -> Result<ValueReceive> {
-        let mut key_value_pairs = HashMap::with_capacity(length);
+        let mut key_value_pairs = IndexMap::with_capacity(length);
         for _ in 0..length {
             let len = self.read_string_length()?;
             let key = self.read_raw_string(len)?;
