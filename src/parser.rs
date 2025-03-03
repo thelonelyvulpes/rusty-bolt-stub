@@ -480,7 +480,6 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
                 .collect::<Result<HashMap<_, _>>>()?;
 
             Box::new(move |msg| {
-                //TODO: Consider optimizing string cloning, consider Ref counting(RC)
                 let ValueReceive::Map(received) = msg else {
                     return Err(anyhow!("Expected map, found {:?}", msg));
                 };
@@ -532,7 +531,54 @@ fn build_map_entry_validator(
     //      E.g., `C: MSG {"foo{}": [1, 2]}` will match `C: MSG {"foo": [1, 2]}` and `C: MSG {"foo": [2, 1]}`, but `C: MSG {"foo{}": "ba"}` will not match `C: MSG {"foo": "ab"}`.
     //    * Example for **optional** and **sorted**: `C: MSG {"[foo{}]": [1, 2]}`.
 
-    todo!("implement")
+    todo!("implement jolt");
+    if let Some(jolt_validator) = build_jolt_validator(key, &expected, config)? {
+        return Ok((key.to_string(), jolt_validator, true));
+    }
+
+    let key = ParsedMapKey::parse(key);
+    let required = !key.is_optional;
+    let ordered = key.is_ordered;
+    let key = key.unescaped;
+    let validator: ValidateValueFn = match expected {
+        JsonValue::Array(expected) if ordered => {
+            let validators = expected
+                .into_iter()
+                .map(|value| build_field_validator(value, config))
+                .collect::<Result<Vec<_>>>()?;
+            Box::new(move |msg| {
+                let ValueReceive::List(received) = msg else {
+                    return Err(anyhow!("Expected list, found {:?}", msg));
+                };
+                if validators.len() != received.len() {
+                    return Err(anyhow!(
+                        "Expected {} fields, found {}",
+                        validators.len(),
+                        received.len()
+                    ));
+                }
+                let mut left_validators = HashSet::new();
+                left_validators.extend((0..validators.len()).into_iter());
+                'values: for value_received in received.iter() {
+                    for validator_idx in &left_validators {
+                        let validator_idx = *validator_idx;
+                        let validator = &validators[validator_idx];
+                        if let Ok(()) = validator(value_received) {
+                            left_validators.remove(&validator_idx);
+                            continue 'values;
+                        }
+                    }
+                    return Err(anyhow!(
+                        "Unexpected value in any order array: {:?}",
+                        value_received
+                    ));
+                }
+                Ok(())
+            })
+        }
+        _ => build_field_validator(expected, config)?,
+    };
+    Ok((key, validator, required))
 }
 
 struct ParsedMapKey {
