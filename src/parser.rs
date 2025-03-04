@@ -298,8 +298,20 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     }
 }
 
-fn condense_actor_blocks(_p0: Vec<ActorBlock>) -> Vec<ActorBlock> {
-    todo!()
+fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
+    let mut res = Vec::new();
+    let blocks = blocks.into_iter();
+    for block in blocks {
+        let Some(last) = res.last_mut() else { continue };
+        match (block, last) {
+            (ActorBlock::BlockList(ctx, list), ActorBlock::BlockList(ctx_last, list_last)) => {
+                *ctx_last = ctx_last.fuse(&ctx);
+                list_last.extend(list)
+            }
+            (block, _) => res.push(block),
+        }
+    }
+    res
 }
 
 fn create_auto_message_sender(
