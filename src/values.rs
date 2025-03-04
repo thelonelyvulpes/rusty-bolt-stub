@@ -3,31 +3,21 @@ use crate::bolt_version::BoltVersion;
 pub mod graph;
 pub mod spatial;
 pub mod time;
-pub mod value_receive;
-pub mod value_send;
+pub mod value;
 
-#[derive(Debug)]
-pub struct ClientMessage {
+#[derive(Debug, Clone)]
+pub struct BoltMessage {
     pub tag: u8,
-    pub fields: Vec<value_receive::ValueReceive>,
-    pub bolt_version: BoltVersion,
+    pub name: &'static str,
+    pub fields: Vec<value::Value>,
 }
 
-impl ClientMessage {
-    pub fn new(
-        tag: u8,
-        fields: Vec<value_receive::ValueReceive>,
-        bolt_version: BoltVersion,
-    ) -> Self {
+impl BoltMessage {
+    pub fn new(tag: u8, fields: Vec<value::Value>, bolt_version: BoltVersion) -> Self {
         Self {
             tag,
+            name: "HELLO", // to be computed from bolt_version
             fields,
-            bolt_version,
         }
     }
-}
-
-#[derive(Debug)]
-pub struct ServerMessage {
-    fields: value_send::ValueSend,
 }

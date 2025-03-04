@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod bang_line;
+mod bolt_encode;
 mod bolt_version;
 mod context;
 mod net;

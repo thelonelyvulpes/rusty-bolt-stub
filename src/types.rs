@@ -39,7 +39,7 @@ pub struct ConditionBranch {
 
 pub mod actor_types {
     use crate::context::Context;
-    use crate::values::ClientMessage;
+    use crate::values::BoltMessage;
 
     use std::fmt::Debug;
 
@@ -48,7 +48,7 @@ pub mod actor_types {
     }
 
     pub trait ClientMessageValidator: ScriptLine {
-        fn validate(&self, message: &ClientMessage) -> anyhow::Result<()>;
+        fn validate(&self, message: &BoltMessage) -> anyhow::Result<()>;
     }
 
     pub trait ServerMessageSender: ScriptLine + Send {
@@ -80,7 +80,7 @@ pub mod actor_types {
     }
 
     impl ClientMessageValidator for AutoMessageHandler {
-        fn validate(&self, message: &ClientMessage) -> anyhow::Result<()> {
+        fn validate(&self, message: &BoltMessage) -> anyhow::Result<()> {
             self.client_validator.validate(message)
         }
     }

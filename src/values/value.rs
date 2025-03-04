@@ -17,22 +17,28 @@ use indexmap::IndexMap;
 use nom::{Parser, ToUsize};
 
 #[allow(unused)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
-pub enum ValueReceive {
+pub enum Value {
     Null,
     Boolean(bool),
     Integer(i64),
     Float(f64),
     Bytes(Vec<u8>),
     String(String),
-    List(Vec<ValueReceive>),
-    Map(IndexMap<String, ValueReceive>),
-    Struct(u8, Vec<ValueReceive>),
+    List(Vec<Value>),
+    Map(IndexMap<String, Value>),
+    Struct(Struct),
 }
 
-impl ValueReceive {
-    pub(crate) fn from_data_consume_all(data: &[u8]) -> Result<ValueReceive> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Struct {
+    pub tag: u8,
+    pub fields: Vec<Value>,
+}
+
+impl Value {
+    pub(crate) fn from_data_consume_all(data: &[u8]) -> Result<Value> {
         let mut decoder = PackStreamDecoder::new(data, 0);
         let value = decoder.read()?;
         if decoder.index != data.len() {
@@ -47,47 +53,31 @@ impl ValueReceive {
     }
 }
 
-impl ValueReceive {
-    pub(crate) fn eq_data(&self, other: &Self) -> bool {
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
         match self {
-            ValueReceive::Null => matches!(other, ValueReceive::Null),
-            ValueReceive::Boolean(v1) => matches!(other, ValueReceive::Boolean(v2) if v1 == v2),
-            ValueReceive::Integer(v1) => matches!(other, ValueReceive::Integer(v2) if v1 == v2),
-            ValueReceive::Float(v1) => match other {
-                ValueReceive::Float(v2) => v1.to_bits() == v2.to_bits(),
+            Value::Null => matches!(other, Value::Null),
+            Value::Boolean(v1) => matches!(other, Value::Boolean(v2) if v1 == v2),
+            Value::Integer(v1) => matches!(other, Value::Integer(v2) if v1 == v2),
+            Value::Float(v1) => match other {
+                Value::Float(v2) => v1.is_nan() && v2.is_nan() || v1.to_bits() == v2.to_bits(),
                 _ => false,
             },
-            ValueReceive::Bytes(v1) => matches!(other, ValueReceive::Bytes(v2) if v1 == v2),
-            ValueReceive::String(v1) => matches!(other, ValueReceive::String(v2) if v1 == v2),
-            ValueReceive::List(v1) => match other {
-                ValueReceive::List(v2) if v1.len() == v2.len() => {
-                    v1.iter().zip(v2.iter()).all(|(v1, v2)| v1.eq_data(v2))
-                }
-                _ => false,
-            },
-            ValueReceive::Map(v1) => match other {
-                ValueReceive::Map(v2) if v1.len() == v2.len() => v1
-                    .iter()
-                    .zip(v2.iter())
-                    .all(|((k1, v1), (k2, v2))| k1 == k2 && v1.eq_data(v2)),
-                _ => false,
-            },
-            ValueReceive::Struct(t1, v1) => match other {
-                ValueReceive::Struct(t2, v2) => {
-                    t1 == t2 && v1.len() == v2.len() && {
-                        v1.iter().zip(v2.iter()).all(|(v1, v2)| v1.eq_data(v2))
-                    }
-                }
-                _ => false,
-            },
+            Value::Bytes(v1) => matches!(other, Value::Bytes(v2) if v1 == v2),
+            Value::String(v1) => matches!(other, Value::String(v2) if v1 == v2),
+            Value::List(v1) => matches!(other, Value::List(v2) if v1 == v2),
+            Value::Map(v1) => matches!(other, Value::Map(v2) if v1 == v2),
+            Value::Struct(v1) => matches!(other, Value::Struct(v2) if v1 == v2),
         }
     }
 }
 
+impl Eq for Value {}
+
 macro_rules! impl_value_from_into {
     ( $value:expr, $($ty:ty),* ) => {
         $(
-            impl From<$ty> for ValueReceive {
+            impl From<$ty> for Value {
                 fn from(value: $ty) -> Self {
                     $value(value.into())
                 }
@@ -99,7 +89,7 @@ macro_rules! impl_value_from_into {
 macro_rules! impl_value_from_owned {
     ( $value:expr, $($ty:ty),* ) => {
         $(
-            impl From<$ty> for ValueReceive {
+            impl From<$ty> for Value {
                 fn from(value: $ty) -> Self {
                     $value(value)
                 }
@@ -108,65 +98,66 @@ macro_rules! impl_value_from_owned {
     };
 }
 
-impl_value_from_into!(ValueReceive::Boolean, bool);
-impl_value_from_into!(ValueReceive::Integer, u8, u16, u32, i8, i16, i32, i64);
-impl_value_from_into!(ValueReceive::Float, f32, f64);
-impl_value_from_into!(ValueReceive::String, &str);
-impl_value_from_into!(ValueReceive::Bytes, &[u8]);
+impl_value_from_into!(Value::Boolean, bool);
+impl_value_from_into!(Value::Integer, u8, u16, u32, i8, i16, i32, i64);
+impl_value_from_into!(Value::Float, f32, f64);
+impl_value_from_into!(Value::String, &str);
+impl_value_from_into!(Value::Bytes, &[u8]);
 
-impl_value_from_owned!(ValueReceive::String, String);
-// impl_value_from_owned!(ValueReceive::List, Vec<ValueReceive>);
+impl_value_from_owned!(Value::String, String);
+impl_value_from_owned!(Value::Struct, Struct);
+// impl_value_from_owned!(Value::List, Vec<Value>);
 // impl_value_from_owned!(Value::Map, HashMap<String, Value>);
-impl<T: Into<ValueReceive>> From<IndexMap<String, T>> for ValueReceive {
+impl<T: Into<Value>> From<IndexMap<String, T>> for Value {
     fn from(value: IndexMap<String, T>) -> Self {
-        ValueReceive::Map(value.into_iter().map(|(k, v)| (k, v.into())).collect())
+        Value::Map(value.into_iter().map(|(k, v)| (k, v.into())).collect())
     }
 }
 
-impl<T: Into<ValueReceive>> From<Vec<T>> for ValueReceive {
+impl<T: Into<Value>> From<Vec<T>> for Value {
     fn from(value: Vec<T>) -> Self {
-        ValueReceive::List(value.into_iter().map(|v| v.into()).collect())
+        Value::List(value.into_iter().map(|v| v.into()).collect())
     }
 }
 
-impl<T: Into<ValueReceive>> From<Option<T>> for ValueReceive {
+impl<T: Into<Value>> From<Option<T>> for Value {
     fn from(value: Option<T>) -> Self {
         match value {
-            None => ValueReceive::Null,
+            None => Value::Null,
             Some(v) => v.into(),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_null(&self) -> bool {
-        matches!(self, ValueReceive::Null)
+        matches!(self, Value::Null)
     }
 }
 
-impl TryFrom<ValueReceive> for bool {
-    type Error = ValueReceive;
+impl TryFrom<Value> for bool {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::Boolean(v) => Ok(v),
+            Value::Boolean(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_bool(&self) -> bool {
-        matches!(self, ValueReceive::Boolean(_))
+        matches!(self, Value::Boolean(_))
     }
 
     #[inline]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
-            ValueReceive::Boolean(v) => Some(*v),
+            Value::Boolean(v) => Some(*v),
             _ => None,
         }
     }
@@ -178,28 +169,28 @@ impl ValueReceive {
     }
 }
 
-impl TryFrom<ValueReceive> for i64 {
-    type Error = ValueReceive;
+impl TryFrom<Value> for i64 {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::Integer(v) => Ok(v),
+            Value::Integer(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_int(&self) -> bool {
-        matches!(self, ValueReceive::Integer(_))
+        matches!(self, Value::Integer(_))
     }
 
     #[inline]
     pub fn as_int(&self) -> Option<i64> {
         match self {
-            ValueReceive::Integer(v) => Some(*v),
+            Value::Integer(v) => Some(*v),
             _ => None,
         }
     }
@@ -211,28 +202,28 @@ impl ValueReceive {
     }
 }
 
-impl TryFrom<ValueReceive> for f64 {
-    type Error = ValueReceive;
+impl TryFrom<Value> for f64 {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::Float(v) => Ok(v),
+            Value::Float(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_float(&self) -> bool {
-        matches!(self, ValueReceive::Float(_))
+        matches!(self, Value::Float(_))
     }
 
     #[inline]
     pub fn as_float(&self) -> Option<f64> {
         match self {
-            ValueReceive::Float(v) => Some(*v),
+            Value::Float(v) => Some(*v),
             _ => None,
         }
     }
@@ -244,28 +235,28 @@ impl ValueReceive {
     }
 }
 
-impl TryFrom<ValueReceive> for Vec<u8> {
-    type Error = ValueReceive;
+impl TryFrom<Value> for Vec<u8> {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::Bytes(v) => Ok(v),
+            Value::Bytes(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_bytes(&self) -> bool {
-        matches!(self, ValueReceive::Bytes(_))
+        matches!(self, Value::Bytes(_))
     }
 
     #[inline]
     pub fn as_bytes(&self) -> Option<&Vec<u8>> {
         match self {
-            ValueReceive::Bytes(v) => Some(v),
+            Value::Bytes(v) => Some(v),
             _ => None,
         }
     }
@@ -277,28 +268,28 @@ impl ValueReceive {
     }
 }
 
-impl TryFrom<ValueReceive> for String {
-    type Error = ValueReceive;
+impl TryFrom<Value> for String {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::String(v) => Ok(v),
+            Value::String(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_string(&self) -> bool {
-        matches!(self, ValueReceive::String(_))
+        matches!(self, Value::String(_))
     }
 
     #[inline]
     pub fn as_string(&self) -> Option<&String> {
         match self {
-            ValueReceive::String(v) => Some(v),
+            Value::String(v) => Some(v),
             _ => None,
         }
     }
@@ -310,101 +301,101 @@ impl ValueReceive {
     }
 }
 
-impl TryFrom<ValueReceive> for Vec<ValueReceive> {
-    type Error = ValueReceive;
+impl TryFrom<Value> for Vec<Value> {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::List(v) => Ok(v),
+            Value::List(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_list(&self) -> bool {
-        matches!(self, ValueReceive::List(_))
+        matches!(self, Value::List(_))
     }
 
     #[inline]
-    pub fn as_list(&self) -> Option<&[ValueReceive]> {
+    pub fn as_list(&self) -> Option<&[Value]> {
         match self {
-            ValueReceive::List(v) => Some(v),
+            Value::List(v) => Some(v),
             _ => None,
         }
     }
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_list(self) -> Result<Vec<ValueReceive>, Self> {
+    pub fn try_into_list(self) -> Result<Vec<Value>, Self> {
         self.try_into()
     }
 }
 
-impl TryFrom<ValueReceive> for IndexMap<String, ValueReceive> {
-    type Error = ValueReceive;
+impl TryFrom<Value> for IndexMap<String, Value> {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::Map(v) => Ok(v),
+            Value::Map(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_map(&self) -> bool {
-        matches!(self, ValueReceive::Map(_))
+        matches!(self, Value::Map(_))
     }
 
     #[inline]
-    pub fn as_map(&self) -> Option<&IndexMap<String, ValueReceive>> {
+    pub fn as_map(&self) -> Option<&IndexMap<String, Value>> {
         match self {
-            ValueReceive::Map(v) => Some(v),
+            Value::Map(v) => Some(v),
             _ => None,
         }
     }
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_map(self) -> Result<IndexMap<String, ValueReceive>, Self> {
+    pub fn try_into_map(self) -> Result<IndexMap<String, Value>, Self> {
         self.try_into()
     }
 }
 
-impl TryFrom<ValueReceive> for (u8, Vec<ValueReceive>) {
-    type Error = ValueReceive;
+impl TryFrom<Value> for (u8, Vec<Value>) {
+    type Error = Value;
 
     #[inline]
-    fn try_from(value: ValueReceive) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            ValueReceive::Struct(tag, values) => Ok((tag, values)),
+            Value::Struct(Struct { tag, fields }) => Ok((tag, fields)),
             _ => Err(value),
         }
     }
 }
 
-impl ValueReceive {
+impl Value {
     #[inline]
     pub fn is_struct(&self) -> bool {
-        matches!(self, ValueReceive::Struct(_, _))
+        matches!(self, Value::Struct(_))
     }
 
     #[inline]
-    pub fn as_struct(&self) -> Option<(u8, &Vec<ValueReceive>)> {
+    pub fn as_struct(&self) -> Option<(u8, &Vec<Value>)> {
         match self {
-            ValueReceive::Struct(tag, values) => Some((*tag, values)),
+            Value::Struct(Struct { tag, fields }) => Some((*tag, fields)),
             _ => None,
         }
     }
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_struct(self) -> Result<(u8, Vec<ValueReceive>), Self> {
+    pub fn try_into_struct(self) -> Result<(u8, Vec<Value>), Self> {
         self.try_into()
     }
 }
@@ -444,18 +435,18 @@ impl<'a> PackStreamDecoder<'a> {
         Self { bytes, index: idx }
     }
 
-    fn read(&mut self) -> Result<ValueReceive> {
+    fn read(&mut self) -> Result<Value> {
         let marker = self.read_byte()?;
         self.read_value(marker)
     }
 
-    fn read_value(&mut self, marker: u8) -> Result<ValueReceive> {
+    fn read_value(&mut self, marker: u8) -> Result<Value> {
         let high_nibble = marker & 0xF0;
 
         Ok(match marker {
             // tiny int
             _ if marker as i8 >= -16 => marker.into(),
-            NULL => ValueReceive::Null,
+            NULL => Value::Null,
             FLOAT_64 => self.read_f64()?.into(),
             FALSE => false.into(),
             TRUE => true.into(),
@@ -522,7 +513,7 @@ impl<'a> PackStreamDecoder<'a> {
         })
     }
 
-    fn read_list(&mut self, length: usize) -> Result<ValueReceive> {
+    fn read_list(&mut self, length: usize) -> Result<Value> {
         let mut items = Vec::with_capacity(length);
         for _ in 0..length {
             items.push(self.read()?);
@@ -530,11 +521,11 @@ impl<'a> PackStreamDecoder<'a> {
         Ok(items.into())
     }
 
-    fn read_string(&mut self, length: usize) -> Result<ValueReceive> {
+    fn read_string(&mut self, length: usize) -> Result<Value> {
         self.read_raw_string(length).map(Into::into)
     }
 
-    fn read_map(&mut self, length: usize) -> Result<ValueReceive> {
+    fn read_map(&mut self, length: usize) -> Result<Value> {
         let mut key_value_pairs = IndexMap::with_capacity(length);
         for _ in 0..length {
             let len = self.read_string_length()?;
@@ -545,19 +536,19 @@ impl<'a> PackStreamDecoder<'a> {
         Ok(key_value_pairs.into())
     }
 
-    fn read_bytes(&mut self, length: usize) -> Result<ValueReceive> {
+    fn read_bytes(&mut self, length: usize) -> Result<Value> {
         let data = self.bytes.get(self.index..self.index + length);
         self.index += length;
         Ok(data.into())
     }
 
-    fn read_struct(&mut self, length: usize) -> Result<ValueReceive> {
+    fn read_struct(&mut self, length: usize) -> Result<Value> {
         let tag = self.read_byte()?;
         let mut fields = Vec::with_capacity(length);
         for _ in 0..length {
             fields.push(self.read()?)
         }
-        let bolt_struct = ValueReceive::Struct(tag, fields);
+        let bolt_struct = Value::Struct(Struct { tag, fields });
         Ok(bolt_struct)
     }
 

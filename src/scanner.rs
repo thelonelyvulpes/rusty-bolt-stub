@@ -48,7 +48,7 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
     if !span.is_empty() {
         return Err(nom::Err::Failure(PError::from_external_error(
             span.into(),
-            nom::error::ErrorKind::Complete,
+            ErrorKind::Complete,
             anyhow!("Trailing input"),
         )));
     }
@@ -921,7 +921,8 @@ mod tests {
             ?}
 
             *: RESET
-            ?: GOODBYE"#};
+            ?: GOODBYE"#
+        };
 
         dbg!(scanner::scan_script(input, "test.script".into())).unwrap();
     }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::values::value_receive::ValueReceive;
+use crate::values::value::Value;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
@@ -21,7 +21,7 @@ use std::fmt::{Display, Formatter};
 pub struct Node {
     pub id: i64,
     pub labels: Vec<String>,
-    pub properties: HashMap<String, ValueReceive>,
+    pub properties: HashMap<String, Value>,
     pub element_id: String,
 }
 
@@ -41,7 +41,7 @@ pub struct Relationship {
     pub start_node_id: i64,
     pub end_node_id: i64,
     pub type_: String,
-    pub properties: HashMap<String, ValueReceive>,
+    pub properties: HashMap<String, Value>,
     pub element_id: String,
     pub start_node_element_id: String,
     pub end_node_element_id: String,
@@ -167,6 +167,6 @@ impl Display for Path {
 pub struct UnboundRelationship {
     pub id: i64,
     pub type_: String,
-    pub properties: HashMap<String, ValueReceive>,
+    pub properties: HashMap<String, Value>,
     pub element_id: String,
 }
