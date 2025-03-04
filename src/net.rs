@@ -111,12 +111,12 @@ impl Server<'_> {
                 _ = ct.cancelled() => {
                     return Err(anyhow!("Shutdown while awaiting new connection"));
                 }
-            };
+            }
         }
     }
 }
 
-fn validate_results(results: &Vec<Result<()>>) -> Result<()> {
+fn validate_results(results: &[Result<()>]) -> Result<()> {
     let errors = results
         .iter()
         .filter(|e| !e.is_ok())
@@ -126,7 +126,7 @@ fn validate_results(results: &Vec<Result<()>>) -> Result<()> {
         })
         .collect_vec();
 
-    if errors.len() != 0 {
+    if !errors.is_empty() {
         let mut sb = String::with_capacity(1024);
         sb = sb.add(
             format!(

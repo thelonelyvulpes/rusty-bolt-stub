@@ -7,9 +7,8 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use itertools::Itertools;
-use nom::{Parser, Slice};
 use regex::Regex;
-use serde_json::{Deserializer, Value as JsonValue};
+use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 
 use crate::bang_line::BangLine;
 use crate::bolt_encode;
@@ -52,7 +51,7 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
         let lines = script.lines().enumerate();
         let mut excerpt_lines = Vec::<String>::with_capacity(end - start + 3 + 2 * CONTEXT_LINES);
         if start.saturating_sub(CONTEXT_LINES) > 1 {
-            excerpt_lines.push(format!("  {: >width$} ...", "", width = line_num_width).into());
+            excerpt_lines.push(format!("  {: >width$} ...", "", width = line_num_width));
         }
         for (mut line_num, line) in lines {
             line_num += 1;
@@ -62,28 +61,32 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
             }
             if line_num < start {
                 // context before the excerpt
-                excerpt_lines.push(
-                    format!("  {: >width$} {}", line_num, line, width = line_num_width).into(),
-                );
+                excerpt_lines.push(format!(
+                    "  {line_num: >width$} {line}",
+                    width = line_num_width
+                ));
                 continue;
             }
             if line_num <= end {
                 // the excerpt
-                excerpt_lines.push(
-                    format!("> {: >width$} {}", line_num, line, width = line_num_width).into(),
-                );
+                excerpt_lines.push(format!(
+                    "> {line_num: >width$} {line}",
+                    width = line_num_width
+                ));
                 continue;
             }
             // context after the excerpt
-            excerpt_lines
-                .push(format!("  {: >width$} {}", line_num, line, width = line_num_width).into());
+            excerpt_lines.push(format!(
+                "  {line_num: >width$} {line}",
+                width = line_num_width
+            ));
             if line_num >= end.saturating_add(CONTEXT_LINES) {
                 // past context
                 break;
             }
         }
         if end.saturating_add(CONTEXT_LINES) < line_num_max {
-            excerpt_lines.push(format!("  {: >width$} ...", "", width = line_num_width).into());
+            excerpt_lines.push(format!("  {: >width$} ...", "", width = line_num_width));
         }
         excerpt_lines.join("\n")
     }
@@ -133,7 +136,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     let mut allow_restart: Option<bool> = None;
     let mut allow_concurrent: Option<bool> = None;
     let mut handshake: Option<Vec<u8>> = None;
-    let mut handshake_delay: Option<Duration> = None;
+    let handshake_delay: Option<Duration> = None;
 
     for bang_line in bang_lines {
         match bang_line {
@@ -295,13 +298,13 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     }
 }
 
-fn condense_actor_blocks(p0: Vec<ActorBlock>) -> Vec<ActorBlock> {
+fn condense_actor_blocks(_p0: Vec<ActorBlock>) -> Vec<ActorBlock> {
     todo!()
 }
 
 fn create_auto_message_sender(
-    client_message_tag: &str,
-    config: &ActorConfig,
+    _client_message_tag: &str,
+    _config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
     // return Ok(Box::new(()));
     todo!("Create the auto message sending component, composed with a validator by caller")
@@ -310,7 +313,7 @@ fn create_auto_message_sender(
 fn create_message_sender(
     message_name: &str,
     message_body: &Option<String>,
-    config: &ActorConfig,
+    _config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
     // return Ok(Box::new(()));
     let data = vec![];
@@ -360,7 +363,7 @@ struct ValidatorImpl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> {
 }
 
 impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> Debug for ValidatorImpl<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
 }
@@ -465,6 +468,11 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
             })
         }
         JsonValue::Object(expected) => {
+            let expected = match build_jolt_validator(expected, config)? {
+                IsJoltValidator::Yes(jolt_validator) => return Ok(jolt_validator),
+                IsJoltValidator::No(expected) => expected,
+            };
+
             let mut required_keys = HashSet::new();
             let mut unique_keys = HashSet::new();
             let validators = expected
@@ -536,11 +544,6 @@ fn build_map_entry_validator(
     //      E.g., `C: MSG {"foo{}": [1, 2]}` will match `C: MSG {"foo": [1, 2]}` and `C: MSG {"foo": [2, 1]}`, but `C: MSG {"foo{}": "ba"}` will not match `C: MSG {"foo": "ab"}`.
     //    * Example for **optional** and **sorted**: `C: MSG {"[foo{}]": [1, 2]}`.
 
-    let expected = match build_jolt_validator(key, expected, config)? {
-        IsJoltValidator::Yes(jolt_validator) => return Ok((key.to_string(), jolt_validator, true)),
-        IsJoltValidator::No(expected) => expected,
-    };
-
     let key = ParsedMapKey::parse(key);
     let required = !key.is_optional;
     let ordered = key.is_ordered;
@@ -563,7 +566,7 @@ fn build_map_entry_validator(
                     ));
                 }
                 let mut left_validators = HashSet::new();
-                left_validators.extend((0..validators.len()).into_iter());
+                left_validators.extend(0..validators.len());
                 'values: for value_received in received.iter() {
                     for validator_idx in &left_validators {
                         let validator_idx = *validator_idx;
@@ -588,20 +591,16 @@ fn build_map_entry_validator(
 
 enum IsJoltValidator {
     Yes(ValidateValueFn),
-    No(JsonValue),
+    No(JsonMap<String, JsonValue>),
 }
 
 fn build_jolt_validator(
-    key: &str,
-    expected: JsonValue,
+    expected: JsonMap<String, JsonValue>,
     config: &ActorConfig,
 ) -> Result<IsJoltValidator> {
     // https://docs.google.com/document/d/1QK4OcC0tZ08lKqVr-3-z8HpPY9jFeEh6zZPhMm15D-w/edit?tab=t.0
-    let JsonValue::Object(expected) = expected else {
-        return Ok(IsJoltValidator::No(expected));
-    };
     if expected.len() != 1 {
-        return Ok(IsJoltValidator::No(JsonValue::Object(expected)));
+        return Ok(IsJoltValidator::No(expected));
     }
     let (sigil, expected) = expected.into_iter().next().expect("non-empty check above");
     let (versionless_sigil, jolt_version) = parse_jolt_sigil(&sigil, config)?;
@@ -694,12 +693,12 @@ fn build_jolt_validator(
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
         }
         "T" => {
-            let JsonValue::String(expected) = expected else {
+            let JsonValue::String(_expected) = expected else {
                 return Err(ParseError::new(format!(
                     "Expected temporal string after sigil \"T\", but found {expected:?}",
                 )));
             };
-            todo!("Implement temporal string parsing :-!")
+            todo!("Implement temporal string parsing :-!");
         }
         "@" => {
             let JsonValue::String(expected) = expected else {
@@ -790,7 +789,7 @@ fn build_jolt_validator(
                 todo!("implement path parsing")
             }
         },
-        _ => IsJoltValidator::No(expected),
+        _ => IsJoltValidator::No([(sigil, expected)].into_iter().collect()),
     })
 }
 
@@ -951,16 +950,15 @@ fn build_fields_validator(
     config: &ActorConfig,
 ) -> Result<ValidateValuesFn> {
     let Some(line) = msg_body else {
-        return Ok(Box::new(|msg| build_no_fields_validator(msg)));
+        return Ok(Box::new(build_no_fields_validator));
     };
     // RUN "RETURN $n AS n" {"n": 1}
-    let fields: Vec<_> = Deserializer::from_str(line)
+    let _field_validators: Vec<_> = Deserializer::from_str(line)
         .into_iter()
         .collect::<StdResult<Vec<JsonValue>, _>>()?
         .into_iter()
         .map(|field| build_field_validator(field, config))
         .collect::<Result<_>>()?;
-    let field_validators = fields;
 
     todo!();
 
@@ -981,10 +979,10 @@ fn build_fields_validator(
     // dbg!(v);
     // [1, 2] "h ello" {"a": false}
     // let v: Value = serde_json::from_str(line)?;
-    Ok(Box::new(|_| Ok(())))
+    // Ok(Box::new(|_| Ok(())))
 }
 
-fn message_tag_from_name(tag_name: &str, config: &ActorConfig) -> Result<u8> {
+fn message_tag_from_name(_tag_name: &str, _config: &ActorConfig) -> Result<u8> {
     todo!("Take a message name, and return the byte dependent on the bolt version, as pull and pullall both use the same tag byte.")
 }
 

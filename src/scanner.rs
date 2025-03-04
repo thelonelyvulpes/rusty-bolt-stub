@@ -47,7 +47,7 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
     let (span, body) = delimited(multispace0, opt(scan_body), multispace0)(span)?;
     if !span.is_empty() {
         return Err(nom::Err::Failure(PError::from_external_error(
-            span.into(),
+            span,
             ErrorKind::Complete,
             anyhow!("Trailing input"),
         )));
@@ -69,11 +69,11 @@ fn scan_bang_lines(input: Input) -> IResult<Vec<BangLine>> {
         context("bolt version bang", bolt_version_bang_line),
         context(
             "allow restart",
-            simple_bang_line("ALLOW RESTART", |b| BangLine::AllowRestart(b)),
+            simple_bang_line("ALLOW RESTART", BangLine::AllowRestart),
         ),
         context(
             "allow concurrent",
-            simple_bang_line("ALLOW CONCURRENT", |b| BangLine::Concurrent(b)),
+            simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
             // TODO: add delay handshake
             //       handshake bytes
             //       python line
@@ -116,7 +116,7 @@ fn auto_bang_line(input: Input) -> IResult<BangLine> {
     )(input)
 }
 
-fn simple_bang_line<'a, 'b>(
+fn simple_bang_line<'a>(
     expect: &'static str,
     mut res: impl FnMut(Context) -> BangLine,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, BangLine> {
@@ -288,7 +288,7 @@ fn message<'a>(
 
 fn prefixed_line<'a>(
     prefix: Option<&'static str>,
-) -> impl FnMut(Input<'a>) -> IResult<(Input<'a>, Option<Input<'a>>)> {
+) -> impl FnMut(Input<'a>) -> IResult<'a, (Input<'a>, Option<Input<'a>>)> {
     preceded(
         multispace0,
         preceded(
@@ -313,7 +313,7 @@ fn prefixed_line<'a>(
 fn message_simple_content<'a>(
     tag: Option<&'static str>,
     mut block: impl FnMut(Context, String) -> ScanBlock,
-) -> impl FnMut(Input<'a>) -> IResult<ScanBlock> {
+) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
     map(
         preceded(
             multispace0,
@@ -328,7 +328,7 @@ fn message_simple_content<'a>(
 
 fn prefixed_line_simple_content<'a>(
     prefix: Option<&'static str>,
-) -> impl FnMut(Input<'a>) -> IResult<Input<'a>> {
+) -> impl FnMut(Input<'a>) -> IResult<'a, Input<'a>> {
     preceded(
         cond(
             prefix.is_some(),
@@ -562,7 +562,7 @@ mod tests {
         println!("{:}", result.unwrap_err());
     }
 
-    fn wrap_input<'a>(input: &'a str) -> Input<'a> {
+    fn wrap_input(input: &str) -> Input<'_> {
         Spanned::new(input, true)
     }
 
@@ -626,7 +626,7 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
         assert_eq!(
-            result.bang_lines.get(0),
+            result.bang_lines.first(),
             Some(&BangLine::Version(new_ctx(1, 1), 5, Some(4)))
         );
         assert_eq!(
@@ -655,7 +655,7 @@ mod tests {
         let result = dbg!(scanner::scan_script(&input, "test.script".into()));
         let result = result.unwrap();
         assert_eq!(
-            result.bang_lines.get(0),
+            result.bang_lines.first(),
             Some(&BangLine::Auto(new_ctx(1, 1), "Nonsense".into()))
         );
     }

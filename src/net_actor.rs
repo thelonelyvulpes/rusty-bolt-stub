@@ -18,7 +18,7 @@ pub struct NetActor<T> {
     peeked_message: Option<BoltMessage>,
 }
 
-impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
+impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
     pub fn new(
         ct: CancellationToken,
         conn: T,
@@ -54,7 +54,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             ActorBlock::ServerMessageSend(ctx, data) => {
                 // send and die
                 let d = data.send()?;
-                self.conn.write_all(&d).await.context(ctx)
+                self.conn.write_all(d).await.context(ctx)
             }
             ActorBlock::Python(_, _) => {
                 // run some python and die.
@@ -68,7 +68,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 )
                 .await?;
                 for alt_block in alt_blocks {
-                    if Self::simulate_block(alt_block, &peeked_message).is_ok() {
+                    if Self::simulate_block(alt_block, peeked_message).is_ok() {
                         return Box::pin(self.run_block(alt_block)).await;
                     }
                 }
@@ -81,7 +81,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                     self.script.config.bolt_version,
                 )
                 .await?;
-                if Self::simulate_block(optional_block, &peeked_message).is_ok() {
+                if Self::simulate_block(optional_block, peeked_message).is_ok() {
                     return Box::pin(self.run_block(optional_block)).await;
                 }
                 Ok(())
@@ -95,7 +95,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                         self.script.config.bolt_version,
                     )
                     .await?;
-                    if Self::simulate_block(block, &peeked_message).is_ok() {
+                    if Self::simulate_block(block, peeked_message).is_ok() {
                         Box::pin(self.run_block(block)).await?;
                         c += 1;
                     } else {
@@ -114,7 +114,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 let message = self.read_message().await?;
                 handler.client_validator.validate(&message).context(ctx)?;
                 let d = handler.server_sender.send()?;
-                self.conn.write_all(&d).await.context(ctx)
+                self.conn.write_all(d).await.context(ctx)
             }
             ActorBlock::NoOp(_) => Ok(()),
         }
@@ -484,7 +484,7 @@ mod tests {
 
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
             let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
-            assert!(!res.is_ok());
+            assert!(res.is_err());
         }
     }
 }

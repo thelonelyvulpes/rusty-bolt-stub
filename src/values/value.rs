@@ -14,7 +14,7 @@
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
-use nom::{Parser, ToUsize};
+use nom::ToUsize;
 
 #[allow(unused)]
 #[derive(Debug, Clone)]

@@ -13,7 +13,7 @@ pub struct BoltMessage {
 }
 
 impl BoltMessage {
-    pub fn new(tag: u8, fields: Vec<value::Value>, bolt_version: BoltVersion) -> Self {
+    pub fn new(tag: u8, fields: Vec<value::Value>, _bolt_version: BoltVersion) -> Self {
         Self {
             tag,
             name: "HELLO", // to be computed from bolt_version
