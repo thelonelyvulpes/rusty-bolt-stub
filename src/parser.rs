@@ -202,9 +202,13 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
         todo!("Report err")
     }
 
-    let bolt_version = bolt_version.ok_or(ParseError::new("Bolt version not specified"))?;
-    let allow_restart = allow_restart.unwrap_or(false);
+    let bolt_version = bolt_version.ok_or(ParseError::new("Bolt version bang line missing"))?;
     let allow_concurrent = allow_concurrent.unwrap_or(false);
+    let allow_restart = if allow_concurrent {
+        true // allow concurrent implies allow restart
+    } else {
+        allow_restart.unwrap_or(false)
+    };
     Ok(ActorConfig {
         bolt_version,
         allow_restart,
@@ -217,23 +221,18 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
 fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     match block {
         ScanBlock::List(ctx, scan_blocks) => {
-            let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
-            for scan_block in scan_blocks {
-                let b = parse_block(scan_block, config)?;
-                if matches!(b, ActorBlock::NoOp(_)) {
-                    continue;
-                }
-                actor_blocks.push(b);
-            }
+            let mut actor_blocks = condense_actor_blocks(
+                scan_blocks
+                    .iter()
+                    .map(|b| parse_block(b, config))
+                    .collect::<Result<_>>()?,
+            );
             validate_list_children(&actor_blocks)?;
 
             match actor_blocks.len() {
                 0 => Ok(ActorBlock::NoOp(*ctx)),
                 1 => Ok(actor_blocks.remove(0)),
-                _ => {
-                    let actor_blocks = condense_actor_blocks(actor_blocks);
-                    Ok(ActorBlock::BlockList(*ctx, actor_blocks))
-                }
+                _ => Ok(ActorBlock::BlockList(*ctx, actor_blocks)),
             }
         }
         ScanBlock::Alt(ctx, scan_blocks) => {
@@ -245,8 +244,14 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             }
             Ok(ActorBlock::Alt(*ctx, actor_blocks))
         }
-        ScanBlock::Parallel(_, _) => {
-            todo!("Parallel blocks are not yet supported in the actor")
+        ScanBlock::Parallel(ctx, scan_blocks) => {
+            let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
+            for block in scan_blocks {
+                let b = parse_block(block, config)?;
+                validate_parallel_child(&b)?;
+                actor_blocks.push(b);
+            }
+            Ok(ActorBlock::Alt(*ctx, actor_blocks))
         }
         ScanBlock::Optional(ctx, optional_scan_block) => {
             // TODO: Handle bad optional blocks
@@ -304,6 +309,7 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
     for block in blocks {
         let Some(last) = res.last_mut() else { continue };
         match (block, last) {
+            (ActorBlock::NoOp(_), _) => continue,
             (ActorBlock::BlockList(ctx, list), ActorBlock::BlockList(ctx_last, list_last)) => {
                 *ctx_last = ctx_last.fuse(&ctx);
                 list_last.extend(list)
@@ -1000,9 +1006,9 @@ fn message_tag_from_name(_tag_name: &str, _config: &ActorConfig) -> Result<u8> {
 
 fn is_skippable(block: &ActorBlock) -> bool {
     match block {
-        ActorBlock::BlockList(_, blocks) | ActorBlock::Alt(_, blocks) => {
-            blocks.iter().all(is_skippable)
-        }
+        ActorBlock::BlockList(_, blocks)
+        | ActorBlock::Alt(_, blocks)
+        | ActorBlock::Parallel(_, blocks) => blocks.iter().all(is_skippable),
         ActorBlock::Repeat(_, block, count) => *count == 0 || is_skippable(block),
         ActorBlock::Optional(..) | ActorBlock::NoOp(..) => true,
         ActorBlock::ClientMessageValidate(..)
@@ -1024,7 +1030,9 @@ fn has_deterministic_end(block: &ActorBlock) -> bool {
         ActorBlock::ClientMessageValidate(..)
         | ActorBlock::ServerMessageSend(..)
         | ActorBlock::Python(..) => true,
-        ActorBlock::Alt(_, blocks) => blocks.iter().all(has_deterministic_end),
+        ActorBlock::Alt(_, blocks) | ActorBlock::Parallel(_, blocks) => {
+            blocks.iter().all(has_deterministic_end)
+        }
         ActorBlock::Optional(..) | ActorBlock::Repeat(..) => false,
         ActorBlock::AutoMessage(..) => true,
         ActorBlock::NoOp(..) => true,
@@ -1045,7 +1053,9 @@ fn is_action_block(block: &ActorBlock) -> bool {
             }
             break 'arm false;
         }
-        ActorBlock::Alt(_, blocks) => blocks.iter().any(is_action_block),
+        ActorBlock::Alt(_, blocks) | ActorBlock::Parallel(_, blocks) => {
+            blocks.iter().any(is_action_block)
+        }
         ActorBlock::Optional(_, block) => is_action_block(block),
         ActorBlock::Repeat(_, block, _) => is_action_block(block),
         ActorBlock::ClientMessageValidate(..)
@@ -1092,7 +1102,13 @@ fn validate_list_children(blocks: &[ActorBlock]) -> Result<()> {
 
 fn validate_alt_child(b: &ActorBlock) -> Result<()> {
     validate_non_empty(b, Some("as an Alt block branch"))?;
-    validate_non_action(b, Some("as an Alt block child"))?;
+    validate_non_action(b, Some("as an Alt block branch"))?;
+    Ok(())
+}
+
+fn validate_parallel_child(b: &ActorBlock) -> Result<()> {
+    validate_non_empty(b, Some("as an Parallel block branch"))?;
+    validate_non_action(b, Some("as an Parallel block branch"))?;
     Ok(())
 }
 
@@ -1115,9 +1131,9 @@ mod test {
             handshake: None,
             handshake_delay: None,
         };
-        let validator = create_validator(tag, Some(body), &cfg).unwrap();
+        let _validator = create_validator(tag, Some(body), &cfg).unwrap();
 
-        let cm = BoltMessage::new(0x00, vec![], BoltVersion::V5_0);
+        let _cm = BoltMessage::new(0x00, vec![], BoltVersion::V5_0);
 
         todo!();
         // assert_!(validator.validate(&cm).unwrap());

@@ -104,6 +104,7 @@ pub mod actor_types {
         ServerMessageSend(Context, Box<dyn ServerMessageSender>),
         Python(Context, String),
         Alt(Context, Vec<ActorBlock>),
+        Parallel(Context, Vec<ActorBlock>),
         Optional(Context, Box<ActorBlock>),
         Repeat(Context, Box<ActorBlock>, usize),
         AutoMessage(Context, AutoMessageHandler),
@@ -113,15 +114,16 @@ pub mod actor_types {
     impl ActorBlock {
         pub fn ctx(&self) -> &Context {
             match self {
-                ActorBlock::BlockList(ctx, _) => ctx,
-                ActorBlock::ClientMessageValidate(ctx, _) => ctx,
-                ActorBlock::ServerMessageSend(ctx, _) => ctx,
-                ActorBlock::Python(ctx, _) => ctx,
-                ActorBlock::Alt(ctx, _) => ctx,
-                ActorBlock::Optional(ctx, _) => ctx,
-                ActorBlock::Repeat(ctx, _, _) => ctx,
-                ActorBlock::AutoMessage(ctx, _) => ctx,
-                ActorBlock::NoOp(ctx) => ctx,
+                ActorBlock::BlockList(ctx, _)
+                | ActorBlock::ClientMessageValidate(ctx, _)
+                | ActorBlock::ServerMessageSend(ctx, _)
+                | ActorBlock::Python(ctx, _)
+                | ActorBlock::Alt(ctx, _)
+                | ActorBlock::Parallel(ctx, _)
+                | ActorBlock::Optional(ctx, _)
+                | ActorBlock::Repeat(ctx, _, _)
+                | ActorBlock::AutoMessage(ctx, _)
+                | ActorBlock::NoOp(ctx) => ctx,
             }
         }
     }

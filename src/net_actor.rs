@@ -1,11 +1,14 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Context as AnyhowContext, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 use crate::bolt_version::BoltVersion;
+use crate::context::Context;
 use crate::parser::ActorScript;
-use crate::types::actor_types::ActorBlock;
+use crate::types::actor_types::{
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
+};
 use crate::values;
 use crate::values::value::Struct;
 use crate::values::BoltMessage;
@@ -36,87 +39,243 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
 
     pub async fn run_client_connection(&mut self) -> Result<()> {
         self.handshake().await?;
-        self.run_block(&self.script.tree).await
+        let mut block = BlockWithState::new(&self.script.tree);
+        loop {
+            self.server_action(&mut block).await?;
+            if block.done() {
+                break;
+            }
+            if !self.try_consume(&mut block).await? {
+                // TODO: enhance script mismatch error:
+                //  * Which lines were expected?
+                //  * What was received?
+                return Err(anyhow!("Script mismatch"));
+            }
+        }
+        Ok(())
     }
 
-    async fn run_block(&mut self, curr: &'static ActorBlock) -> Result<()> {
-        match curr {
-            ActorBlock::BlockList(ctx, blocks) => {
-                for block in blocks {
-                    Box::pin(self.run_block(block)).await.context(ctx)?;
+    /// # Returns
+    /// bool indicates if a message could be consumed `true` or there was a script mismatch `false`
+    async fn try_consume(&mut self, block: &mut BlockWithState<'_>) -> Result<bool> {
+        match block {
+            BlockWithState::BlockList(state, _, blocks) => {
+                if state.current_block >= blocks.len() {
+                    return Ok(false);
                 }
-                Ok(())
-            }
-            ActorBlock::ClientMessageValidate(ctx, validator) => {
-                let message = self.read_message().await?;
-                validator.validate(&message).context(ctx)
-            }
-            ActorBlock::ServerMessageSend(ctx, data) => {
-                // send and die
-                let d = data.send()?;
-                self.conn.write_all(d).await.context(ctx)
-            }
-            ActorBlock::Python(_, _) => {
-                // run some python and die.
-                todo!();
-            }
-            ActorBlock::Alt(ctx, alt_blocks) => {
-                let peeked_message = Self::peek_message(
-                    &mut self.conn,
-                    &mut self.peeked_message,
-                    self.script.config.bolt_version,
-                )
-                .await?;
-                for alt_block in alt_blocks {
-                    if Self::simulate_block(alt_block, peeked_message).is_ok() {
-                        return Box::pin(self.run_block(alt_block)).await;
+                for block in blocks.iter_mut().skip(state.current_block) {
+                    if Box::pin(self.try_consume(block)).await? {
+                        state.current_block += 1;
+                        return Ok(true);
+                    }
+                    if block.can_skip() {
+                        state.current_block += 1;
+                        continue;
                     }
                 }
-                Err(anyhow!("No blocks matched")).context(ctx)
+                Ok(false)
             }
-            ActorBlock::Optional(_, optional_block) => {
-                let peeked_message = Self::peek_message(
-                    &mut self.conn,
-                    &mut self.peeked_message,
-                    self.script.config.bolt_version,
-                )
-                .await?;
-                if Self::simulate_block(optional_block, peeked_message).is_ok() {
-                    return Box::pin(self.run_block(optional_block)).await;
-                }
-                Ok(())
-            }
-            ActorBlock::Repeat(ctx, block, rep) => {
-                let mut c = 0;
-                loop {
+            BlockWithState::ClientMessageValidate(state, _, validator) => match state.done {
+                true => Ok(false),
+                false => {
                     let peeked_message = Self::peek_message(
                         &mut self.conn,
                         &mut self.peeked_message,
                         self.script.config.bolt_version,
                     )
                     .await?;
-                    if Self::simulate_block(block, peeked_message).is_ok() {
-                        Box::pin(self.run_block(block)).await?;
-                        c += 1;
-                    } else {
+                    if validator.validate(peeked_message).is_err() {
+                        return Ok(false);
+                    }
+                    _ = self.read_message().await?; // consume the message
+                    Ok(true)
+                }
+            },
+            BlockWithState::Alt(state, _, blocks) => match state {
+                BranchState::Init => {
+                    for (i, block) in blocks.iter_mut().enumerate() {
+                        if Box::pin(self.try_consume(block)).await? {
+                            if block.done() {
+                                *state = BranchState::Done;
+                            } else {
+                                *state = BranchState::InBlock(i);
+                            }
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                BranchState::InBlock(i) => {
+                    let res = Box::pin(self.try_consume(&mut blocks[*i])).await;
+                    if blocks[*i].done() {
+                        *state = BranchState::Done;
+                    }
+                    res
+                }
+                BranchState::Done => Ok(false),
+            },
+            BlockWithState::Parallel(state, _, blocks) => {
+                if state.done {
+                    return Ok(false);
+                }
+                let mut matched = false;
+                for block in blocks.iter_mut() {
+                    if block.done() {
+                        continue;
+                    }
+                    if Box::pin(self.try_consume(block)).await? {
+                        matched = true;
                         break;
                     }
                 }
-                if c < *rep {
-                    return Err(anyhow!(
-                        "Expected {rep} repetitions but only {c} were completed."
-                    ))
-                    .context(ctx);
+                if blocks.iter().all(BlockWithState::done) {
+                    state.done = true;
                 }
-                Ok(())
+                Ok(matched)
             }
-            ActorBlock::AutoMessage(ctx, handler) => {
+            BlockWithState::Optional(state, _, block) => match state {
+                OptionalState::Init | OptionalState::Started => {
+                    let res = Box::pin(self.try_consume(block)).await;
+                    if let Ok(true) = res {
+                        *state = OptionalState::Started;
+                    }
+                    if block.done() {
+                        *state = OptionalState::Done;
+                    }
+                    res
+                }
+                OptionalState::Done => Ok(false),
+            },
+            BlockWithState::Repeat(state, _, block, _) => {
+                if Box::pin(self.try_consume(block)).await? {
+                    state.in_block = true;
+                    return Ok(true);
+                }
+                if state.in_block && block.can_skip() {
+                    // try form the top
+                    let peeked_message = Self::peek_message(
+                        &mut self.conn,
+                        &mut self.peeked_message,
+                        self.script.config.bolt_version,
+                    )
+                    .await?;
+                    match Self::can_consume(state.initial_state.as_ref(), peeked_message) {
+                        true => {
+                            *block = state.initial_state.clone();
+                            state.count += 1;
+                            assert!(Box::pin(self.try_consume(block)).await?);
+                            state.in_block = true;
+                            Ok(true)
+                        }
+                        false => Ok(false),
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            BlockWithState::AutoMessage(state, ctx, auto_handler) => {
                 let message = self.read_message().await?;
-                handler.client_validator.validate(&message).context(ctx)?;
-                let d = handler.server_sender.send()?;
-                self.conn.write_all(d).await.context(ctx)
+                auto_handler
+                    .client_validator
+                    .validate(&message)
+                    .context(*ctx)?;
+                let response = auto_handler.server_sender.send()?;
+                self.conn.write_all(response).await.context(*ctx)?;
+                state.done = true;
+                Ok(true)
             }
-            ActorBlock::NoOp(_) => Ok(()),
+            BlockWithState::ServerMessageSend(..)
+            | BlockWithState::Python(..)
+            | BlockWithState::NoOp(..) => {
+                panic!("Should've called server_action before: {block:?}")
+            }
+        }
+    }
+
+    async fn server_action(&mut self, block: &mut BlockWithState<'_>) -> Result<()> {
+        match block {
+            BlockWithState::BlockList(state, _, blocks) => {
+                let Some(block) = blocks.get_mut(state.current_block) else {
+                    return Ok(());
+                };
+                loop {
+                    Box::pin(self.server_action(block)).await?;
+                    if !block.done() {
+                        return Ok(());
+                    }
+                    state.current_block += 1;
+                }
+            }
+            BlockWithState::ServerMessageSend(state, ctx, sender) => match state.done {
+                true => Ok(()),
+                false => {
+                    let data = sender.send()?;
+                    self.conn.write_all(data).await.context(*ctx)?;
+                    state.done = true;
+                    Ok(())
+                }
+            },
+            BlockWithState::Python(state, _, _command) => match state.done {
+                true => Ok(()),
+                false => {
+                    todo!("Python commands not yet implemented");
+                    // state.done = true;
+                    // Ok(())
+                }
+            },
+            BlockWithState::Alt(state, _, blocks) => match state {
+                BranchState::Init => Ok(()),
+                BranchState::InBlock(i) => {
+                    Box::pin(self.server_action(&mut blocks[*i])).await?;
+                    if blocks[*i].done() {
+                        *state = BranchState::Done
+                    }
+                    Ok(())
+                }
+                BranchState::Done => Ok(()),
+            },
+            BlockWithState::Parallel(state, _, blocks) => match state.done {
+                true => Ok(()),
+                false => {
+                    for block in blocks.iter_mut() {
+                        if block.done() {
+                            continue;
+                        }
+                        Box::pin(self.server_action(block)).await?;
+                    }
+                    if blocks.iter().all(BlockWithState::done) {
+                        state.done = true;
+                    }
+                    Ok(())
+                }
+            },
+            BlockWithState::Optional(state, _, block) => match state {
+                // optional block children cannot start with an action block
+                OptionalState::Init => Ok(()),
+                OptionalState::Started => {
+                    let res = Box::pin(self.server_action(block)).await;
+                    if block.done() {
+                        *state = OptionalState::Done;
+                    }
+                    res
+                }
+                OptionalState::Done => Ok(()),
+            },
+            BlockWithState::Repeat(state, _, block, _) => match state.in_block {
+                true => {
+                    let res = Box::pin(self.server_action(block)).await;
+                    if block.done() {
+                        state.in_block = false;
+                        state.count += 1;
+                    }
+                    res
+                }
+                // repeat block children cannot start with an action block
+                false => Ok(()),
+            },
+            BlockWithState::AutoMessage(..)
+            | BlockWithState::ClientMessageValidate(..)
+            | BlockWithState::NoOp(..) => Ok(()),
         }
     }
 
@@ -173,31 +332,50 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         Ok(())
     }
 
-    pub fn simulate_block(curr: &ActorBlock, message: &BoltMessage) -> Result<()> {
-        match curr {
-            ActorBlock::BlockList(_, blocks) => {
-                Self::simulate_block(blocks.first().unwrap(), message)
-            }
-            ActorBlock::ClientMessageValidate(_, validator) => validator.validate(message),
-            ActorBlock::ServerMessageSend(_, _) => Ok(()),
-            ActorBlock::Python(_, _) => Ok(()),
-            ActorBlock::Alt(_, alt_blocks) => {
-                for alt_block in alt_blocks {
-                    if Self::simulate_block(alt_block, message).is_ok() {
-                        return Ok(());
+    /// # Returns
+    /// bool indicating the message can be consumed `true` or there was a script mismatch `false`
+    fn can_consume(block: &BlockWithState<'_>, message: &BoltMessage) -> bool {
+        match block {
+            BlockWithState::BlockList(state, _, blocks) => {
+                for block in blocks.iter().skip(state.current_block) {
+                    if Self::can_consume(block, message) {
+                        return true;
+                    }
+                    if !block.can_skip() {
+                        break;
                     }
                 }
-                // todo: improve the way that we report the alt block failure, none of the branches
-                //  match and we should print the first line of each block to report none matched
-                //  like in existing test kit.
-                Err(anyhow!("No blocks matched"))
+                false
             }
-            ActorBlock::Optional(_, optional_block) => {
-                Self::simulate_block(optional_block, message)
+            BlockWithState::ClientMessageValidate(state, _, validator) => {
+                !state.done && validator.validate(message).is_ok()
             }
-            ActorBlock::Repeat(_, block, _) => Self::simulate_block(block, message),
-            ActorBlock::AutoMessage(_, handler) => handler.client_validator.validate(message),
-            ActorBlock::NoOp(_) => Ok(()),
+            BlockWithState::Alt(state, _, child_blocks) => match state {
+                BranchState::Init => child_blocks.iter().any(|b| Self::can_consume(b, message)),
+                BranchState::InBlock(i) => Self::can_consume(&child_blocks[*i], message),
+                BranchState::Done => false,
+            },
+            BlockWithState::Parallel(state, _, blocks) => {
+                !state.done && blocks.iter().any(|b| Self::can_consume(b, message))
+            }
+            BlockWithState::Optional(state, _, block) => match state {
+                OptionalState::Init | OptionalState::Started => Self::can_consume(block, message),
+                OptionalState::Done => false,
+            },
+            BlockWithState::Repeat(state, _, block, _) => {
+                Self::can_consume(block, message)
+                    || (state.in_block
+                        && block.can_skip()
+                        && Self::can_consume(&state.initial_state, message))
+            }
+            BlockWithState::AutoMessage(state, _, handler) => {
+                !state.done && handler.client_validator.validate(message).is_ok()
+            }
+            BlockWithState::ServerMessageSend(..)
+            | BlockWithState::Python(..)
+            | BlockWithState::NoOp(..) => {
+                panic!("Should've called server_action before: {block:?}")
+            }
         }
     }
 
@@ -244,6 +422,170 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
     }
 }
 
+#[derive(Debug, Clone)]
+enum BlockWithState<'a> {
+    BlockList(ListState, Context, Vec<BlockWithState<'a>>),
+    ClientMessageValidate(OneShotState, Context, &'a dyn ClientMessageValidator),
+    ServerMessageSend(OneShotState, Context, &'a dyn ServerMessageSender),
+    Python(OneShotState, Context, &'a str),
+    Alt(BranchState, Context, Vec<BlockWithState<'a>>),
+    Parallel(OneShotState, Context, Vec<BlockWithState<'a>>),
+    Optional(OptionalState, Context, Box<BlockWithState<'a>>),
+    Repeat(RepeatState<'a>, Context, Box<BlockWithState<'a>>, usize),
+    AutoMessage(OneShotState, Context, &'a AutoMessageHandler),
+    NoOp(Context),
+}
+
+/*
+match block {
+    BlockWithState::BlockList(state, ctx, blocks) => todo!(),
+    BlockWithState::ClientMessageValidate(state, ctx, validator) => todo!(),
+    BlockWithState::ServerMessageSend(state, ctx, sender) => todo!(),
+    BlockWithState::Python(state, ctx, command) => todo!(),
+    BlockWithState::Alt(state, ctx, blocks) => todo!(),
+    BlockWithState::Parallel(state, ctx, blocks) => todo!(),
+    BlockWithState::Optional(state, ctx, block) => todo!(),
+    BlockWithState::Repeat(state, ctx, block, rep) => todo!(),
+    BlockWithState::AutoMessage(state, ctx, auto_handler) => todo!(),
+    BlockWithState::NoOp(ctx) => todo!(),
+}
+*/
+
+#[derive(Debug, Default, Clone)]
+struct ListState {
+    current_block: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct OneShotState {
+    done: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+enum BranchState {
+    #[default]
+    Init,
+    InBlock(usize),
+    Done,
+}
+
+#[derive(Debug, Default, Clone)]
+enum OptionalState {
+    #[default]
+    Init,
+    Started,
+    Done,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatState<'a> {
+    in_block: bool,
+    count: usize,
+    initial_state: Box<BlockWithState<'a>>,
+}
+
+impl<'a> RepeatState<'a> {
+    fn new(initial_state: Box<BlockWithState<'a>>) -> Self {
+        Self {
+            in_block: false,
+            count: 0,
+            initial_state,
+        }
+    }
+}
+
+impl<'a> BlockWithState<'a> {
+    fn new(block: &'a ActorBlock) -> Self {
+        match block {
+            ActorBlock::BlockList(ctx, blocks) => Self::BlockList(
+                Default::default(),
+                *ctx,
+                blocks.iter().map(Self::new).collect(),
+            ),
+            ActorBlock::ClientMessageValidate(ctx, validator) => {
+                Self::ClientMessageValidate(Default::default(), *ctx, validator.as_ref())
+            }
+            ActorBlock::ServerMessageSend(ctx, sender) => {
+                Self::ServerMessageSend(Default::default(), *ctx, sender.as_ref())
+            }
+            ActorBlock::Python(ctx, command) => Self::Python(Default::default(), *ctx, command),
+            ActorBlock::Alt(ctx, blocks) => Self::Alt(
+                Default::default(),
+                *ctx,
+                blocks.iter().map(Self::new).collect(),
+            ),
+            ActorBlock::Parallel(ctx, blocks) => Self::Parallel(
+                Default::default(),
+                *ctx,
+                blocks.iter().map(Self::new).collect(),
+            ),
+            ActorBlock::Optional(ctx, block) => {
+                Self::Optional(Default::default(), *ctx, Box::new(Self::new(block)))
+            }
+            ActorBlock::Repeat(ctx, block, rep) => Self::Repeat(
+                RepeatState::new(Box::new(Self::new(block))),
+                *ctx,
+                Box::new(Self::new(block)),
+                *rep,
+            ),
+            ActorBlock::AutoMessage(ctx, handler) => {
+                Self::AutoMessage(Default::default(), *ctx, handler)
+            }
+            ActorBlock::NoOp(ctx) => Self::NoOp(*ctx),
+        }
+    }
+
+    fn done(&self) -> bool {
+        match self {
+            BlockWithState::BlockList(state, _, blocks) => state.current_block >= blocks.len(),
+            BlockWithState::Alt(state, _, blocks) => match state {
+                BranchState::Init => false,
+                BranchState::InBlock(i) => blocks[*i].done(),
+                BranchState::Done => true,
+            },
+            BlockWithState::Parallel(state, _, blocks) => {
+                state.done || blocks.iter().all(Self::done)
+            }
+            BlockWithState::Optional(state, _, _) => matches!(state, OptionalState::Done),
+            BlockWithState::Repeat(_, _, _, _) => false,
+            BlockWithState::ClientMessageValidate(state, _, _)
+            | BlockWithState::ServerMessageSend(state, _, _)
+            | BlockWithState::Python(state, _, _)
+            | BlockWithState::AutoMessage(state, _, _) => state.done,
+            BlockWithState::NoOp(_) => true,
+        }
+    }
+
+    fn can_skip(&self) -> bool {
+        match self {
+            BlockWithState::BlockList(state, _, blocks) => {
+                blocks.iter().skip(state.current_block).all(Self::can_skip)
+            }
+            BlockWithState::Alt(state, _, blocks) => match state {
+                BranchState::Init => blocks.iter().any(Self::can_skip),
+                BranchState::InBlock(i) => blocks[*i].can_skip(),
+                BranchState::Done => true,
+            },
+            BlockWithState::Parallel(state, _, blocks) => {
+                state.done || blocks.iter().all(Self::can_skip)
+            }
+            BlockWithState::Optional(state, _, block) => match state {
+                OptionalState::Init | OptionalState::Done => true,
+                OptionalState::Started => block.can_skip(),
+            },
+            BlockWithState::Repeat(state, _, block, rep) => match state.in_block {
+                true => block.can_skip(),
+                false => state.count >= *rep,
+            },
+            BlockWithState::ClientMessageValidate(state, _, _)
+            | BlockWithState::ServerMessageSend(state, _, _)
+            | BlockWithState::Python(state, _, _)
+            | BlockWithState::AutoMessage(state, _, _) => state.done,
+            BlockWithState::NoOp(_) => true,
+        }
+    }
+}
+
 fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> Result<BoltMessage> {
     if data.len() <= 1 {
         return Err(anyhow!(
@@ -261,15 +603,15 @@ fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> Result<BoltMessage
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     mod simulate {
-        use crate::bolt_version::BoltVersion;
-        use crate::context::Context;
-        use crate::net_actor::NetActor;
-        use crate::types::actor_types::{ActorBlock, ClientMessageValidator, ScriptLine};
-        use crate::values::BoltMessage;
         use anyhow::anyhow;
         use std::fmt::{Debug, Formatter};
         use tokio::net::TcpStream;
+
+        use super::*;
+        use crate::types::actor_types::ScriptLine;
 
         struct TestValidator {
             pub valid: bool,
@@ -317,9 +659,11 @@ mod tests {
                     )],
                 )],
             );
+
+            let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
-            assert!(res.is_ok());
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            assert!(res);
         }
 
         #[test]
@@ -344,9 +688,10 @@ mod tests {
                 )],
             );
 
+            let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
-            assert!(res.is_err());
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            assert!(!res);
         }
 
         #[test]
@@ -413,9 +758,10 @@ mod tests {
                 ],
             );
 
+            let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
-            assert!(res.is_ok());
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            assert!(res);
         }
 
         #[test]
@@ -482,9 +828,10 @@ mod tests {
                 ],
             );
 
+            let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::simulate_block(&test_block, &message);
-            assert!(res.is_err());
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            assert!(!res);
         }
     }
 }
