@@ -1,5 +1,6 @@
-use crate::context::Context;
 use std::error::Error;
+
+use crate::context::Context;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -38,5 +39,11 @@ impl Error for ParseError {}
 impl From<serde_json::Error> for ParseError {
     fn from(err: serde_json::Error) -> Self {
         Self::new(err.to_string())
+    }
+}
+
+impl From<String> for ParseError {
+    fn from(err: String) -> Self {
+        Self::new(err)
     }
 }

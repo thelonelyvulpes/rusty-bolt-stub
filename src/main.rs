@@ -5,6 +5,7 @@ mod bang_line;
 mod bolt_encode;
 mod bolt_version;
 mod context;
+mod jolt;
 mod net;
 mod net_actor;
 mod parse_error;
@@ -13,6 +14,7 @@ mod scanner;
 mod serde_json_ext;
 mod str_byte;
 mod types;
+mod util;
 mod values;
 
 use crate::parser::ActorScript;

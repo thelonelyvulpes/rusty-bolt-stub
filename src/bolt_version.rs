@@ -1,3 +1,5 @@
+use crate::jolt::JoltVersion;
+
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
 pub enum BoltVersion {
     V3,
@@ -76,6 +78,23 @@ impl BoltVersion {
             BoltVersion::V5_3 => 3,
             BoltVersion::V5_4 => 4,
             BoltVersion::V5_5 => 5,
+        }
+    }
+
+    pub fn jolt_version(&self) -> JoltVersion {
+        match self {
+            BoltVersion::V3
+            | BoltVersion::V4_0
+            | BoltVersion::V4_1
+            | BoltVersion::V4_2
+            | BoltVersion::V4_3
+            | BoltVersion::V4_4 => JoltVersion::V1,
+            BoltVersion::V5_0
+            | BoltVersion::V5_1
+            | BoltVersion::V5_2
+            | BoltVersion::V5_3
+            | BoltVersion::V5_4
+            | BoltVersion::V5_5 => JoltVersion::V2,
         }
     }
 }

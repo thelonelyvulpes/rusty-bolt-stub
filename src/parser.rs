@@ -6,14 +6,15 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike};
+use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
 use itertools::Itertools;
-use regex::{Captures, Regex};
+use regex::Regex;
 use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 
 use crate::bang_line::BangLine;
 use crate::bolt_encode;
 use crate::bolt_version::BoltVersion;
+use crate::jolt::{JoltDate, JoltDuration, JoltTime, JoltVersion};
 use crate::parse_error::ParseError;
 use crate::serde_json_ext;
 use crate::str_byte;
@@ -21,6 +22,7 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
 };
 use crate::types::{ScanBlock, Script};
+use crate::util::opt_res_ret;
 use crate::values::value::{Struct, Value};
 use crate::values::BoltMessage;
 
@@ -831,16 +833,11 @@ fn parse_jolt_sigil<'a>(sigil: &'a str, config: &ActorConfig) -> Result<(&'a str
         });
     }
     SIGIL_VERSION_RE.with(|re| {
-        let jolt_version = if config.bolt_version >= BoltVersion::V5_0 {
-            JoltVersion::V2
-        } else {
-            JoltVersion::V1
-        };
         let Some(captures) = re.captures(sigil) else {
-            return Ok((sigil, jolt_version));
+            return Ok((sigil, config.bolt_version.jolt_version()));
         };
         let Some(version_overwrite) = captures.get(1) else {
-            return Ok((sigil, jolt_version));
+            return Ok((sigil, config.bolt_version.jolt_version()));
         };
         let version_overwrite = version_overwrite.as_str();
         let jolt_version = JoltVersion::parse(version_overwrite)?;
@@ -852,25 +849,6 @@ fn parse_jolt_sigil<'a>(sigil: &'a str, config: &ActorConfig) -> Result<(&'a str
             jolt_version,
         ))
     })
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum JoltVersion {
-    V1,
-    V2,
-}
-
-impl JoltVersion {
-    fn parse(s: &str) -> Result<Self> {
-        let jolt_version = i32::from_str(s).map_err(|e| {
-            ParseError::new(format!("Jolt version must be i32 (found {s:?}): {e}",))
-        })?;
-        Ok(match jolt_version {
-            1 => Self::V1,
-            2 => Self::V2,
-            _ => return Err(ParseError::new(format!("Unknown jolt version: {s}"))),
-        })
-    }
 }
 
 fn parse_hex_string(s: &str) -> Result<Vec<u8>> {
@@ -922,17 +900,6 @@ fn parse_hex_string(s: &str) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Like `?`, but for Option<Result<T>>.
-macro_rules! opt_res_ret {
-    ($e:expr) => {
-        match $e {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => return Some(Err(e)),
-            None => return None,
-        }
-    };
-}
-
 /// yes:
 /// 2020-01-01
 /// 2020-01
@@ -942,11 +909,7 @@ macro_rules! opt_res_ret {
 /// 2020-1-1
 /// --1
 fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
-    let JoltDate { date } = match JoltDate::parse(s) {
-        None => return None,
-        Some(Err(e)) => return Some(Err(e)),
-        Some(Ok(date)) => date,
-    };
+    let JoltDate { date } = opt_res_ret!(JoltDate::parse(s));
     let days_since_epoch = date - NaiveDate::from_ymd_opt(0, 1, 1).unwrap();
     Some(Ok(build_struct_match_validator(Struct {
         tag: 0x44,
@@ -1130,123 +1093,6 @@ fn build_date_time_validator(
     Some(Ok(build_struct_match_validator(expected_struct)))
 }
 
-#[derive(Debug)]
-struct JoltDate {
-    date: NaiveDate,
-}
-
-impl JoltDate {
-    fn parse(s: &str) -> Option<Result<Self>> {
-        thread_local! {
-            static DATE_RE: LazyCell<Regex> = LazyCell::new(|| {
-                Regex::new(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$").unwrap()
-            });
-        }
-        let captures = DATE_RE.with(|re| re.captures(s))?;
-        let year = i32::from_str(
-            captures
-                .get(1)
-                .expect("regex enforces existence of year")
-                .as_str(),
-        )
-        .expect("regex enforces year to be i32");
-        let month = captures
-            .get(2)
-            .map(|m| u32::from_str(m.as_str()).expect("regex enforces month to be u32"))
-            .unwrap_or(1);
-        let day = captures
-            .get(3)
-            .map(|d| u32::from_str(d.as_str()).expect("regex enforces day to be u32"))
-            .unwrap_or(1);
-        let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
-            return Some(Err(ParseError::new(format!("Unparsable date {s:?}"))));
-        };
-        Some(Ok(Self { date }))
-    }
-}
-
-#[derive(Debug)]
-struct JoltTime<'a> {
-    time: NaiveTime,
-    utc_offset_seconds: Option<i32>,
-    time_zone_id: Option<&'a str>,
-}
-
-impl<'a> JoltTime<'a> {
-    fn parse(s: &'a str) -> Option<Result<Self>> {
-        thread_local! {
-            static TIME_RE: LazyCell<Regex> = LazyCell::new(|| {
-                Regex::new(concat!(
-                    r"^(\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,9}))?",
-                    r"(?:(Z)|(?:(\+00(?::?00)?|[+-]00:?(?:[0-5][1-9]|[1-5]\d)|",
-                    r"(?:[+-](?:0[1-9]|1\d|2[0-3]):?[0-5]\d)))(?:\[([^\]]+)\])?)?$"
-                )).unwrap()
-            });
-        }
-        let captures = TIME_RE.with(|re| re.captures(s))?;
-        let hours = u32::from_str(
-            captures
-                .get(1)
-                .expect("regex enforces existence of hours")
-                .as_str(),
-        )
-        .expect("regex enforces hours to be u32");
-        let minutes = captures
-            .get(2)
-            .map(|m| u32::from_str(m.as_str()).expect("regex enforces minutes to be u32"))
-            .unwrap_or_default();
-        let seconds = captures
-            .get(3)
-            .map(|m| u32::from_str(m.as_str()).expect("regex enforces seconds to be u32"))
-            .unwrap_or_default();
-        if seconds >= 60 {
-            return Some(Err(ParseError::new(format!(
-                "Unparsable time: {s:?} (leap seconds are not supported)"
-            ))));
-        }
-        let nanos = captures
-            .get(4)
-            .map(|m| {
-                // left align to fill in omitted decimal places
-                u32::from_str(&format!("{:<09}", m.as_str()))
-                    .expect("regex enforces nanos to be u32")
-            })
-            .unwrap_or_default();
-        let utc_offset_seconds = match captures.get(5) {
-            None => captures.get(6).map(|m| {
-                // ±XY[[:]ZT]
-                let s = m.as_str();
-                let sign = match &s[..1] {
-                    "+" => 1,
-                    "-" => -1,
-                    _ => unreachable!("regex enforces offset sign to be + or -"),
-                };
-                let hours =
-                    i32::from_str(&s[1..=2]).expect("regex enforces offset hours to be i32");
-                let minutes = match s.len() {
-                    3 => 0,
-                    5 => i32::from_str(&s[3..=4]).expect("regex enforces offset minutes to be i32"),
-                    6 => i32::from_str(&s[4..=5]).expect("regex enforces offset minutes to be i32"),
-                    _ => unreachable!(
-                        "regex enforces offset to have length 3, 5, or six, found {s:?}"
-                    ),
-                };
-                sign * (hours * 60 + minutes) * 60
-            }),
-            Some(_) => Some(0), // Z
-        };
-        let time_zone_id = captures.get(7).map(|m| m.as_str());
-        let Some(time) = NaiveTime::from_hms_nano_opt(hours, minutes, seconds, nanos) else {
-            return Some(Err(ParseError::new(format!("Unparsable time: {s:?}"))));
-        };
-        Some(Ok(Self {
-            time,
-            utc_offset_seconds,
-            time_zone_id,
-        }))
-    }
-}
-
 /// yes:
 /// P12Y13M40DT10H70M80.000000000S
 /// P12Y-13M40DT-10H70M80.000000000S
@@ -1259,61 +1105,13 @@ impl<'a> JoltTime<'a> {
 /// P12Y13M40DT10H70.1M10S
 /// P5W
 fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
-    thread_local! {
-        static DURATION_RE: LazyCell<Regex> = LazyCell::new(|| {
-            Regex::new(concat!(
-                r"^P(?:(-?\d+)Y)?(?:(-?\d+)M)?(?:(-?\d+)D)",
-                r"(?:T(?:(-?\d+)H)?(?:(-?\d+)M)?(?:(-?\d+)(?:\.(\d{1,9}))?S)?)?"
-            )).unwrap()
-        });
-    }
-    let captures = DURATION_RE.with(|re| re.captures(s))?;
-    let years = match i64::from_str(&captures[1]) {
-        Ok(years) => years,
-        Err(e) => {
-            return Some(Err(ParseError::new(format!(
-                "Failed to parse duration years {}: {e}",
-                &captures[0]
-            ))))
-        }
-    };
-
-    fn i64_capture(i: usize, name: &str, captures: &Captures) -> Option<Result<i64>> {
-        Some(match captures.get(i) {
-            None => Ok(0),
-            Some(c) => i64::from_str(c.as_str()).map_err(|e| {
-                ParseError::new(format!(
-                    "Failed to parse duration {name} {}: {e}",
-                    c.as_str()
-                ))
-            }),
-        })
-    }
-
-    let months = opt_res_ret!(i64_capture(2, "months", &captures));
-    let days = opt_res_ret!(i64_capture(3, "days", &captures));
-    let hours = opt_res_ret!(i64_capture(4, "hours", &captures));
-    let minutes = opt_res_ret!(i64_capture(5, "minutes", &captures));
-    let seconds = opt_res_ret!(i64_capture(6, "seconds", &captures));
-    let nanos = captures
-        .get(7)
-        .map(|m| {
-            // left align to fill in omitted decimal places
-            i64::from_str(&format!("{:<09}", m.as_str())).expect("regex enforces nanos to be u32")
-        })
-        .unwrap_or_default();
-    let Some(months) = years
-        .checked_mul(12)
-        .and_then(|years_as_months| months.checked_add(years_as_months))
-    else {
-        return Some(Err(ParseError::new(
-            "Duration months (together with years) are overflowing",
-        )));
-    };
-    let total_nanos = i128::from(hours) * 1_000_000_000 * 60 * 60
-        + i128::from(minutes) * 1_000_000_000 * 60
-        + i128::from(seconds) * 1_000_000_000
-        + i128::from(nanos);
+    let JoltDuration {
+        months,
+        days,
+        seconds,
+        nanos,
+    } = opt_res_ret!(JoltDuration::parse(s));
+    let total_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
     Some(Ok(Box::new(move |msg| match msg {
         Value::Struct(received) => {
             if received.tag != 0x45 {
