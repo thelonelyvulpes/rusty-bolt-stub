@@ -10,6 +10,7 @@ mod net_actor;
 mod parse_error;
 mod parser;
 mod scanner;
+mod serde_json_ext;
 mod str_byte;
 mod types;
 mod values;

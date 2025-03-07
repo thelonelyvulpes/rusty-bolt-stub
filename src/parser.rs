@@ -6,20 +6,22 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike};
 use itertools::Itertools;
-use regex::Regex;
+use regex::{Captures, Regex};
 use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 
 use crate::bang_line::BangLine;
 use crate::bolt_encode;
 use crate::bolt_version::BoltVersion;
 use crate::parse_error::ParseError;
+use crate::serde_json_ext;
 use crate::str_byte;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
 };
 use crate::types::{ScanBlock, Script};
-use crate::values::value::Value;
+use crate::values::value::{Struct, Value};
 use crate::values::BoltMessage;
 
 #[derive(Debug)]
@@ -711,12 +713,22 @@ fn build_jolt_validator(
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
         }
         "T" => {
-            let JsonValue::String(_expected) = expected else {
+            let JsonValue::String(expected) = expected else {
                 return Err(ParseError::new(format!(
                     "Expected temporal string after sigil \"T\", but found {expected:?}",
                 )));
             };
-            todo!("Implement temporal string parsing :-!");
+            let validator = build_date_validator(&expected)
+                .or_else(|| build_time_validator(&expected))
+                .or_else(|| build_date_time_validator(&expected, jolt_version))
+                .or_else(|| build_duration_validator(&expected))
+                .transpose()?
+                .ok_or_else(|| {
+                    ParseError::new(format!(
+                        "Expected temporal string after sigil \"T\", but found {expected:?}",
+                    ))
+                })?;
+            IsJoltValidator::Yes(validator)
         }
         "@" => {
             let JsonValue::String(expected) = expected else {
@@ -775,38 +787,39 @@ fn build_jolt_validator(
                 false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
             }))
         }
-        "()" => match jolt_version {
-            JoltVersion::V1 => {
-                todo!("implement node parsing")
-            }
-            JoltVersion::V2 => {
-                todo!("implement node parsing")
-            }
-        },
-        "->" => match jolt_version {
-            JoltVersion::V1 => {
-                todo!("implement relationship parsing")
-            }
-            JoltVersion::V2 => {
-                todo!("implement relationship parsing")
-            }
-        },
-        "<-" => match jolt_version {
-            JoltVersion::V1 => {
-                todo!("implement relationship parsing")
-            }
-            JoltVersion::V2 => {
-                todo!("implement relationship parsing")
-            }
-        },
-        ".." => match jolt_version {
-            JoltVersion::V1 => {
-                todo!("implement path parsing")
-            }
-            JoltVersion::V2 => {
-                todo!("implement path parsing")
-            }
-        },
+        "()" => {
+            let fixed_syntax = format!(
+                r#"{{"\{sigil}": {}}}"#,
+                serde_json_ext::compact_pretty_print(&expected)
+                    .expect("JsonValue cannot fail Json serialization")
+            );
+            return Err(ParseError::new(format!(
+                "Node structs cannot be received by the server, only sent. \
+                If you meant to match a map, use `{fixed_syntax}` instead.",
+            )));
+        }
+        "->" | "<-" => {
+            let fixed_syntax = format!(
+                r#"{{"\{sigil}": {}}}"#,
+                serde_json_ext::compact_pretty_print(&expected)
+                    .expect("JsonValue cannot fail Json serialization")
+            );
+            return Err(ParseError::new(format!(
+                "Relationship structs cannot be received by the server, only sent. \
+                If you meant to match a map, use `{fixed_syntax}` instead.",
+            )));
+        }
+        ".." => {
+            let fixed_syntax = format!(
+                r#"{{"\{sigil}": {}}}"#,
+                serde_json_ext::compact_pretty_print(&expected)
+                    .expect("JsonValue cannot fail Json serialization")
+            );
+            return Err(ParseError::new(format!(
+                "Path structs cannot be received by the server, only sent. \
+                If you meant to match a map, use `{fixed_syntax}` instead.",
+            )));
+        }
         _ => IsJoltValidator::No([(sigil, expected)].into_iter().collect()),
     })
 }
@@ -907,6 +920,452 @@ fn parse_hex_string(s: &str) -> Result<Vec<u8>> {
         )));
     }
     Ok(result)
+}
+
+/// Like `?`, but for Option<Result<T>>.
+macro_rules! opt_res_ret {
+    ($e:expr) => {
+        match $e {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => return Some(Err(e)),
+            None => return None,
+        }
+    };
+}
+
+/// yes:
+/// 2020-01-01
+/// 2020-01
+/// 2020
+///
+/// no:
+/// 2020-1-1
+/// --1
+fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
+    let JoltDate { date } = match JoltDate::parse(s) {
+        None => return None,
+        Some(Err(e)) => return Some(Err(e)),
+        Some(Ok(date)) => date,
+    };
+    let days_since_epoch = date - NaiveDate::from_ymd_opt(0, 1, 1).unwrap();
+    Some(Ok(build_struct_match_validator(Struct {
+        tag: 0x44,
+        fields: vec![Value::Integer(days_since_epoch.num_days())],
+    })))
+}
+
+/// yes:
+/// 12:00:00.000000000+0000
+/// 12:00:00.000+0000
+/// 12:00:00+00:00
+/// 12:00:00+00
+/// 12:00:00Z
+/// 12:00Z
+/// 12Z
+/// 12:00:00-01
+///
+/// no:
+/// 12:00:00.0000000000Z
+/// 12:00:00-0000
+/// 12:0:0Z
+/// 12:00:00+01:02:03
+/// 12:00:00+00:00\[Europe/Berlin]
+fn build_time_validator(s: &str) -> Option<Result<ValidateValueFn>> {
+    let JoltTime {
+        time,
+        utc_offset_seconds,
+        time_zone_id,
+    } = opt_res_ret!(JoltTime::parse(s));
+    if time_zone_id.is_some() {
+        // times only accept UTC offsets, not time zone ids
+        return None;
+    }
+    let nanos_since_midnight =
+        i64::from(time.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(time.nanosecond());
+    let expected_struct = match utc_offset_seconds {
+        // local time
+        None => Struct {
+            tag: 0x74,
+            fields: vec![Value::Integer(nanos_since_midnight)],
+        },
+        // time
+        Some(offset) => Struct {
+            tag: 0x54,
+            fields: vec![
+                Value::Integer(nanos_since_midnight),
+                Value::Integer(offset.into()),
+            ],
+        },
+    };
+    Some(Ok(build_struct_match_validator(expected_struct)))
+}
+
+/// yes:
+/// `<date_re>T<time_re><timezone_name>`
+/// where `<date_re>` is anything that works for [`build_date_validator`], `<time_re>`
+/// is anything that works for [`build_time_validator`] and `<timezone_name>` (optional) is any
+/// timezone name in square brackets, e.g., `[Europe/Stockholm]`. `<timezone_name>` may only be
+/// present, when `<time_re>` has a time offset.
+///
+/// no:
+/// anything else
+fn build_date_time_validator(
+    s: &str,
+    jolt_version: JoltVersion,
+) -> Option<Result<ValidateValueFn>> {
+    thread_local! {
+        static DATE_TIME_RE: LazyCell<Regex> = LazyCell::new(|| {
+            Regex::new(r"^(.*?)T(.*)$").unwrap()
+        });
+    }
+    let captures = DATE_TIME_RE.with(|re| re.captures(s))?;
+    let JoltDate { date } = opt_res_ret!(JoltDate::parse(&captures[1]));
+    let JoltTime {
+        time,
+        utc_offset_seconds,
+        time_zone_id,
+    } = opt_res_ret!(JoltTime::parse(&captures[2]));
+    let date_time = NaiveDateTime::new(date, time);
+
+    let expected_struct =
+        match (utc_offset_seconds, time_zone_id) {
+            (Some(utc_offset_seconds), Some(time_zone_id)) => {
+                // date time zone id
+
+                // let tz = match Tz::from_str(time_zone_id) {
+                //     Ok(tz) => tz,
+                //     Err(e) => {
+                //         return Some(Err(ParseError::new(format!(
+                //             "Failed to load time zone id {time_zone_id:?}: {e}"
+                //         ))))
+                //     }
+                // };
+                // let date_time = date_time_utc.with_timezone(&tz);
+                // let found_offset_seconds = date_time.offset().fix().local_minus_utc();
+                // if found_offset_seconds != utc_offset_seconds {
+                //     // "Timezone database for {s} does not agree with the offset \
+                //     // {utc_offset_seconds} seconds, found {found_offset_seconds}. \
+                //     // Either there is a typo or the timezone database is outdated."
+                //     todo!("Emit warning, possibly a typo in the script");
+                // }
+                match jolt_version {
+                    JoltVersion::V1 => {
+                        let date_time = date_time.and_utc();
+                        let seconds = date_time.timestamp();
+                        let nanos = date_time.timestamp_subsec_nanos();
+                        Struct {
+                            tag: 0x66,
+                            fields: vec![
+                                Value::Integer(seconds),
+                                Value::Integer(nanos.into()),
+                                Value::String(String::from(time_zone_id)),
+                            ],
+                        }
+                    }
+                    JoltVersion::V2 => {
+                        let date_time_utc = date_time.and_utc()
+                            - TimeDelta::new(utc_offset_seconds.into(), 0).unwrap();
+                        let seconds = date_time_utc.timestamp();
+                        let nanos = date_time_utc.timestamp_subsec_nanos();
+                        Struct {
+                            tag: 0x69,
+                            fields: vec![
+                                Value::Integer(seconds),
+                                Value::Integer(nanos.into()),
+                                Value::String(String::from(time_zone_id)),
+                            ],
+                        }
+                    }
+                }
+            }
+            (Some(utc_offset_seconds), None) => {
+                //date time
+                match jolt_version {
+                    JoltVersion::V1 => {
+                        let date_time = date_time.and_utc();
+                        let seconds = date_time.timestamp();
+                        let nanos = date_time.timestamp_subsec_nanos();
+                        Struct {
+                            tag: 0x46,
+                            fields: vec![
+                                Value::Integer(seconds),
+                                Value::Integer(nanos.into()),
+                                Value::Integer(utc_offset_seconds.into()),
+                            ],
+                        }
+                    }
+                    JoltVersion::V2 => {
+                        let tz = FixedOffset::east_opt(utc_offset_seconds)
+                            .expect("regex enforced offset in bounds");
+                        let date_time = date_time.and_local_timezone(tz).unwrap();
+                        let seconds = date_time.timestamp();
+                        let nanos = date_time.timestamp_subsec_nanos();
+                        Struct {
+                            tag: 0x46,
+                            fields: vec![
+                                Value::Integer(seconds),
+                                Value::Integer(nanos.into()),
+                                Value::Integer(utc_offset_seconds.into()),
+                            ],
+                        }
+                    }
+                }
+            }
+            (None, Some(_)) => return Some(Err(ParseError::new(
+                "DateTime with named zone requires an explicit time offset to avoid ambiguity. \
+                E.g., `2025-03-06T18:05:02+01:00[Europe/Stockholm]` instead of \
+                `2025-03-06T18:05:02[Europe/Stockholm]`",
+            ))),
+            (None, None) => {
+                // local date time
+                let date_time = date_time.and_utc();
+                let seconds = date_time.timestamp();
+                let nanos = date_time.timestamp_subsec_nanos();
+                Struct {
+                    tag: 0x64,
+                    fields: vec![Value::Integer(seconds), Value::Integer(nanos.into())],
+                }
+            }
+        };
+    Some(Ok(build_struct_match_validator(expected_struct)))
+}
+
+#[derive(Debug)]
+struct JoltDate {
+    date: NaiveDate,
+}
+
+impl JoltDate {
+    fn parse(s: &str) -> Option<Result<Self>> {
+        thread_local! {
+            static DATE_RE: LazyCell<Regex> = LazyCell::new(|| {
+                Regex::new(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$").unwrap()
+            });
+        }
+        let captures = DATE_RE.with(|re| re.captures(s))?;
+        let year = i32::from_str(
+            captures
+                .get(1)
+                .expect("regex enforces existence of year")
+                .as_str(),
+        )
+        .expect("regex enforces year to be i32");
+        let month = captures
+            .get(2)
+            .map(|m| u32::from_str(m.as_str()).expect("regex enforces month to be u32"))
+            .unwrap_or(1);
+        let day = captures
+            .get(3)
+            .map(|d| u32::from_str(d.as_str()).expect("regex enforces day to be u32"))
+            .unwrap_or(1);
+        let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+            return Some(Err(ParseError::new(format!("Unparsable date {s:?}"))));
+        };
+        Some(Ok(Self { date }))
+    }
+}
+
+#[derive(Debug)]
+struct JoltTime<'a> {
+    time: NaiveTime,
+    utc_offset_seconds: Option<i32>,
+    time_zone_id: Option<&'a str>,
+}
+
+impl<'a> JoltTime<'a> {
+    fn parse(s: &'a str) -> Option<Result<Self>> {
+        thread_local! {
+            static TIME_RE: LazyCell<Regex> = LazyCell::new(|| {
+                Regex::new(concat!(
+                    r"^(\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,9}))?",
+                    r"(?:(Z)|(?:(\+00(?::?00)?|[+-]00:?(?:[0-5][1-9]|[1-5]\d)|",
+                    r"(?:[+-](?:0[1-9]|1\d|2[0-3]):?[0-5]\d)))(?:\[([^\]]+)\])?)?$"
+                )).unwrap()
+            });
+        }
+        let captures = TIME_RE.with(|re| re.captures(s))?;
+        let hours = u32::from_str(
+            captures
+                .get(1)
+                .expect("regex enforces existence of hours")
+                .as_str(),
+        )
+        .expect("regex enforces hours to be u32");
+        let minutes = captures
+            .get(2)
+            .map(|m| u32::from_str(m.as_str()).expect("regex enforces minutes to be u32"))
+            .unwrap_or_default();
+        let seconds = captures
+            .get(3)
+            .map(|m| u32::from_str(m.as_str()).expect("regex enforces seconds to be u32"))
+            .unwrap_or_default();
+        if seconds >= 60 {
+            return Some(Err(ParseError::new(format!(
+                "Unparsable time: {s:?} (leap seconds are not supported)"
+            ))));
+        }
+        let nanos = captures
+            .get(4)
+            .map(|m| {
+                // left align to fill in omitted decimal places
+                u32::from_str(&format!("{:<09}", m.as_str()))
+                    .expect("regex enforces nanos to be u32")
+            })
+            .unwrap_or_default();
+        let utc_offset_seconds = match captures.get(5) {
+            None => captures.get(6).map(|m| {
+                // ±XY[[:]ZT]
+                let s = m.as_str();
+                let sign = match &s[..1] {
+                    "+" => 1,
+                    "-" => -1,
+                    _ => unreachable!("regex enforces offset sign to be + or -"),
+                };
+                let hours =
+                    i32::from_str(&s[1..=2]).expect("regex enforces offset hours to be i32");
+                let minutes = match s.len() {
+                    3 => 0,
+                    5 => i32::from_str(&s[3..=4]).expect("regex enforces offset minutes to be i32"),
+                    6 => i32::from_str(&s[4..=5]).expect("regex enforces offset minutes to be i32"),
+                    _ => unreachable!(
+                        "regex enforces offset to have length 3, 5, or six, found {s:?}"
+                    ),
+                };
+                sign * (hours * 60 + minutes) * 60
+            }),
+            Some(_) => Some(0), // Z
+        };
+        let time_zone_id = captures.get(7).map(|m| m.as_str());
+        let Some(time) = NaiveTime::from_hms_nano_opt(hours, minutes, seconds, nanos) else {
+            return Some(Err(ParseError::new(format!("Unparsable time: {s:?}"))));
+        };
+        Some(Ok(Self {
+            time,
+            utc_offset_seconds,
+            time_zone_id,
+        }))
+    }
+}
+
+/// yes:
+/// P12Y13M40DT10H70M80.000000000S
+/// P12Y-13M40DT-10H70M80.000000000S
+/// P12Y
+/// PT70M
+/// P12T10H70M
+///
+/// no:
+/// P12Y13M40DT10H70M80.0000000000S
+/// P12Y13M40DT10H70.1M10S
+/// P5W
+fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
+    thread_local! {
+        static DURATION_RE: LazyCell<Regex> = LazyCell::new(|| {
+            Regex::new(concat!(
+                r"^P(?:(-?\d+)Y)?(?:(-?\d+)M)?(?:(-?\d+)D)",
+                r"(?:T(?:(-?\d+)H)?(?:(-?\d+)M)?(?:(-?\d+)(?:\.(\d{1,9}))?S)?)?"
+            )).unwrap()
+        });
+    }
+    let captures = DURATION_RE.with(|re| re.captures(s))?;
+    let years = match i64::from_str(&captures[1]) {
+        Ok(years) => years,
+        Err(e) => {
+            return Some(Err(ParseError::new(format!(
+                "Failed to parse duration years {}: {e}",
+                &captures[0]
+            ))))
+        }
+    };
+
+    fn i64_capture(i: usize, name: &str, captures: &Captures) -> Option<Result<i64>> {
+        Some(match captures.get(i) {
+            None => Ok(0),
+            Some(c) => i64::from_str(c.as_str()).map_err(|e| {
+                ParseError::new(format!(
+                    "Failed to parse duration {name} {}: {e}",
+                    c.as_str()
+                ))
+            }),
+        })
+    }
+
+    let months = opt_res_ret!(i64_capture(2, "months", &captures));
+    let days = opt_res_ret!(i64_capture(3, "days", &captures));
+    let hours = opt_res_ret!(i64_capture(4, "hours", &captures));
+    let minutes = opt_res_ret!(i64_capture(5, "minutes", &captures));
+    let seconds = opt_res_ret!(i64_capture(6, "seconds", &captures));
+    let nanos = captures
+        .get(7)
+        .map(|m| {
+            // left align to fill in omitted decimal places
+            i64::from_str(&format!("{:<09}", m.as_str())).expect("regex enforces nanos to be u32")
+        })
+        .unwrap_or_default();
+    let Some(months) = years
+        .checked_mul(12)
+        .and_then(|years_as_months| months.checked_add(years_as_months))
+    else {
+        return Some(Err(ParseError::new(
+            "Duration months (together with years) are overflowing",
+        )));
+    };
+    let total_nanos = i128::from(hours) * 1_000_000_000 * 60 * 60
+        + i128::from(minutes) * 1_000_000_000 * 60
+        + i128::from(seconds) * 1_000_000_000
+        + i128::from(nanos);
+    Some(Ok(Box::new(move |msg| match msg {
+        Value::Struct(received) => {
+            if received.tag != 0x45 {
+                return Err(anyhow!("Expected duration (tag 0x45), found {:?}", msg));
+            }
+            fn get_int_field(i: usize, name: &str, received: &Struct) -> anyhow::Result<i64> {
+                match received.fields.get(i) {
+                    None => Err(anyhow!(
+                        "Received invalid duration: {:?} (missing {name})",
+                        received
+                    )),
+                    Some(Value::Integer(value)) => Ok(*value),
+                    Some(_) => Err(anyhow!(
+                        "Received invalid duration: {:?} ({name} not integer)",
+                        received
+                    )),
+                }
+            }
+            let received_months = get_int_field(0, "months", received)?;
+            let received_days = get_int_field(0, "days", received)?;
+            let received_seconds = get_int_field(0, "seconds", received)?;
+            let received_nanos = get_int_field(0, "nanoseconds", received)?;
+            let received_total_nanos =
+                i128::from(received_seconds) * 1_000_000_000 + i128::from(received_nanos);
+            if received_months != months {
+                return Err(anyhow!(
+                    "Expected duration months: {months}, found {received_months} in {received:?}",
+                ));
+            }
+            if received_days != days {
+                return Err(anyhow!(
+                    "Expected duration days: {days}, found {received_days} in {received:?}",
+                ));
+            }
+            if received_total_nanos != total_nanos {
+                return Err(anyhow!(
+                    "Expected duration with total nanoseconds: {total_nanos}, \
+                    found {received_total_nanos} in {received:?}",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(anyhow!("Expected duration, found {:?}", msg)),
+    })))
+}
+
+fn build_struct_match_validator(expected: Struct) -> ValidateValueFn {
+    let expected = Value::Struct(expected);
+    Box::new(move |msg| match msg == &expected {
+        true => Ok(()),
+        false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+    })
 }
 
 struct ParsedMapKey {
