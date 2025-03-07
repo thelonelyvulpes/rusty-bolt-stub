@@ -445,7 +445,15 @@ fn create_validator(
     ctx: Context,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
-    let expected_tag = message_tag_from_name(expected_tag, config)?;
+    let expected_tag = config
+        .bolt_version
+        .message_tag_from_request(expected_tag)
+        .ok_or_else(|| {
+            ParseError::new(format!(
+                "Unknown message name {expected_tag:?} for BOLT version {}",
+                config.bolt_version
+            ))
+        })?;
     let expected_body_behavior = build_fields_validator(expected_body_string, config)?;
     Ok(Box::new(ValidatorImpl {
         func: move |client_message| {
@@ -532,57 +540,63 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
                 IsJoltValidator::No(expected) => expected,
             };
 
-            let mut required_keys = HashSet::new();
-            let mut unique_keys = HashSet::new();
-            let validators = expected
-                .into_iter()
-                .map(|(key, expect_for_key)| {
-                    let (key, validator, req) =
-                        build_map_entry_validator(&key, expect_for_key, config)?;
-                    if req {
-                        required_keys.insert(key.clone());
-                    }
-                    if !unique_keys.insert(key.clone()) {
-                        return Err(ParseError::new(format!(
-                            "contains same unescaped key twice {key}"
-                        )));
-                    }
-                    Ok((key, validator))
-                })
-                .collect::<Result<HashMap<_, _>>>()?;
-
-            Box::new(move |msg| {
-                let Value::Map(received) = msg else {
-                    return Err(anyhow!("Expected map, found {:?}", msg));
-                };
-
-                let mut matched_keys = HashSet::new();
-
-                for (key, value) in received {
-                    let Some(validator) = validators.get(key) else {
-                        return Err(anyhow!("Unexpected Key:{key} was received."));
-                    };
-                    validator(value)?;
-                    matched_keys.insert(key.clone());
-                }
-
-                match matched_keys.is_superset(&required_keys) {
-                    true => Ok(()),
-                    false => {
-                        let mut missing_keys = required_keys.difference(&matched_keys);
-                        Err(anyhow!(
-                            "Received message with missing keys: {:?}",
-                            missing_keys.join(", ")
-                        ))
-                    }
-                }
-            })
+            build_map_validator(config, expected)?
             // try to build jolt matcher (incl. Structs like datetime)
             //   * if has 1 key-value pair
             //   * && key is known sigil
             //   * Special string "*" applies: E.g., `C: RUN {"Z": "*"}` will match any integer: `C: RUN 1` and `C: RUN 2`, but not `C: RUN 1.2` or `C: RUN "*"`.
         }
     })
+}
+
+fn build_map_validator(
+    config: &ActorConfig,
+    expected: JsonMap<String, JsonValue>,
+) -> Result<ValidateValueFn> {
+    let mut required_keys = HashSet::new();
+    let mut unique_keys = HashSet::new();
+    let validators = expected
+        .into_iter()
+        .map(|(key, expect_for_key)| {
+            let (key, validator, req) = build_map_entry_validator(&key, expect_for_key, config)?;
+            if req {
+                required_keys.insert(key.clone());
+            }
+            if !unique_keys.insert(key.clone()) {
+                return Err(ParseError::new(format!(
+                    "contains same unescaped key twice {key}"
+                )));
+            }
+            Ok((key, validator))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    Ok(Box::new(move |msg| {
+        let Value::Map(received) = msg else {
+            return Err(anyhow!("Expected map, found {:?}", msg));
+        };
+
+        let mut matched_keys = HashSet::new();
+
+        for (key, value) in received {
+            let Some(validator) = validators.get(key) else {
+                return Err(anyhow!("Unexpected Key:{key} was received."));
+            };
+            validator(value)?;
+            matched_keys.insert(key.clone());
+        }
+
+        match matched_keys.is_superset(&required_keys) {
+            true => Ok(()),
+            false => {
+                let mut missing_keys = required_keys.difference(&matched_keys);
+                Err(anyhow!(
+                    "Received message with missing keys: {:?}",
+                    missing_keys.join(", ")
+                ))
+            }
+        }
+    }))
 }
 
 /// # Returns
@@ -657,6 +671,19 @@ fn build_jolt_validator(
     expected: JsonMap<String, JsonValue>,
     config: &ActorConfig,
 ) -> Result<IsJoltValidator> {
+    fn is_match_all(value: &JsonValue) -> bool {
+        value.as_str().map(|s| s == "*").unwrap_or_default()
+    }
+
+    macro_rules! match_any {
+        ($typ:expr, $pattern:pat) => {
+            return Ok(IsJoltValidator::Yes(Box::new(|msg| match msg {
+                $pattern => Ok(()),
+                _ => Err(anyhow!("Expected any {:} found {:?}", $typ, msg)),
+            })))
+        };
+    }
+
     // https://docs.google.com/document/d/1QK4OcC0tZ08lKqVr-3-z8HpPY9jFeEh6zZPhMm15D-w/edit?tab=t.0
     if expected.len() != 1 {
         return Ok(IsJoltValidator::No(expected));
@@ -665,6 +692,9 @@ fn build_jolt_validator(
     let (versionless_sigil, jolt_version) = parse_jolt_sigil(&sigil, config)?;
     Ok(match versionless_sigil {
         "?" => {
+            if is_match_all(&expected) {
+                match_any!("bool", Value::Boolean(_));
+            }
             if !expected.is_boolean() {
                 return Err(ParseError::new(format!(
                     "Expected bool after sigil \"?\", but found {expected:?}",
@@ -673,6 +703,9 @@ fn build_jolt_validator(
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
         }
         "Z" => {
+            if is_match_all(&expected) {
+                match_any!("integer", Value::Integer(_));
+            }
             let JsonValue::String(expected) = expected else {
                 return Err(ParseError::new(format!(
                     "Expected string after sigil \"Z\", but found {expected:?}",
@@ -689,6 +722,9 @@ fn build_jolt_validator(
             )?)
         }
         "R" => {
+            if is_match_all(&expected) {
+                match_any!("float", Value::Float(_));
+            }
             let JsonValue::String(expected) = expected else {
                 return Err(ParseError::new(format!(
                     "Expected string after sigil \"R\", but found {expected:?}",
@@ -705,6 +741,9 @@ fn build_jolt_validator(
             }))
         }
         "U" => {
+            if is_match_all(&expected) {
+                match_any!("string", Value::String(_));
+            }
             if !expected.is_string() {
                 return Err(ParseError::new(format!(
                     "Expected string after sigil \"U\", but found {expected:?}",
@@ -713,6 +752,9 @@ fn build_jolt_validator(
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
         }
         "#" => {
+            if is_match_all(&expected) {
+                match_any!("bytes", Value::Bytes(_));
+            }
             let bytes = match expected {
                 JsonValue::String(expected) => parse_hex_string(&expected)?,
                 JsonValue::Array(expected) => {
@@ -744,12 +786,26 @@ fn build_jolt_validator(
             }))
         }
         "[]" => {
+            if is_match_all(&expected) {
+                match_any!("list", Value::List(_));
+            }
             if !expected.is_array() {
                 return Err(ParseError::new(format!(
                     "Expected array after sigil \"[]\", but found {expected:?}",
                 )));
             }
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
+        }
+        "{}" => {
+            if is_match_all(&expected) {
+                match_any!("map", Value::Map(_));
+            }
+            let JsonValue::Object(expected) = expected else {
+                return Err(ParseError::new(format!(
+                    "Expected object after sigil \"{{}}\", but found {expected:?}",
+                )));
+            };
+            IsJoltValidator::Yes(build_map_validator(config, expected)?)
         }
         "T" => {
             let JsonValue::String(expected) = expected else {
@@ -770,6 +826,19 @@ fn build_jolt_validator(
             IsJoltValidator::Yes(validator)
         }
         "@" => {
+            if is_match_all(&expected) {
+                return Ok(IsJoltValidator::Yes(Box::new(|msg| match msg {
+                    Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
+                        (0x58, [Value::Integer(_), Value::Float(_), Value::Float(_)]) => Ok(()),
+                        (
+                            0x59,
+                            [Value::Integer(_), Value::Float(_), Value::Float(_), Value::Float(_)],
+                        ) => Ok(()),
+                        _ => Err(anyhow!("Expected any date struct found {msg:?}")),
+                    },
+                    _ => Err(anyhow!("Expected any spatial struct found {msg:?}")),
+                })));
+            }
             let JsonValue::String(expected) = expected else {
                 return Err(ParseError::new(format!(
                     "Expected spatial string after sigil \"@\", but found {expected:?}",
@@ -873,14 +942,14 @@ fn parse_jolt_sigil<'a>(sigil: &'a str, config: &ActorConfig) -> Result<(&'a str
         let Some(captures) = re.captures(sigil) else {
             return Ok((sigil, config.bolt_version.jolt_version()));
         };
-        let Some(version_overwrite) = captures.get(1) else {
+        let Some(version_overwrite) = captures.get(2) else {
             return Ok((sigil, config.bolt_version.jolt_version()));
         };
         let version_overwrite = version_overwrite.as_str();
         let jolt_version = JoltVersion::parse(version_overwrite)?;
         Ok((
             captures
-                .get(0)
+                .get(1)
                 .expect("regex enforces one group to exist")
                 .as_str(),
             jolt_version,
@@ -946,6 +1015,15 @@ fn parse_hex_string(s: &str) -> Result<Vec<u8>> {
 /// 2020-1-1
 /// --1
 fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
+    if s == "*" {
+        return Some(Ok(Box::new(|msg| match msg {
+            Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
+                (0x44, [Value::Integer(_)]) => Ok(()),
+                _ => Err(anyhow!("Expected any date struct found {msg:?}")),
+            },
+            _ => Err(anyhow!("Expected any date struct found {msg:?}")),
+        })));
+    }
     let JoltDate { date } = opt_res_ret!(JoltDate::parse(s));
     let days_since_epoch = date - NaiveDate::from_ymd_opt(0, 1, 1).unwrap();
     Some(Ok(build_struct_match_validator(Struct {
@@ -971,6 +1049,16 @@ fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
 /// 12:00:00+01:02:03
 /// 12:00:00+00:00\[Europe/Berlin]
 fn build_time_validator(s: &str) -> Option<Result<ValidateValueFn>> {
+    if s == "*" {
+        return Some(Ok(Box::new(|msg| match msg {
+            Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
+                (0x74, [Value::Integer(_)]) => Ok(()),
+                (0x54, [Value::Integer(_), Value::Integer(_)]) => Ok(()),
+                _ => Err(anyhow!("Expected any time struct found {msg:?}")),
+            },
+            _ => Err(anyhow!("Expected any time struct found {msg:?}")),
+        })));
+    }
     let JoltTime {
         time,
         utc_offset_seconds,
@@ -1013,6 +1101,35 @@ fn build_date_time_validator(
     s: &str,
     jolt_version: JoltVersion,
 ) -> Option<Result<ValidateValueFn>> {
+    if s == "*" {
+        return Some(Ok(Box::new(move |msg| match msg {
+            Value::Struct(Struct { tag, fields }) => match (jolt_version, tag, fields.as_slice()) {
+                (
+                    JoltVersion::V1,
+                    0x66,
+                    [Value::Integer(_), Value::Integer(_), Value::String(_)],
+                ) => Ok(()),
+                (
+                    JoltVersion::V2,
+                    0x69,
+                    [Value::Integer(_), Value::Integer(_), Value::String(_)],
+                ) => Ok(()),
+                (
+                    JoltVersion::V1,
+                    0x46,
+                    [Value::Integer(_), Value::Integer(_), Value::Integer(_)],
+                ) => Ok(()),
+                (
+                    JoltVersion::V2,
+                    0x49,
+                    [Value::Integer(_), Value::Integer(_), Value::Integer(_)],
+                ) => Ok(()),
+                (_, 0x64, [Value::Integer(_), Value::Integer(_)]) => Ok(()),
+                _ => Err(anyhow!("Expected any date time struct found {msg:?}")),
+            },
+            _ => Err(anyhow!("Expected any date time struct found {msg:?}")),
+        })));
+    }
     thread_local! {
         static DATE_TIME_RE: LazyCell<Regex> = LazyCell::new(|| {
             Regex::new(r"^(.*?)T(.*)$").unwrap()
@@ -1079,7 +1196,7 @@ fn build_date_time_validator(
                 }
             }
             (Some(utc_offset_seconds), None) => {
-                //date time
+                // date time
                 match jolt_version {
                     JoltVersion::V1 => {
                         let date_time = date_time.and_utc();
@@ -1101,7 +1218,7 @@ fn build_date_time_validator(
                         let seconds = date_time.timestamp();
                         let nanos = date_time.timestamp_subsec_nanos();
                         Struct {
-                            tag: 0x46,
+                            tag: 0x49,
                             fields: vec![
                                 Value::Integer(seconds),
                                 Value::Integer(nanos.into()),
@@ -1142,6 +1259,18 @@ fn build_date_time_validator(
 /// P12Y13M40DT10H70.1M10S
 /// P5W
 fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
+    if s == "*" {
+        return Some(Ok(Box::new(|msg| match msg {
+            Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
+                (
+                    0x45,
+                    [Value::Integer(_), Value::Integer(_), Value::Integer(_), Value::Integer(_)],
+                ) => Ok(()),
+                _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
+            },
+            _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
+        })));
+    }
     let JoltDuration {
         months,
         days,
@@ -1168,9 +1297,9 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
                 }
             }
             let received_months = get_int_field(0, "months", received)?;
-            let received_days = get_int_field(0, "days", received)?;
-            let received_seconds = get_int_field(0, "seconds", received)?;
-            let received_nanos = get_int_field(0, "nanoseconds", received)?;
+            let received_days = get_int_field(1, "days", received)?;
+            let received_seconds = get_int_field(2, "seconds", received)?;
+            let received_nanos = get_int_field(3, "nanoseconds", received)?;
             let received_total_nanos =
                 i128::from(received_seconds) * 1_000_000_000 + i128::from(received_nanos);
             if received_months != months {
@@ -1267,37 +1396,26 @@ fn build_fields_validator(
         return Ok(Box::new(build_no_fields_validator));
     };
     // RUN "RETURN $n AS n" {"n": 1}
-    let _field_validators: Vec<_> = Deserializer::from_str(line)
+    let field_validators: Vec<_> = Deserializer::from_str(line)
         .into_iter()
         .collect::<StdResult<Vec<JsonValue>, _>>()?
         .into_iter()
         .map(|field| build_field_validator(field, config))
         .collect::<Result<_>>()?;
 
-    todo!();
-
-    // Ok(Box::new(move |msg| {
-    //     for field in fields {
-    //
-    //     }
-    // })
-
-    // for field in Deserializer::from_str(line).into_iter() {
-    //     let field = field?;
-    //     validate_field(field)?;
-    // }
-    // let v: Vec<StdResult<Value, _>> =
-    //     Deserializer::from_str("[1, 2] [3] null 1 false {\"a\": null}")
-    //         .into_iter()
-    //         .collect();
-    // dbg!(v);
-    // [1, 2] "h ello" {"a": false}
-    // let v: Value = serde_json::from_str(line)?;
-    // Ok(Box::new(|_| Ok(())))
-}
-
-fn message_tag_from_name(_tag_name: &str, _config: &ActorConfig) -> Result<u8> {
-    todo!("Take a message name, and return the byte dependent on the bolt version, as PULL and PULL_ALL both use the same tag byte.")
+    Ok(Box::new(move |fields| {
+        if fields.len() != field_validators.len() {
+            return Err(anyhow!(
+                "Expected {} fields, but found {}",
+                fields.len(),
+                field_validators.len()
+            ));
+        }
+        for (field, field_validator) in fields.iter().zip(&field_validators) {
+            field_validator(field)?;
+        }
+        Ok(())
+    }))
 }
 
 fn is_skippable(block: &ActorBlock) -> bool {
@@ -1411,12 +1529,14 @@ fn validate_parallel_child(b: &ActorBlock) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    use indexmap::indexmap;
     use serde_json::Number;
 
     #[test]
     fn should_validate_any_hello() {
         let tag = "HELLO";
-        let body = "{\"{}\": \"*\"}";
+        let body = r#"{"{}": "*"}"#;
         let ctx = Context {
             start_line_number: 0,
             end_line_number: 0,
@@ -1428,12 +1548,18 @@ mod test {
             handshake: None,
             handshake_delay: None,
         };
-        let _validator = create_validator(tag, Some(body), ctx, &cfg).unwrap();
+        let validator = create_validator(tag, Some(body), ctx, &cfg).unwrap();
 
-        let _cm = BoltMessage::new(0x00, vec![], BoltVersion::V5_0);
+        let cm = BoltMessage::new(
+            0x01,
+            vec![Value::Map(
+                indexmap! {String::from("foo") => Value::String(String::from("bar"))},
+            )],
+            BoltVersion::V5_0,
+        );
 
-        todo!();
-        // assert_!(validator.validate(&cm).unwrap());
+        // assert_eq!(validator.validate(&cm), Ok(()));
+        validator.validate(&cm).unwrap()
     }
 
     #[test]
