@@ -1213,18 +1213,20 @@ impl ParsedMapKey {
     fn parse(key: &str) -> Self {
         thread_local! {
             static UNESCAPE_RE: LazyCell<Regex> = LazyCell::new(|| {
-                Regex::new(r"^(\[)?(?:\\[\\\{}\}\[\]]|[^\\])*?(\{\})?(\])?$").unwrap()
+                Regex::new(r"\\([\{\}\[\]\\])").unwrap()
             });
         }
         let unescaped = UNESCAPE_RE.with(|re| re.replace_all(key, r"$1"));
-
         let mut unescaped_ref = unescaped.as_ref();
-        let is_optional = key.starts_with('[') && key.ends_with(']');
-        let is_ordered = if is_optional {
-            key.ends_with("{}]")
-        } else {
-            key.ends_with("{}")
-        };
+
+        thread_local! {
+            static FLAGS_RE: LazyCell<Regex> = LazyCell::new(|| {
+                Regex::new(r"^(\[)?(?:\\[\\\{}\}\[\]]|[^\\])*?(\{\})?(\])?$").unwrap()
+            });
+        }
+        let flags = FLAGS_RE.with(|re| re.captures(key).expect("regex matches anything"));
+        let is_optional = flags.get(1).is_some() && flags.get(3).is_some();
+        let is_ordered = flags.get(2).is_some();
 
         if is_optional {
             unescaped_ref = &unescaped_ref[1..unescaped.len() - 1]
@@ -1295,7 +1297,7 @@ fn build_fields_validator(
 }
 
 fn message_tag_from_name(_tag_name: &str, _config: &ActorConfig) -> Result<u8> {
-    todo!("Take a message name, and return the byte dependent on the bolt version, as pull and pullall both use the same tag byte.")
+    todo!("Take a message name, and return the byte dependent on the bolt version, as PULL and PULL_ALL both use the same tag byte.")
 }
 
 fn is_skippable(block: &ActorBlock) -> bool {
@@ -1480,6 +1482,6 @@ mod test {
     fn handle_doubled_slash() {
         let key = r"jeff\{}";
         let escaped = ParsedMapKey::parse(key);
-        assert_eq!(escaped.unescaped, "jeff")
+        assert_eq!(escaped.unescaped, "jeff{}")
     }
 }
