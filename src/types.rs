@@ -44,7 +44,7 @@ pub mod actor_types {
     use std::fmt::Debug;
 
     pub trait ScriptLine: Debug + Send + Sync {
-        fn original_line(&self) -> &str;
+        fn original_line<'a>(&self, script: &'a str) -> &'a str;
     }
 
     pub trait ClientMessageValidator: ScriptLine {
@@ -92,8 +92,8 @@ pub mod actor_types {
     }
 
     impl ScriptLine for AutoMessageHandler {
-        fn original_line(&self) -> &str {
-            self.client_validator.original_line()
+        fn original_line<'a>(&self, script: &'a str) -> &'a str {
+            self.client_validator.original_line(script)
         }
     }
 

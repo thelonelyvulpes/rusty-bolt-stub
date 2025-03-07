@@ -24,4 +24,26 @@ impl Context {
             end_line_number: max(self.end_line_number, other.end_line_number),
         }
     }
+
+    pub fn original_line<'a>(&self, script: &'a str) -> &'a str {
+        let mut to_start = self.start_line_number;
+        let mut to_end = self.end_line_number;
+
+        let mut current_offset = 0;
+        let mut start = 0;
+        let mut end = script.len();
+        while let Some(i) = script.find("\n") {
+            if to_start == 0 {
+                start = current_offset;
+            }
+            if to_end == 0 {
+                end = current_offset + i;
+                break;
+            }
+            current_offset += i + "\n".len();
+            to_start = to_start.wrapping_sub(1);
+            to_end = to_end.wrapping_sub(1);
+        }
+        &script[start..end]
+    }
 }

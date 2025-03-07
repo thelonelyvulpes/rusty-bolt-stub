@@ -302,6 +302,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             return Err(anyhow::anyhow!("Invalid Bolt version"));
         }
 
+        // TODO: handle equivalent versions (e.g. a bolt 4.2 script is allowed to run on bolt 4.1)
+
+        // TODO: handshake manifest v1
+
         let to_negotiate = &self.script.config.bolt_version;
         self.conn
             .write_all(&[0x00, 0x00, to_negotiate.minor(), to_negotiate.major()])
@@ -618,7 +622,7 @@ mod tests {
         }
 
         impl ScriptLine for TestValidator {
-            fn original_line(&self) -> &str {
+            fn original_line<'a>(&self, _script: &'a str) -> &'a str {
                 ""
             }
         }

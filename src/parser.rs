@@ -14,6 +14,7 @@ use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 use crate::bang_line::BangLine;
 use crate::bolt_encode;
 use crate::bolt_version::BoltVersion;
+use crate::context::Context;
 use crate::jolt::{JoltDate, JoltDuration, JoltTime, JoltVersion};
 use crate::parse_error::ParseError;
 use crate::serde_json_ext;
@@ -277,7 +278,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
         }
         ScanBlock::ClientMessage(ctx, message_name, body_string) => {
-            let validator = create_validator(message_name, body_string.as_deref(), config)
+            let validator = create_validator(message_name, body_string.as_deref(), *ctx, config)
                 .map_err(|mut e| {
                     e.ctx.get_or_insert(*ctx);
                     e
@@ -286,20 +287,26 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
         }
         ScanBlock::ServerMessage(ctx, message_name, body_string) => {
             // TODO: Implement parser for the special messages like S: <Sleep 2>
-            let server_message_sender = create_message_sender(message_name, body_string, config)
-                .map_err(|mut e| {
-                    e.ctx.get_or_insert(*ctx);
-                    e
-                })?;
+            let server_message_sender =
+                create_message_sender(message_name, body_string, *ctx, config).map_err(
+                    |mut e| {
+                        e.ctx.get_or_insert(*ctx);
+                        e
+                    },
+                )?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
         ScanBlock::AutoMessage(ctx, client_message_name, client_body_string) => {
-            let validator =
-                create_validator(client_message_name, client_body_string.as_deref(), config)
-                    .map_err(|mut e| {
-                        e.ctx.get_or_insert(*ctx);
-                        e
-                    })?;
+            let validator = create_validator(
+                client_message_name,
+                client_body_string.as_deref(),
+                *ctx,
+                config,
+            )
+            .map_err(|mut e| {
+                e.ctx.get_or_insert(*ctx);
+                e
+            })?;
             let server_message_sender = create_auto_message_sender(client_message_name, config);
             Ok(ActorBlock::AutoMessage(
                 *ctx,
@@ -347,33 +354,46 @@ fn create_auto_message_sender(
 fn create_message_sender(
     message_name: &str,
     message_body: &Option<String>,
+    ctx: Context,
     _config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
     // return Ok(Box::new(()));
     let data = vec![];
 
-    Ok(Box::new(SenderBytes::new(data, message_name, message_body)))
+    Ok(Box::new(SenderBytes::new(
+        data,
+        message_name,
+        message_body,
+        ctx,
+    )))
 }
 
 struct SenderBytes {
     pub data: Vec<u8>,
     pub message_name: String,
     pub message_body: Option<String>,
+    pub ctx: Context,
 }
 
 impl SenderBytes {
-    pub fn new(data: Vec<u8>, message_name: &str, message_body: &Option<String>) -> Self {
+    pub fn new(
+        data: Vec<u8>,
+        message_name: &str,
+        message_body: &Option<String>,
+        ctx: Context,
+    ) -> Self {
         Self {
             data,
             message_name: message_name.to_string(),
             message_body: message_body.clone(),
+            ctx,
         }
     }
 }
 
 impl ScriptLine for SenderBytes {
-    fn original_line(&self) -> &str {
-        ""
+    fn original_line<'a>(&self, script: &'a str) -> &'a str {
+        self.ctx.original_line(script)
     }
 }
 
@@ -394,17 +414,20 @@ impl ServerMessageSender for SenderBytes {
 
 struct ValidatorImpl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> {
     pub func: T,
+    pub ctx: Context,
 }
 
 impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> Debug for ValidatorImpl<T> {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatorImpl")
+            .field("ctx", &self.ctx)
+            .finish()
     }
 }
 
 impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ScriptLine for ValidatorImpl<T> {
-    fn original_line(&self) -> &str {
-        todo!()
+    fn original_line<'a>(&self, script: &'a str) -> &'a str {
+        self.ctx.original_line(script)
     }
 }
 
@@ -419,6 +442,7 @@ impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ClientMessageValid
 fn create_validator(
     expected_tag: &str,
     expected_body_string: Option<&str>,
+    ctx: Context,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
     let expected_tag = message_tag_from_name(expected_tag, config)?;
@@ -430,6 +454,7 @@ fn create_validator(
             }
             expected_body_behavior(&client_message.fields)
         },
+        ctx,
     }))
 }
 
@@ -1384,15 +1409,16 @@ fn validate_parallel_child(b: &ActorBlock) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::bolt_version::BoltVersion;
-    use crate::parser::{create_validator, ActorConfig};
-    use crate::values::BoltMessage;
     use serde_json::Number;
 
     #[test]
     fn should_validate_any_hello() {
         let tag = "HELLO";
         let body = "{\"{}\": \"*\"}";
+        let ctx = Context {
+            start_line_number: 0,
+            end_line_number: 0,
+        };
         let cfg = ActorConfig {
             bolt_version: BoltVersion::V5_0,
             allow_restart: false,
@@ -1400,7 +1426,7 @@ mod test {
             handshake: None,
             handshake_delay: None,
         };
-        let _validator = create_validator(tag, Some(body), &cfg).unwrap();
+        let _validator = create_validator(tag, Some(body), ctx, &cfg).unwrap();
 
         let _cm = BoltMessage::new(0x00, vec![], BoltVersion::V5_0);
 
