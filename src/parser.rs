@@ -166,7 +166,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 allow_restart = Some(true);
             }
             BangLine::Auto(_, _) => {
-                todo!("Auto blocks are not yet supported in the actor")
+                todo!("Auto bang lines are not yet supported in the actor")
             }
             BangLine::Concurrent(ctx) => {
                 if allow_concurrent.is_some() {
@@ -288,7 +288,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
         ScanBlock::ServerMessage(ctx, message_name, body_string) => {
             // TODO: Implement parser for the special messages like S: <Sleep 2>
             let server_message_sender =
-                create_message_sender(message_name, body_string, *ctx, config).map_err(
+                create_message_sender(message_name, body_string.as_deref(), *ctx, config).map_err(
                     |mut e| {
                         e.ctx.get_or_insert(*ctx);
                         e
@@ -353,12 +353,24 @@ fn create_auto_message_sender(
 
 fn create_message_sender(
     message_name: &str,
-    message_body: &Option<String>,
+    message_body: Option<&str>,
     ctx: Context,
-    _config: &ActorConfig,
+    config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
-    // return Ok(Box::new(()));
-    let data = vec![];
+    let tag = config
+        .bolt_version
+        .message_tag_from_response(message_name)
+        .ok_or_else(|| {
+            ParseError::new(format!(
+                "Unknown message name {message_name:?} for BOLT version {}",
+                config.bolt_version
+            ))
+        })?;
+    let message = Struct {
+        tag,
+        fields: transcode_body(message_body, config)?,
+    };
+    let data = Value::Struct(message).to_data();
 
     Ok(Box::new(SenderBytes::new(
         data,
@@ -379,13 +391,13 @@ impl SenderBytes {
     pub fn new(
         data: Vec<u8>,
         message_name: &str,
-        message_body: &Option<String>,
+        message_body: Option<&str>,
         ctx: Context,
     ) -> Self {
         Self {
             data,
             message_name: message_name.to_string(),
-            message_body: message_body.clone(),
+            message_body: message_body.map(String::from),
             ctx,
         }
     }
@@ -410,6 +422,14 @@ impl ServerMessageSender for SenderBytes {
     fn send(&self) -> anyhow::Result<&[u8]> {
         Ok(&self.data)
     }
+}
+
+fn transcode_body(msg: Option<&str>, _config: &ActorConfig) -> Result<Vec<Value>> {
+    let Some(_msg) = msg else {
+        return Ok(vec![]);
+    };
+    todo!("serialize the message body");
+    compile_error!("continue here");
 }
 
 struct ValidatorImpl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> {
@@ -440,17 +460,17 @@ impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ClientMessageValid
 }
 
 fn create_validator(
-    expected_tag: &str,
+    message_name: &str,
     expected_body_string: Option<&str>,
     ctx: Context,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
     let expected_tag = config
         .bolt_version
-        .message_tag_from_request(expected_tag)
+        .message_tag_from_request(message_name)
         .ok_or_else(|| {
             ParseError::new(format!(
-                "Unknown message name {expected_tag:?} for BOLT version {}",
+                "Unknown message name {message_name:?} for BOLT version {}",
                 config.bolt_version
             ))
         })?;
@@ -1558,7 +1578,6 @@ mod test {
             BoltVersion::V5_0,
         );
 
-        // assert_eq!(validator.validate(&cm), Ok(()));
         validator.validate(&cm).unwrap()
     }
 

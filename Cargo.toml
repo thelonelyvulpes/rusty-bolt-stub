@@ -20,6 +20,7 @@ serde = "1.0.217"
 serde_json = { version = "1.0.137", features = ["default", "preserve_order"] }
 regex = "1.11.1"
 indexmap = "2.7.1"
+usize_cast = "1.1.0"
 
 [dev-dependencies]
 rstest ="0.22.0"

@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::convert::Into;
+use std::io::Write;
+
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use nom::ToUsize;
+use usize_cast::FromUsize;
 
+// TODO: rename to BoltValue
 #[allow(unused)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -27,6 +32,7 @@ pub enum Value {
     Bytes(Vec<u8>),
     String(String),
     List(Vec<Value>),
+    // TODO: rename to Dict to match PackStream terminology
     Map(IndexMap<String, Value>),
     Struct(Struct),
 }
@@ -50,6 +56,13 @@ impl Value {
             ));
         }
         Ok(value)
+    }
+
+    pub(crate) fn to_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(128);
+        let mut serializer = PackStreamSerializer::new(&mut data);
+        serializer.write(self);
+        data
     }
 }
 
@@ -629,5 +642,165 @@ impl<'a> PackStreamDecoder<'a> {
         let parsed = String::from_utf8(data.into())?;
         self.index += length;
         Ok(parsed)
+    }
+}
+
+pub struct PackStreamSerializer<'a> {
+    data: &'a mut Vec<u8>,
+}
+
+impl<'a> PackStreamSerializer<'a> {
+    pub fn new(writer: &'a mut Vec<u8>) -> Self {
+        Self { data: writer }
+    }
+
+    pub fn write(&mut self, value: &Value) {
+        match value {
+            Value::Null => self.write_null(),
+            Value::Boolean(b) => self.write_bool(*b),
+            Value::Integer(i) => self.write_int(*i),
+            Value::Float(f) => self.write_float(*f),
+            Value::Bytes(b) => self.write_bytes(b),
+            Value::String(s) => self.write_string(s),
+            Value::List(l) => {
+                self.write_list_header(u64::from_usize(l.len()));
+                for value in l {
+                    self.write(value);
+                }
+            }
+            Value::Map(m) => {
+                self.write_dict_header(u64::from_usize(m.len()));
+                for (k, v) in m {
+                    self.write_string(k);
+                    self.write(v);
+                }
+            }
+            Value::Struct(Struct { tag, fields }) => {
+                self.write_struct_header(
+                    *tag,
+                    fields
+                        .len()
+                        .try_into()
+                        .expect("Produced struct with too many fields"),
+                );
+                for value in fields {
+                    self.write(value);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn write_all(&mut self, data: &[u8]) {
+        self.data.write_all(data).unwrap();
+    }
+
+    fn write_null(&mut self) {
+        self.write_all(&[0xC0]);
+    }
+
+    fn write_bool(&mut self, b: bool) {
+        self.write_all(match b {
+            false => &[0xC2],
+            true => &[0xC3],
+        });
+    }
+
+    fn write_int(&mut self, i: i64) {
+        if (-16..=127).contains(&i) {
+            self.write_all(&i8::to_be_bytes(i as i8));
+        } else if (-128..=127).contains(&i) {
+            self.write_all(&[0xC8]);
+            self.write_all(&i8::to_be_bytes(i as i8));
+        } else if (-32_768..=32_767).contains(&i) {
+            self.write_all(&[0xC9]);
+            self.write_all(&i16::to_be_bytes(i as i16));
+        } else if (-2_147_483_648..=2_147_483_647).contains(&i) {
+            self.write_all(&[0xCA]);
+            self.write_all(&i32::to_be_bytes(i as i32));
+        } else {
+            self.write_all(&[0xCB]);
+            self.write_all(&i64::to_be_bytes(i));
+        }
+    }
+
+    fn write_float(&mut self, f: f64) {
+        self.write_all(&[0xC1]);
+        self.write_all(&f64::to_be_bytes(f));
+    }
+
+    fn write_bytes(&mut self, b: &[u8]) {
+        let size = b.len();
+        if size <= 255 {
+            self.write_all(&[0xCC]);
+            self.write_all(&u8::to_be_bytes(size as u8));
+        } else if size <= 65_535 {
+            self.write_all(&[0xCD]);
+            self.write_all(&u16::to_be_bytes(size as u16));
+        } else if size <= 2_147_483_647 {
+            self.write_all(&[0xCE]);
+            self.write_all(&u32::to_be_bytes(size as u32));
+        } else {
+            panic!("bytes exceed max size of 2,147,483,647");
+        }
+        self.write_all(b);
+    }
+
+    fn write_string(&mut self, s: &str) {
+        let bytes = s.as_bytes();
+        let size = bytes.len();
+        if size <= 15 {
+            self.write_all(&[0x80 + size as u8]);
+        } else if size <= 255 {
+            self.write_all(&[0xD0]);
+            self.write_all(&u8::to_be_bytes(size as u8));
+        } else if size <= 65_535 {
+            self.write_all(&[0xD1]);
+            self.write_all(&u16::to_be_bytes(size as u16));
+        } else if size <= 2_147_483_647 {
+            self.write_all(&[0xD2]);
+            self.write_all(&u32::to_be_bytes(size as u32));
+        } else {
+            panic!("string exceeds max size of 2,147,483,647 bytes");
+        }
+        self.write_all(bytes);
+    }
+
+    fn write_list_header(&mut self, size: u64) {
+        if size <= 15 {
+            self.write_all(&[0x90 + size as u8]);
+        } else if size <= 255 {
+            self.write_all(&[0xD4]);
+            self.write_all(&u8::to_be_bytes(size as u8));
+        } else if size <= 65_535 {
+            self.write_all(&[0xD5]);
+            self.write_all(&u16::to_be_bytes(size as u16));
+        } else if size <= 2_147_483_647 {
+            self.write_all(&[0xD6]);
+            self.write_all(&u32::to_be_bytes(size as u32));
+        } else {
+            panic!("list exceeds max size of 2,147,483,647");
+        }
+    }
+
+    fn write_dict_header(&mut self, size: u64) {
+        if size <= 15 {
+            self.write_all(&[0xA0 + size as u8]);
+        } else if size <= 255 {
+            self.write_all(&[0xD8]);
+            self.write_all(&u8::to_be_bytes(size as u8));
+        } else if size <= 65_535 {
+            self.write_all(&[0xD9]);
+            self.write_all(&u16::to_be_bytes(size as u16));
+        } else if size <= 2_147_483_647 {
+            self.write_all(&[0xDA]);
+            self.write_all(&u32::to_be_bytes(size as u32));
+        } else {
+            panic!("map exceeds max size of 2,147,483,647");
+        }
+    }
+
+    fn write_struct_header(&mut self, tag: u8, size: u8) {
+        self.write_all(&[0xB0 + size, tag]);
     }
 }
