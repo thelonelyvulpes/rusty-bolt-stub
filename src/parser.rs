@@ -277,18 +277,30 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
         }
         ScanBlock::ClientMessage(ctx, message_name, body_string) => {
-            let validator = create_validator(message_name, body_string.as_deref(), config)?;
+            let validator = create_validator(message_name, body_string.as_deref(), config)
+                .map_err(|mut e| {
+                    e.ctx.get_or_insert(*ctx);
+                    e
+                })?;
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
         ScanBlock::ServerMessage(ctx, message_name, body_string) => {
             // TODO: Implement parser for the special messages like S: <Sleep 2>
-            let server_message_sender = create_message_sender(message_name, body_string, config)?;
+            let server_message_sender = create_message_sender(message_name, body_string, config)
+                .map_err(|mut e| {
+                    e.ctx.get_or_insert(*ctx);
+                    e
+                })?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
         ScanBlock::AutoMessage(ctx, client_message_name, client_body_string) => {
             let validator =
-                create_validator(client_message_name, client_body_string.as_deref(), config)?;
-            let server_message_sender = create_auto_message_sender(client_message_name, config)?;
+                create_validator(client_message_name, client_body_string.as_deref(), config)
+                    .map_err(|mut e| {
+                        e.ctx.get_or_insert(*ctx);
+                        e
+                    })?;
+            let server_message_sender = create_auto_message_sender(client_message_name, config);
             Ok(ActorBlock::AutoMessage(
                 *ctx,
                 AutoMessageHandler {
@@ -327,7 +339,7 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
 fn create_auto_message_sender(
     _client_message_tag: &str,
     _config: &ActorConfig,
-) -> Result<Box<dyn ServerMessageSender>> {
+) -> Box<dyn ServerMessageSender> {
     // return Ok(Box::new(()));
     todo!("Create the auto message sending component, composed with a validator by caller")
 }
