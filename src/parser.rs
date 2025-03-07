@@ -33,7 +33,7 @@ pub struct ActorScript {
     pub script: Script,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ActorConfig {
     pub bolt_version: BoltVersion,
     pub allow_restart: bool,
