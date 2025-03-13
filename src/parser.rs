@@ -6,16 +6,13 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
 use itertools::Itertools;
 use regex::Regex;
 use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 
 use crate::bang_line::BangLine;
-use crate::bolt_encode;
-use crate::bolt_version::BoltVersion;
+use crate::bolt_version::{BoltVersion, JoltVersion};
 use crate::context::Context;
-use crate::jolt::{JoltDate, JoltDuration, JoltTime, JoltVersion};
 use crate::parse_error::ParseError;
 use crate::serde_json_ext;
 use crate::str_byte;
@@ -24,6 +21,10 @@ use crate::types::actor_types::{
 };
 use crate::types::{ScanBlock, Script};
 use crate::util::opt_res_ret;
+use crate::values::structs::{
+    BoltDate, BoltDateTime, BoltDuration, BoltNode, BoltPath, BoltPoint, BoltRelationship,
+    BoltTime, TAG_DATE, TAG_DURATION, TAG_LOCAL_TIME, TAG_POINT_2D, TAG_POINT_3D, TAG_TIME,
+};
 use crate::values::value::{Struct, Value};
 use crate::values::BoltMessage;
 
@@ -424,12 +425,199 @@ impl ServerMessageSender for SenderBytes {
     }
 }
 
-fn transcode_body(msg: Option<&str>, _config: &ActorConfig) -> Result<Vec<Value>> {
-    let Some(_msg) = msg else {
+fn transcode_body(msg: Option<&str>, config: &ActorConfig) -> Result<Vec<Value>> {
+    let Some(msg) = msg else {
         return Ok(vec![]);
     };
-    todo!("serialize the message body");
-    compile_error!("continue here");
+    Deserializer::from_str(msg)
+        .into_iter()
+        .collect::<StdResult<Vec<JsonValue>, _>>()?
+        .into_iter()
+        .map(|field| transcode_field(field, config))
+        .collect()
+}
+
+pub(crate) fn transcode_field(field: JsonValue, config: &ActorConfig) -> Result<Value> {
+    Ok(match field {
+        JsonValue::Null => Value::Null,
+        JsonValue::Bool(value) => Value::Boolean(value),
+        JsonValue::Number(value) if value.is_i64() => Value::Integer(value.as_i64().unwrap()),
+        JsonValue::Number(value) if value.is_f64() => Value::Float(value.as_f64().unwrap()),
+        JsonValue::Number(value) => {
+            return Err(ParseError::new(format!(
+                "Can't parse number (must be i64 or f64) {value:?}",
+            )));
+        }
+        JsonValue::String(value) => Value::String(value),
+        JsonValue::Array(value) => Value::List(
+            value
+                .into_iter()
+                .map(|v| transcode_field(v, config))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        JsonValue::Object(value) => {
+            let value = match transcode_jolt_value(value, config)? {
+                IsJoltValue::Yes(jolt_value) => return Ok(jolt_value),
+                IsJoltValue::No(value) => value,
+            };
+
+            Value::Map(
+                value
+                    .into_iter()
+                    .map(|(k, v)| transcode_field(v, config).map(|v| (k, v)))
+                    .collect::<Result<_>>()?,
+            )
+        }
+    })
+}
+
+enum IsJoltValue {
+    Yes(Value),
+    No(JsonMap<String, JsonValue>),
+}
+
+fn transcode_jolt_value(
+    value: JsonMap<String, JsonValue>,
+    config: &ActorConfig,
+) -> Result<IsJoltValue> {
+    if value.len() != 1 {
+        return Ok(IsJoltValue::No(value));
+    }
+    let (sigil, value) = value.into_iter().next().expect("non-empty check above");
+    let (versionless_sigil, jolt_version) = parse_jolt_sigil(&sigil, config)?;
+    Ok(match versionless_sigil {
+        "?" => {
+            if !value.is_boolean() {
+                return Err(ParseError::new(format!(
+                    "Expected bool after sigil \"?\", but found {value:?}",
+                )));
+            }
+            IsJoltValue::Yes(transcode_field(value, config)?)
+        }
+        "Z" => {
+            let JsonValue::String(value) = value else {
+                return Err(ParseError::new(format!(
+                    "Expected string after sigil \"Z\", but found {value:?}",
+                )));
+            };
+            let value = i64::from_str(&value).map_err(|e| {
+                ParseError::new(format!(
+                    "Failed to parse i64 after sigil \"Z\": {value:?} because {e}",
+                ))
+            })?;
+            IsJoltValue::Yes(transcode_field(JsonValue::Number(value.into()), config)?)
+        }
+        "R" => {
+            let JsonValue::String(value) = value else {
+                return Err(ParseError::new(format!(
+                    "Expected string after sigil \"R\", but found {value:?}",
+                )));
+            };
+            let value = f64::from_str(&value).map_err(|e| {
+                ParseError::new(format!(
+                    "Failed to parse f64 after sigil \"R\": {value:?} because {e}",
+                ))
+            })?;
+            IsJoltValue::Yes(Value::Float(value))
+        }
+        "U" => {
+            if !value.is_string() {
+                return Err(ParseError::new(format!(
+                    "Expected string after sigil \"U\", but found {value:?}",
+                )));
+            }
+            IsJoltValue::Yes(transcode_field(value, config)?)
+        }
+        "#" => {
+            let bytes = parse_jolt_bytes(value)?;
+            IsJoltValue::Yes(Value::Bytes(bytes))
+        }
+        "[]" => {
+            if !value.is_array() {
+                return Err(ParseError::new(format!(
+                    "Expected array after sigil \"[]\", but found {value:?}",
+                )));
+            }
+            IsJoltValue::Yes(transcode_field(value, config)?)
+        }
+        "{}" => {
+            if !value.is_object() {
+                return Err(ParseError::new(format!(
+                    "Expected object after sigil \"{{}}\", but found {value:?}",
+                )));
+            };
+            IsJoltValue::Yes(transcode_field(value, config)?)
+        }
+        "T" => {
+            let JsonValue::String(value) = value else {
+                return Err(ParseError::new(format!(
+                    "Expected temporal string after sigil \"T\", but found {value:?}",
+                )));
+            };
+            let value = transcode_date_value(&value)
+                .or_else(|| transcode_time_value(&value))
+                .or_else(|| transcode_date_time_value(&value, jolt_version))
+                .or_else(|| transcode_duration_value(&value))
+                .transpose()?
+                .ok_or_else(|| {
+                    ParseError::new(format!(
+                        "Expected temporal string after sigil \"T\", but found {value:?}",
+                    ))
+                })?;
+            IsJoltValue::Yes(value)
+        }
+        "@" => {
+            let JsonValue::String(value) = value else {
+                return Err(ParseError::new(format!(
+                    "Expected spatial string after sigil \"@\", but found {value:?}",
+                )));
+            };
+            let bolt_point = BoltPoint::parse(&value)?;
+            IsJoltValue::Yes(Value::Struct(bolt_point.as_struct()))
+        }
+        "()" => {
+            let bolt_node = BoltNode::parse(value, jolt_version, config)?;
+            IsJoltValue::Yes(Value::Struct(bolt_node.into_struct()))
+        }
+        "->" => {
+            let bolt_relationship = BoltRelationship::parse(value, jolt_version, config)?;
+            IsJoltValue::Yes(Value::Struct(bolt_relationship.into_struct()))
+        }
+        "<-" => {
+            let mut bolt_relationship = BoltRelationship::parse(value, jolt_version, config)?;
+            bolt_relationship.flip_direction();
+            IsJoltValue::Yes(Value::Struct(bolt_relationship.into_struct()))
+        }
+        ".." => {
+            let bolt_path = BoltPath::parse(value, jolt_version, config)?;
+            IsJoltValue::Yes(Value::Struct(bolt_path.into_struct()))
+        }
+        _ => IsJoltValue::No([(sigil, value)].into_iter().collect()),
+    })
+}
+
+fn transcode_date_value(s: &str) -> Option<Result<Value>> {
+    let bolt_date = opt_res_ret!(BoltDate::parse(s));
+    let value_struct = opt_res_ret!(bolt_date.as_struct());
+    Some(Ok(Value::Struct(value_struct)))
+}
+
+fn transcode_time_value(s: &str) -> Option<Result<Value>> {
+    let bolt_time = opt_res_ret!(BoltTime::parse(s));
+    let value_struct = opt_res_ret!(bolt_time.as_struct());
+    Some(Ok(Value::Struct(value_struct)))
+}
+
+fn transcode_date_time_value(s: &str, jolt_version: JoltVersion) -> Option<Result<Value>> {
+    let bolt_date_time = opt_res_ret!(BoltDateTime::parse(s));
+    let value_struct = opt_res_ret!(bolt_date_time.as_struct(jolt_version));
+    Some(Ok(Value::Struct(value_struct)))
+}
+
+fn transcode_duration_value(s: &str) -> Option<Result<Value>> {
+    let bolt_duration = opt_res_ret!(BoltDuration::parse(s));
+    let value_struct = opt_res_ret!(bolt_duration.as_struct());
+    Some(Ok(Value::Struct(value_struct)))
 }
 
 struct ValidatorImpl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> {
@@ -523,8 +711,7 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
         }
         JsonValue::Number(expected) => {
             return Err(ParseError::new(format!(
-                "Can't parse number (must be i64 or f64) {:?}",
-                expected
+                "Can't parse number (must be i64 or f64) {expected:?}",
             )));
         }
         JsonValue::String(expected) => Box::new(move |msg| match msg {
@@ -560,7 +747,7 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
                 IsJoltValidator::No(expected) => expected,
             };
 
-            build_map_validator(config, expected)?
+            build_map_validator(expected, config)?
             // try to build jolt matcher (incl. Structs like datetime)
             //   * if has 1 key-value pair
             //   * && key is known sigil
@@ -570,8 +757,8 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
 }
 
 fn build_map_validator(
-    config: &ActorConfig,
     expected: JsonMap<String, JsonValue>,
+    config: &ActorConfig,
 ) -> Result<ValidateValueFn> {
     let mut required_keys = HashSet::new();
     let mut unique_keys = HashSet::new();
@@ -775,31 +962,7 @@ fn build_jolt_validator(
             if is_match_all(&expected) {
                 match_any!("bytes", Value::Bytes(_));
             }
-            let bytes = match expected {
-                JsonValue::String(expected) => parse_hex_string(&expected)?,
-                JsonValue::Array(expected) => {
-                    let mut bytes = Vec::with_capacity(expected.len());
-                    for (i, b) in expected.into_iter().enumerate() {
-                        let Some(b) = b.as_i64() else {
-                            return Err(ParseError::new(format!(
-                                "Array after sigil \"#\" must contain only ints, but found {b:?} (at {i})",
-                            )));
-                        };
-                        let b: u8 = b.try_into().map_err(|_| {
-                            ParseError::new(format!(
-                                "Array after sigil \"#\" must contain only u8, but found {b} (at {i})",
-                            ))
-                        })?;
-                        bytes.push(b);
-                    }
-                    bytes
-                }
-                _ => {
-                    return Err(ParseError::new(format!(
-                        "Expected string or array after sigil \"#\", but found {expected:?}",
-                    )));
-                }
-            };
+            let bytes = parse_jolt_bytes(expected)?;
             IsJoltValidator::Yes(Box::new(move |msg| match msg {
                 Value::Bytes(received) if &bytes == received => Ok(()),
                 _ => Err(anyhow!("Expected bytes {:?} found {:?}", &bytes, msg)),
@@ -825,7 +988,7 @@ fn build_jolt_validator(
                     "Expected object after sigil \"{{}}\", but found {expected:?}",
                 )));
             };
-            IsJoltValidator::Yes(build_map_validator(config, expected)?)
+            IsJoltValidator::Yes(build_map_validator(expected, config)?)
         }
         "T" => {
             let JsonValue::String(expected) = expected else {
@@ -849,9 +1012,11 @@ fn build_jolt_validator(
             if is_match_all(&expected) {
                 return Ok(IsJoltValidator::Yes(Box::new(|msg| match msg {
                     Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                        (0x58, [Value::Integer(_), Value::Float(_), Value::Float(_)]) => Ok(()),
+                        (&TAG_POINT_2D, [Value::Integer(_), Value::Float(_), Value::Float(_)]) => {
+                            Ok(())
+                        }
                         (
-                            0x59,
+                            &TAG_POINT_3D,
                             [Value::Integer(_), Value::Float(_), Value::Float(_), Value::Float(_)],
                         ) => Ok(()),
                         _ => Err(anyhow!("Expected any date struct found {msg:?}")),
@@ -864,52 +1029,8 @@ fn build_jolt_validator(
                     "Expected spatial string after sigil \"@\", but found {expected:?}",
                 )));
             };
-            thread_local! {
-                static SPATIAL_RE: LazyCell<Regex> = LazyCell::new(|| {
-                    Regex::new(concat!(
-                        r"^(?:SRID=([^;]+);)?\s*",
-                        r"POINT\s*\(((?:(?:\S+)?\s+){1,2}\S+)\)$",
-                    )).unwrap()
-                });
-            }
-
-            let captures = SPATIAL_RE.with(|re| re.captures(&expected));
-            let Some(captures) = captures else {
-                return Err(ParseError::new(format!(
-                    "Expected valid spatial string after sigil \"@\", \
-                    e.g., \"SRID=7203;POINT(1 2)\" found: {expected:?}"
-                )));
-            };
-            let Some(srid_match) = captures.get(1) else {
-                return Err(ParseError::new(format!(
-                    "Spatial string (after sigil \"@\") requires an SRID, \
-                    e.g., \"SRID=7203;POINT(1 2)\" found: {expected:?}"
-                )));
-            };
-            let srid = srid_match.as_str();
-            let srid = i64::from_str(srid).map_err(|e| {
-                ParseError::new(format!(
-                    "Spatial string (after sigil \"@\") contained non-i64 srid {srid:?}): {e}"
-                ))
-            })?;
-            let coords = dbg!(&captures[2]);
-            let coords = coords
-                .split_whitespace()
-                .enumerate()
-                .map(|(i, c)| {
-                    f64::from_str(c).map_err(|e| {
-                        ParseError::new(format!(
-                            "Spatial string (after sigil \"@\") contained non-f64 coordinate \
-                            {c:?} (at {i}): {e}"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let expected = Value::Struct(match coords.as_slice() {
-                [x, y] => bolt_encode::read_point_2d(srid, *x, *y),
-                [x, y, z] => bolt_encode::read_point_3d(srid, *x, *y, *z),
-                _ => panic!("Regex asserts exactly 2 or 3 coordinates"),
-            });
+            let bolt_point = BoltPoint::parse(&expected)?;
+            let expected = Value::Struct(bolt_point.as_struct());
             IsJoltValidator::Yes(Box::new(move |msg| match msg == &expected {
                 true => Ok(()),
                 false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
@@ -977,6 +1098,34 @@ fn parse_jolt_sigil<'a>(sigil: &'a str, config: &ActorConfig) -> Result<(&'a str
     })
 }
 
+fn parse_jolt_bytes(expected: JsonValue) -> Result<Vec<u8>> {
+    Ok(match expected {
+        JsonValue::String(expected) => parse_hex_string(&expected)?,
+        JsonValue::Array(expected) => {
+            let mut bytes = Vec::with_capacity(expected.len());
+            for (i, b) in expected.into_iter().enumerate() {
+                let Some(b) = b.as_i64() else {
+                    return Err(ParseError::new(format!(
+                        "Array after sigil \"#\" must contain only ints, but found {b:?} (at {i})",
+                    )));
+                };
+                let b: u8 = b.try_into().map_err(|_| {
+                    ParseError::new(format!(
+                        "Array after sigil \"#\" must contain only u8, but found {b} (at {i})",
+                    ))
+                })?;
+                bytes.push(b);
+            }
+            bytes
+        }
+        _ => {
+            return Err(ParseError::new(format!(
+                "Expected string or array after sigil \"#\", but found {expected:?}",
+            )));
+        }
+    })
+}
+
 fn parse_hex_string(s: &str) -> Result<Vec<u8>> {
     if s.is_empty() {
         return Ok(vec![]);
@@ -1038,18 +1187,15 @@ fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
             Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                (0x44, [Value::Integer(_)]) => Ok(()),
+                (&TAG_DATE, [Value::Integer(_)]) => Ok(()),
                 _ => Err(anyhow!("Expected any date struct found {msg:?}")),
             },
             _ => Err(anyhow!("Expected any date struct found {msg:?}")),
         })));
     }
-    let JoltDate { date } = opt_res_ret!(JoltDate::parse(s));
-    let days_since_epoch = date - NaiveDate::from_ymd_opt(0, 1, 1).unwrap();
-    Some(Ok(build_struct_match_validator(Struct {
-        tag: 0x44,
-        fields: vec![Value::Integer(days_since_epoch.num_days())],
-    })))
+    let bolt_date = opt_res_ret!(BoltDate::parse(s));
+    let expected_struct = opt_res_ret!(bolt_date.as_struct());
+    Some(Ok(build_struct_match_validator(expected_struct)))
 }
 
 /// yes:
@@ -1072,39 +1218,15 @@ fn build_time_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
             Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                (0x74, [Value::Integer(_)]) => Ok(()),
-                (0x54, [Value::Integer(_), Value::Integer(_)]) => Ok(()),
+                (&TAG_LOCAL_TIME, [Value::Integer(_)]) => Ok(()),
+                (&TAG_TIME, [Value::Integer(_), Value::Integer(_)]) => Ok(()),
                 _ => Err(anyhow!("Expected any time struct found {msg:?}")),
             },
             _ => Err(anyhow!("Expected any time struct found {msg:?}")),
         })));
     }
-    let JoltTime {
-        time,
-        utc_offset_seconds,
-        time_zone_id,
-    } = opt_res_ret!(JoltTime::parse(s));
-    if time_zone_id.is_some() {
-        // times only accept UTC offsets, not time zone ids
-        return None;
-    }
-    let nanos_since_midnight =
-        i64::from(time.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(time.nanosecond());
-    let expected_struct = match utc_offset_seconds {
-        // local time
-        None => Struct {
-            tag: 0x74,
-            fields: vec![Value::Integer(nanos_since_midnight)],
-        },
-        // time
-        Some(offset) => Struct {
-            tag: 0x54,
-            fields: vec![
-                Value::Integer(nanos_since_midnight),
-                Value::Integer(offset.into()),
-            ],
-        },
-    };
+    let bolt_time = opt_res_ret!(BoltTime::parse(s));
+    let expected_struct = opt_res_ret!(bolt_time.as_struct());
     Some(Ok(build_struct_match_validator(expected_struct)))
 }
 
@@ -1150,120 +1272,8 @@ fn build_date_time_validator(
             _ => Err(anyhow!("Expected any date time struct found {msg:?}")),
         })));
     }
-    thread_local! {
-        static DATE_TIME_RE: LazyCell<Regex> = LazyCell::new(|| {
-            Regex::new(r"^(.*?)T(.*)$").unwrap()
-        });
-    }
-    let captures = DATE_TIME_RE.with(|re| re.captures(s))?;
-    let JoltDate { date } = opt_res_ret!(JoltDate::parse(&captures[1]));
-    let JoltTime {
-        time,
-        utc_offset_seconds,
-        time_zone_id,
-    } = opt_res_ret!(JoltTime::parse(&captures[2]));
-    let date_time = NaiveDateTime::new(date, time);
-
-    let expected_struct =
-        match (utc_offset_seconds, time_zone_id) {
-            (Some(utc_offset_seconds), Some(time_zone_id)) => {
-                // date time zone id
-
-                // let tz = match Tz::from_str(time_zone_id) {
-                //     Ok(tz) => tz,
-                //     Err(e) => {
-                //         return Some(Err(ParseError::new(format!(
-                //             "Failed to load time zone id {time_zone_id:?}: {e}"
-                //         ))))
-                //     }
-                // };
-                // let date_time = date_time_utc.with_timezone(&tz);
-                // let found_offset_seconds = date_time.offset().fix().local_minus_utc();
-                // if found_offset_seconds != utc_offset_seconds {
-                //     // "Timezone database for {s} does not agree with the offset \
-                //     // {utc_offset_seconds} seconds, found {found_offset_seconds}. \
-                //     // Either there is a typo or the timezone database is outdated."
-                //     todo!("Emit warning, possibly a typo in the script");
-                // }
-                match jolt_version {
-                    JoltVersion::V1 => {
-                        let date_time = date_time.and_utc();
-                        let seconds = date_time.timestamp();
-                        let nanos = date_time.timestamp_subsec_nanos();
-                        Struct {
-                            tag: 0x66,
-                            fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::String(String::from(time_zone_id)),
-                            ],
-                        }
-                    }
-                    JoltVersion::V2 => {
-                        let date_time_utc = date_time.and_utc()
-                            - TimeDelta::new(utc_offset_seconds.into(), 0).unwrap();
-                        let seconds = date_time_utc.timestamp();
-                        let nanos = date_time_utc.timestamp_subsec_nanos();
-                        Struct {
-                            tag: 0x69,
-                            fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::String(String::from(time_zone_id)),
-                            ],
-                        }
-                    }
-                }
-            }
-            (Some(utc_offset_seconds), None) => {
-                // date time
-                match jolt_version {
-                    JoltVersion::V1 => {
-                        let date_time = date_time.and_utc();
-                        let seconds = date_time.timestamp();
-                        let nanos = date_time.timestamp_subsec_nanos();
-                        Struct {
-                            tag: 0x46,
-                            fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::Integer(utc_offset_seconds.into()),
-                            ],
-                        }
-                    }
-                    JoltVersion::V2 => {
-                        let tz = FixedOffset::east_opt(utc_offset_seconds)
-                            .expect("regex enforced offset in bounds");
-                        let date_time = date_time.and_local_timezone(tz).unwrap();
-                        let seconds = date_time.timestamp();
-                        let nanos = date_time.timestamp_subsec_nanos();
-                        Struct {
-                            tag: 0x49,
-                            fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::Integer(utc_offset_seconds.into()),
-                            ],
-                        }
-                    }
-                }
-            }
-            (None, Some(_)) => return Some(Err(ParseError::new(
-                "DateTime with named zone requires an explicit time offset to avoid ambiguity. \
-                E.g., `2025-03-06T18:05:02+01:00[Europe/Stockholm]` instead of \
-                `2025-03-06T18:05:02[Europe/Stockholm]`",
-            ))),
-            (None, None) => {
-                // local date time
-                let date_time = date_time.and_utc();
-                let seconds = date_time.timestamp();
-                let nanos = date_time.timestamp_subsec_nanos();
-                Struct {
-                    tag: 0x64,
-                    fields: vec![Value::Integer(seconds), Value::Integer(nanos.into())],
-                }
-            }
-        };
+    let bolt_date_time = opt_res_ret!(BoltDateTime::parse(s));
+    let expected_struct = opt_res_ret!(bolt_date_time.as_struct(jolt_version));
     Some(Ok(build_struct_match_validator(expected_struct)))
 }
 
@@ -1283,7 +1293,7 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
         return Some(Ok(Box::new(|msg| match msg {
             Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
                 (
-                    0x45,
+                    &TAG_DURATION,
                     [Value::Integer(_), Value::Integer(_), Value::Integer(_), Value::Integer(_)],
                 ) => Ok(()),
                 _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
@@ -1291,17 +1301,19 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
             _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
         })));
     }
-    let JoltDuration {
+    let BoltDuration {
         months,
         days,
         seconds,
         nanos,
-    } = opt_res_ret!(JoltDuration::parse(s));
+    } = opt_res_ret!(BoltDuration::parse(s));
     let total_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
     Some(Ok(Box::new(move |msg| match msg {
         Value::Struct(received) => {
-            if received.tag != 0x45 {
-                return Err(anyhow!("Expected duration (tag 0x45), found {:?}", msg));
+            if received.tag != TAG_DURATION {
+                return Err(anyhow!(
+                    "Expected duration (tag {TAG_DURATION:#X}), found {msg:?}",
+                ));
             }
             fn get_int_field(i: usize, name: &str, received: &Struct) -> anyhow::Result<i64> {
                 match received.fields.get(i) {

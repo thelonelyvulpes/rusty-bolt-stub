@@ -1,9 +1,9 @@
 use std::fmt::Display;
+use std::str::FromStr;
 use std::sync::atomic::AtomicI64;
 
 use indexmap::{indexmap, IndexMap};
 
-use crate::jolt::JoltVersion;
 use crate::values::value::Value;
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
@@ -224,5 +224,23 @@ impl BoltVersion {
             BoltVersion::V5_7 => "Neo4j/5.26.0",
             BoltVersion::V5_8 => "Neo4j/5.26.0",
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum JoltVersion {
+    V1,
+    V2,
+}
+
+impl JoltVersion {
+    pub(crate) fn parse(s: &str) -> Result<Self, String> {
+        let jolt_version =
+            i32::from_str(s).map_err(|e| format!("Jolt version must be i32 (found {s:?}): {e}"))?;
+        Ok(match jolt_version {
+            1 => Self::V1,
+            2 => Self::V2,
+            _ => return Err(format!("Unknown jolt version: {s}")),
+        })
     }
 }

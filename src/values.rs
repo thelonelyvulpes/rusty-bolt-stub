@@ -2,6 +2,7 @@ use crate::bolt_version::BoltVersion;
 
 pub mod graph;
 pub mod spatial;
+pub mod structs;
 pub mod time;
 pub mod value;
 
