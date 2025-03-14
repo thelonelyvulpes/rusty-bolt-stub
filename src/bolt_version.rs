@@ -155,6 +155,29 @@ impl BoltVersion {
         })
     }
 
+    pub fn message_name_from_request(&self, tag: u8) -> Option<&'static str> {
+        Some(match tag {
+            0x01 if self < &BoltVersion::V3 => "INIT",
+            0x01 if self >= &BoltVersion::V3 => "HELLO",
+            0x6A if self >= &BoltVersion::V5_1 => "LOGON",
+            0x6B if self >= &BoltVersion::V5_1 => "LOGOFF",
+            0x54 if self >= &BoltVersion::V5_4 => "TELEMETRY",
+            0x02 => "GOODBYE",
+            0x0E if self < &BoltVersion::V3 => "ACK_FAILURE",
+            0x0F => "RESET",
+            0x10 => "RUN",
+            0x2F if self < &BoltVersion::V4_0 => "DISCARD_ALL",
+            0x2F if self >= &BoltVersion::V4_0 => "DISCARD",
+            0x3F if self < &BoltVersion::V4_0 => "PULL_ALL",
+            0x3F if self >= &BoltVersion::V4_0 => "PULL",
+            0x11 => "BEGIN",
+            0x12 => "COMMIT",
+            0x13 => "ROLLBACK",
+            0x66 if self >= &BoltVersion::V4_3 => "ROUTE",
+            _ => return None,
+        })
+    }
+
     pub fn message_tag_from_response(&self, name: &str) -> Option<u8> {
         Some(match name {
             "SUCCESS" => 0x70,
