@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context as AnyhowContext, Result};
+use log::{debug, info};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -59,23 +60,37 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
     /// bool indicates if a message could be consumed `true` or there was a script mismatch `false`
     async fn try_consume(&mut self, block: &mut BlockWithState<'_>) -> Result<bool> {
         match block {
-            BlockWithState::BlockList(state, _, blocks) => {
+            BlockWithState::BlockList(state, ctx, blocks) => {
                 if state.current_block >= blocks.len() {
                     return Ok(false);
                 }
+                let blocks_len = blocks.len();
                 for block in blocks.iter_mut().skip(state.current_block) {
                     if Box::pin(self.try_consume(block)).await? {
-                        state.current_block += 1;
+                        if block.done() {
+                            state.current_block += 1;
+                            debug!(
+                                "list child block done: moving block list ({}) to {}/{blocks_len}",
+                                ctx,
+                                state.current_block + 1
+                            );
+                        }
                         return Ok(true);
                     }
                     if block.can_skip() {
                         state.current_block += 1;
+                        debug!(
+                            "list child block didn't match, but is skippable: \
+                            moving block list ({}) to {}/{blocks_len}",
+                            ctx,
+                            state.current_block + 1
+                        );
                         continue;
                     }
                 }
                 Ok(false)
             }
-            BlockWithState::ClientMessageValidate(state, _, validator) => match state.done {
+            BlockWithState::ClientMessageValidate(state, ctx, validator) => match state.done {
                 true => Ok(false),
                 false => {
                     let peeked_message = Self::peek_message(
@@ -88,16 +103,26 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                         return Ok(false);
                     }
                     _ = self.read_message().await?; // consume the message
+                    debug!("client line ({ctx}) matched: done");
+                    state.done = true;
                     Ok(true)
                 }
             },
-            BlockWithState::Alt(state, _, blocks) => match state {
+            BlockWithState::Alt(state, ctx, blocks) => match state {
                 BranchState::Init => {
                     for (i, block) in blocks.iter_mut().enumerate() {
                         if Box::pin(self.try_consume(block)).await? {
                             if block.done() {
+                                debug!(
+                                    "alt block ({ctx}) child {} started and done: moving to Done",
+                                    i + 1
+                                );
                                 *state = BranchState::Done;
                             } else {
+                                debug!(
+                                    "alt block ({ctx}) child {} started: moving to InBlock",
+                                    i + 1
+                                );
                                 *state = BranchState::InBlock(i);
                             }
                             return Ok(true);
@@ -108,13 +133,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 BranchState::InBlock(i) => {
                     let res = Box::pin(self.try_consume(&mut blocks[*i])).await;
                     if blocks[*i].done() {
+                        debug!("alt block ({ctx}) child {} done: moving to Done", *i + 1);
                         *state = BranchState::Done;
                     }
                     res
                 }
                 BranchState::Done => Ok(false),
             },
-            BlockWithState::Parallel(state, _, blocks) => {
+            BlockWithState::Parallel(state, ctx, blocks) => {
                 if state.done {
                     return Ok(false);
                 }
@@ -129,25 +155,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                     }
                 }
                 if blocks.iter().all(BlockWithState::done) {
+                    debug!("parallel block ({ctx}) all children done: moving to Done");
                     state.done = true;
                 }
                 Ok(matched)
             }
-            BlockWithState::Optional(state, _, block) => match state {
+            BlockWithState::Optional(state, ctx, block) => match state {
                 OptionalState::Init | OptionalState::Started => {
-                    let res = Box::pin(self.try_consume(block)).await;
-                    if let Ok(true) = res {
+                    let res = Box::pin(self.try_consume(block)).await?;
+                    if res {
+                        debug!("optional block ({ctx}) child stared: moving to Started");
                         *state = OptionalState::Started;
                     }
                     if block.done() {
+                        debug!("optional block ({ctx}) child done: moving to Done");
                         *state = OptionalState::Done;
                     }
-                    res
+                    Ok(res)
                 }
                 OptionalState::Done => Ok(false),
             },
-            BlockWithState::Repeat(state, _, block, _) => {
+            BlockWithState::Repeat(state, ctx, block, count) => {
                 if Box::pin(self.try_consume(block)).await? {
+                    debug!(
+                        "repeat{count} block ({ctx}) child consumed message: InBlock count {}",
+                        state.count
+                    );
                     state.in_block = true;
                     return Ok(true);
                 }
@@ -164,6 +197,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                             *block = state.initial_state.clone();
                             state.count += 1;
                             assert!(Box::pin(self.try_consume(block)).await?);
+                            debug!(
+                                "repeat{count} block ({ctx}) looping around: InBlock count {}",
+                                state.count
+                            );
                             state.in_block = true;
                             Ok(true)
                         }
@@ -174,13 +211,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 }
             }
             BlockWithState::AutoMessage(state, ctx, auto_handler) => {
-                let message = self.read_message().await?;
-                auto_handler
+                let peeked_message = Self::peek_message(
+                    &mut self.conn,
+                    &mut self.peeked_message,
+                    self.script.config.bolt_version,
+                )
+                .await?;
+                if auto_handler
                     .client_validator
-                    .validate(&message)
-                    .context(*ctx)?;
+                    .validate(peeked_message)
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+                _ = self.read_message().await?; // consume the message
                 let response = auto_handler.server_sender.send()?;
-                self.conn.write_all(response).await.context(*ctx)?;
+                self.write_message(response).await.context(*ctx)?;
+                debug!("auto message ({ctx}) matched: done");
                 state.done = true;
                 Ok(true)
             }
@@ -194,24 +241,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
 
     async fn server_action(&mut self, block: &mut BlockWithState<'_>) -> Result<()> {
         match block {
-            BlockWithState::BlockList(state, _, blocks) => {
-                let Some(block) = blocks.get_mut(state.current_block) else {
-                    return Ok(());
-                };
+            BlockWithState::BlockList(state, ctx, blocks) => {
+                let blocks_len = blocks.len();
                 loop {
+                    let Some(block) = blocks.get_mut(state.current_block) else {
+                        break;
+                    };
                     Box::pin(self.server_action(block)).await?;
                     if !block.done() {
-                        return Ok(());
+                        break;
                     }
                     state.current_block += 1;
+                    debug!(
+                        "list child block done: moving block list ({}) to {}/{blocks_len}",
+                        ctx,
+                        state.current_block + 1
+                    );
                 }
+                Ok(())
             }
             BlockWithState::ServerMessageSend(state, ctx, sender) => match state.done {
                 true => Ok(()),
                 false => {
                     let data = sender.send()?;
-                    self.conn.write_all(data).await.context(*ctx)?;
+                    self.write_message(data).await.context(*ctx)?;
                     state.done = true;
+                    debug!("server line ({ctx}) written: done");
                     Ok(())
                 }
             },
@@ -223,18 +278,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                     // Ok(())
                 }
             },
-            BlockWithState::Alt(state, _, blocks) => match state {
+            BlockWithState::Alt(state, ctx, blocks) => match state {
                 BranchState::Init => Ok(()),
                 BranchState::InBlock(i) => {
                     Box::pin(self.server_action(&mut blocks[*i])).await?;
                     if blocks[*i].done() {
+                        debug!("alt block ({ctx}) child {} done: moving to Done", *i + 1);
                         *state = BranchState::Done
                     }
                     Ok(())
                 }
                 BranchState::Done => Ok(()),
             },
-            BlockWithState::Parallel(state, _, blocks) => match state.done {
+            BlockWithState::Parallel(state, ctx, blocks) => match state.done {
                 true => Ok(()),
                 false => {
                     for block in blocks.iter_mut() {
@@ -244,29 +300,35 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                         Box::pin(self.server_action(block)).await?;
                     }
                     if blocks.iter().all(BlockWithState::done) {
+                        debug!("parallel block ({ctx}) all children done: moving to Done");
                         state.done = true;
                     }
                     Ok(())
                 }
             },
-            BlockWithState::Optional(state, _, block) => match state {
+            BlockWithState::Optional(state, ctx, block) => match state {
                 // optional block children cannot start with an action block
                 OptionalState::Init => Ok(()),
                 OptionalState::Started => {
                     let res = Box::pin(self.server_action(block)).await;
                     if block.done() {
+                        debug!("optional block ({ctx}) child done: moving to Done");
                         *state = OptionalState::Done;
                     }
                     res
                 }
                 OptionalState::Done => Ok(()),
             },
-            BlockWithState::Repeat(state, _, block, _) => match state.in_block {
+            BlockWithState::Repeat(state, ctx, block, count) => match state.in_block {
                 true => {
                     let res = Box::pin(self.server_action(block)).await;
                     if block.done() {
                         state.in_block = false;
                         state.count += 1;
+                        debug!(
+                            "repeat{count} block ({ctx}) reached end: count {}",
+                            state.count
+                        );
                     }
                     res
                 }
@@ -403,7 +465,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             if chunk_length == 0usize {
                 break;
             }
-            message_buffer.try_reserve(chunk_length)?;
+            message_buffer.extend((0..chunk_length).map(|_| 0));
             data_stream
                 .read_exact(&mut message_buffer[curr_idx..curr_idx + chunk_length])
                 .await?;
@@ -411,6 +473,24 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         }
 
         parse_message(message_buffer, bolt_version)
+    }
+
+    async fn write_message(&mut self, mut data: &[u8]) -> Result<()> {
+        // TODO: proper message formatting
+        info!("{data:?}");
+        while !data.is_empty() {
+            let chunk_size = data.len().min(0xFFFF);
+            // chunk header
+            self.conn
+                .write_all(&(chunk_size as u16).to_be_bytes())
+                .await?;
+            // chunk body
+            self.conn.write_all(&data[..chunk_size]).await?;
+            data = &data[chunk_size..];
+        }
+        // message end
+        self.conn.write_all(&[0, 0]).await?;
+        Ok(())
     }
 
     async fn peek_message<'buf>(
@@ -602,7 +682,10 @@ fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> Result<BoltMessage
     let values::value::Value::Struct(Struct { tag, fields }) = value else {
         return Err(anyhow!("Expected a bolt message but got: {:?}.", value));
     };
-    Ok(BoltMessage::new(tag, fields, bolt_version))
+    // TODO: get rid of the debug format and properly log the message in a pretty format
+    let msg = BoltMessage::new(tag, fields, bolt_version);
+    info!("{msg:?}");
+    Ok(msg)
 }
 
 #[cfg(test)]

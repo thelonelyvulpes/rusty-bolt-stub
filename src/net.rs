@@ -1,27 +1,35 @@
-use crate::net_actor::NetActor;
-use crate::parser::ActorScript;
-use anyhow::{anyhow, Error, Result};
-use itertools::Itertools;
 use std::ops::Add;
 use std::time::Duration;
+
+use anyhow::{anyhow, Error, Result};
+use itertools::Itertools;
+use log::info;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-pub struct Server<'a> {
-    address: &'a str,
+use crate::net_actor::NetActor;
+use crate::parser::ActorScript;
+
+pub struct Server {
+    address: String,
     server_script_cfg: &'static ActorScript,
     grace_period: Duration,
 }
 
-impl Server<'_> {
-    pub fn new<'a>(
-        address: &'a str,
+impl Server {
+    pub fn new(
+        address: &str,
         server_script_cfg: &'static ActorScript,
         grace_period: Duration,
-    ) -> Server<'a> {
+    ) -> Self {
+        let address = if address.starts_with(":") {
+            format!("localhost{}", address)
+        } else {
+            address.to_string()
+        };
         Server {
             address,
             server_script_cfg,
@@ -43,7 +51,7 @@ impl Server<'_> {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let listener = TcpListener::bind(self.address).await?;
+        let listener = TcpListener::bind(&self.address).await?;
         let mut set: JoinSet<Result<()>> = JoinSet::new();
 
         let ct = CancellationToken::new();
@@ -52,12 +60,14 @@ impl Server<'_> {
             let mut sigterm = signal(SignalKind::terminate())?;
             let mut sigint = signal(SignalKind::interrupt())?;
             select! {
-                _ = sigterm.recv() => {
+                _ = sigint.recv() => {
+                    info!("received SIGINT");
                     ct.cancel();
                     tokio::time::sleep(self.grace_period).await;
                     Ok::<(), Error>(())
                 },
-                _ = sigint.recv() => {
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM");
                     // aggressively interrupt
                     Ok::<(), Error>(())
                 },
@@ -67,6 +77,11 @@ impl Server<'_> {
                 }
             }
         }?;
+        #[cfg(not(unix))]
+        {
+            // TODO: Windows signals
+            compile_error!("Only Unix signals are supported for now");
+        }
 
         let r = set.join_all().await;
         validate_results(&r)

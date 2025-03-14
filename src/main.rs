@@ -15,11 +15,13 @@ mod types;
 mod util;
 mod values;
 
-use crate::parser::ActorScript;
-use anyhow::Context;
-use clap::Parser;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+use anyhow::Context;
+use clap::Parser;
+
+use crate::parser::ActorScript;
 
 const LISTEN_ADDR_HELP: &str = "The base address on which to listen for incoming \
 connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localhost'. Each script \
@@ -42,7 +44,7 @@ struct StubArgs {
     )]
     verbose: bool,
     script: String,
-    #[arg(short, long, default_value_t=30.0, help=GRACE_PERIOD_HELP)]
+    #[arg(short, long, default_value_t=5.0, help=GRACE_PERIOD_HELP)]
     grace_period: f32,
 }
 
@@ -50,16 +52,14 @@ static SCRIPT: OnceLock<String> = OnceLock::new();
 static PARSED: OnceLock<ActorScript> = OnceLock::new();
 
 fn main() -> anyhow::Result<()> {
+    env_logger::builder().format_timestamp_millis().init();
     let args = StubArgs::parse();
     let script_text = std::fs::read_to_string(&args.script)
         .with_context(|| format!("Failed to read script file: {}", &args.script))?;
     SCRIPT.get_or_init(move || script_text);
 
-    let output = dbg!(scanner::scan_script(SCRIPT.get().unwrap(), args.script)?);
-    let engine = dbg!(parser::contextualize_res(
-        parser::parse(output),
-        SCRIPT.get().unwrap(),
-    ))?;
+    let output = scanner::scan_script(SCRIPT.get().unwrap(), args.script)?;
+    let engine = parser::contextualize_res(parser::parse(output), SCRIPT.get().unwrap())?;
     PARSED.get_or_init(move || engine);
 
     let shutdown_grace_period = Duration::from_secs_f32(args.grace_period);

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::LazyCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
@@ -298,23 +299,14 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
         ScanBlock::AutoMessage(ctx, client_message_name, client_body_string) => {
-            let validator = create_validator(
-                client_message_name,
-                client_body_string.as_deref(),
-                *ctx,
-                config,
-            )
-            .map_err(|mut e| {
-                e.ctx.get_or_insert(*ctx);
-                e
-            })?;
-            let server_message_sender = create_auto_message_sender(client_message_name, config);
             Ok(ActorBlock::AutoMessage(
                 *ctx,
-                AutoMessageHandler {
-                    client_validator: validator,
-                    server_sender: server_message_sender,
-                },
+                create_auto_message_handler(
+                    client_message_name,
+                    client_body_string.as_deref(),
+                    *ctx,
+                    config,
+                )?,
             ))
         }
         ScanBlock::Comment(ctx) => Ok(ActorBlock::NoOp(*ctx)),
@@ -328,13 +320,15 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
 }
 
 fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
-    let mut res = Vec::new();
-    let blocks = blocks.into_iter();
-    for block in blocks {
-        let Some(last) = res.last_mut() else { continue };
+    let mut res = Vec::with_capacity(blocks.len());
+    for block in blocks.into_iter() {
+        let last = res.last_mut();
         match (block, last) {
             (ActorBlock::NoOp(_), _) => continue,
-            (ActorBlock::BlockList(ctx, list), ActorBlock::BlockList(ctx_last, list_last)) => {
+            (
+                ActorBlock::BlockList(ctx, list),
+                Some(ActorBlock::BlockList(ctx_last, list_last)),
+            ) => {
                 *ctx_last = ctx_last.fuse(&ctx);
                 list_last.extend(list)
             }
@@ -344,12 +338,37 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
     res
 }
 
-fn create_auto_message_sender(
-    _client_message_tag: &str,
-    _config: &ActorConfig,
-) -> Box<dyn ServerMessageSender> {
-    // return Ok(Box::new(()));
-    todo!("Create the auto message sending component, composed with a validator by caller")
+fn create_auto_message_handler(
+    client_message_name: &str,
+    client_body_string: Option<&str>,
+    ctx: Context,
+    config: &ActorConfig,
+) -> Result<AutoMessageHandler> {
+    let client_validator = create_validator(client_message_name, client_body_string, ctx, config)?;
+    let client_message_tag = config
+        .bolt_version
+        .message_tag_from_request(client_message_name)
+        .expect("checked in create_validator");
+    let (server_message_tag, server_message_fields) = config
+        .bolt_version
+        .message_auto_response(client_message_tag)
+        .ok_or_else(|| {
+            ParseError::new(format!(
+                "Bolt version {} has not auto-response for message {client_message_name}",
+                config.bolt_version,
+            ))
+        })?;
+    let data = message_data(server_message_tag, server_message_fields);
+    let server_sender = Box::new(SenderBytes::new(
+        data,
+        "AUTO".into(), // TODO: get the actual name of the server message
+        None,          // TODO: get the body string representation of the server message
+        ctx,
+    ));
+    Ok(AutoMessageHandler {
+        client_validator,
+        server_sender,
+    })
 }
 
 fn create_message_sender(
@@ -367,18 +386,18 @@ fn create_message_sender(
                 config.bolt_version
             ))
         })?;
-    let message = Struct {
-        tag,
-        fields: transcode_body(message_body, config)?,
-    };
-    let data = Value::Struct(message).to_data();
+    let data = message_data(tag, transcode_body(message_body, config)?);
 
     Ok(Box::new(SenderBytes::new(
         data,
-        message_name,
-        message_body,
+        message_name.into(),
+        message_body.map(Into::into),
         ctx,
     )))
+}
+
+fn message_data(tag: u8, fields: Vec<Value>) -> Vec<u8> {
+    Value::Struct(Struct { tag, fields }).to_data()
 }
 
 struct SenderBytes {
@@ -391,14 +410,14 @@ struct SenderBytes {
 impl SenderBytes {
     pub fn new(
         data: Vec<u8>,
-        message_name: &str,
-        message_body: Option<&str>,
+        message_name: Cow<str>,
+        message_body: Option<Cow<str>>,
         ctx: Context,
     ) -> Self {
         Self {
             data,
-            message_name: message_name.to_string(),
-            message_body: message_body.map(String::from),
+            message_name: message_name.into_owned(),
+            message_body: message_body.map(Cow::into_owned),
             ctx,
         }
     }
@@ -676,8 +695,8 @@ fn create_validator(
 
 fn build_no_fields_validator(message: &[Value]) -> anyhow::Result<()> {
     match message.len() {
-        0 => Err(anyhow!("Expected 0 fields")),
-        _ => Ok(()),
+        0 => Ok(()),
+        _ => Err(anyhow!("Expected 0 fields")),
     }
 }
 

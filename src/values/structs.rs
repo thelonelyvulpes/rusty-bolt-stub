@@ -51,7 +51,7 @@ impl BoltPoint {
             });
         }
 
-        let captures = SPATIAL_RE.with(|re| re.captures(&s));
+        let captures = SPATIAL_RE.with(|re| re.captures(s));
         let Some(captures) = captures else {
             return Err(ParseError::new(format!(
                 "Expected valid spatial string after sigil \"@\", \
@@ -844,7 +844,7 @@ impl BoltPath {
 
         let mut unique_relationships = IndexMap::with_capacity(relationships.len());
         for (i, relationship) in relationships.iter().enumerate() {
-            let idx = P::relationship_index(&relationship);
+            let idx = P::relationship_index(relationship);
             if let Some(other_relationship) = unique_relationships.get(idx) {
                 if other_relationship != relationship {
                     return Err(ParseError::new(format!(
@@ -1006,7 +1006,7 @@ fn check_last_field(
     field_num: usize,
     sigil: &str,
 ) -> Result<(), ParseError> {
-    if let Some(_) = fields.next() {
+    if fields.next().is_some() {
         return Err(ParseError::new(format!(
             "Too many fields after sigil \"{sigil}\", expected {}",
             field_num + 1
