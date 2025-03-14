@@ -11,7 +11,7 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
 };
 use crate::values;
-use crate::values::value::Struct;
+use crate::values::bolt_value::Struct;
 use crate::values::BoltMessage;
 
 pub struct NetActor<T> {
@@ -677,9 +677,9 @@ fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> Result<BoltMessage
         ));
     }
 
-    let value =
-        values::value::Value::from_data_consume_all(&data).context("Parsing bolt message")?;
-    let values::value::Value::Struct(Struct { tag, fields }) = value else {
+    let value = values::bolt_value::PackStreamValue::from_data_consume_all(&data)
+        .context("Parsing bolt message")?;
+    let values::bolt_value::PackStreamValue::Struct(Struct { tag, fields }) = value else {
         return Err(anyhow!("Expected a bolt message but got: {:?}.", value));
     };
     // TODO: get rid of the debug format and properly log the message in a pretty format

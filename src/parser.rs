@@ -22,11 +22,11 @@ use crate::types::actor_types::{
 };
 use crate::types::{ScanBlock, Script};
 use crate::util::opt_res_ret;
+use crate::values::bolt_value::{PackStreamValue, Struct};
 use crate::values::structs::{
     BoltDate, BoltDateTime, BoltDuration, BoltNode, BoltPath, BoltPoint, BoltRelationship,
     BoltTime, TAG_DATE, TAG_DURATION, TAG_LOCAL_TIME, TAG_POINT_2D, TAG_POINT_3D, TAG_TIME,
 };
-use crate::values::value::{Struct, Value};
 use crate::values::BoltMessage;
 
 #[derive(Debug)]
@@ -46,8 +46,9 @@ pub struct ActorConfig {
 }
 
 type Result<T> = StdResult<T, ParseError>;
-type ValidateValueFn = Box<dyn Fn(&Value) -> anyhow::Result<()> + 'static + Send + Sync>;
-type ValidateValuesFn = Box<dyn Fn(&[Value]) -> anyhow::Result<()> + 'static + Send + Sync>;
+type ValidateValueFn = Box<dyn Fn(&PackStreamValue) -> anyhow::Result<()> + 'static + Send + Sync>;
+type ValidateValuesFn =
+    Box<dyn Fn(&[PackStreamValue]) -> anyhow::Result<()> + 'static + Send + Sync>;
 
 pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
     fn script_excerpt(script: &str, start: usize, end: usize) -> String {
@@ -396,8 +397,8 @@ fn create_message_sender(
     )))
 }
 
-fn message_data(tag: u8, fields: Vec<Value>) -> Vec<u8> {
-    Value::Struct(Struct { tag, fields }).to_data()
+fn message_data(tag: u8, fields: Vec<PackStreamValue>) -> Vec<u8> {
+    PackStreamValue::Struct(Struct { tag, fields }).to_data()
 }
 
 struct SenderBytes {
@@ -444,7 +445,7 @@ impl ServerMessageSender for SenderBytes {
     }
 }
 
-fn transcode_body(msg: Option<&str>, config: &ActorConfig) -> Result<Vec<Value>> {
+fn transcode_body(msg: Option<&str>, config: &ActorConfig) -> Result<Vec<PackStreamValue>> {
     let Some(msg) = msg else {
         return Ok(vec![]);
     };
@@ -456,19 +457,23 @@ fn transcode_body(msg: Option<&str>, config: &ActorConfig) -> Result<Vec<Value>>
         .collect()
 }
 
-pub(crate) fn transcode_field(field: JsonValue, config: &ActorConfig) -> Result<Value> {
+pub(crate) fn transcode_field(field: JsonValue, config: &ActorConfig) -> Result<PackStreamValue> {
     Ok(match field {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(value) => Value::Boolean(value),
-        JsonValue::Number(value) if value.is_i64() => Value::Integer(value.as_i64().unwrap()),
-        JsonValue::Number(value) if value.is_f64() => Value::Float(value.as_f64().unwrap()),
+        JsonValue::Null => PackStreamValue::Null,
+        JsonValue::Bool(value) => PackStreamValue::Boolean(value),
+        JsonValue::Number(value) if value.is_i64() => {
+            PackStreamValue::Integer(value.as_i64().unwrap())
+        }
+        JsonValue::Number(value) if value.is_f64() => {
+            PackStreamValue::Float(value.as_f64().unwrap())
+        }
         JsonValue::Number(value) => {
             return Err(ParseError::new(format!(
                 "Can't parse number (must be i64 or f64) {value:?}",
             )));
         }
-        JsonValue::String(value) => Value::String(value),
-        JsonValue::Array(value) => Value::List(
+        JsonValue::String(value) => PackStreamValue::String(value),
+        JsonValue::Array(value) => PackStreamValue::List(
             value
                 .into_iter()
                 .map(|v| transcode_field(v, config))
@@ -480,7 +485,7 @@ pub(crate) fn transcode_field(field: JsonValue, config: &ActorConfig) -> Result<
                 IsJoltValue::No(value) => value,
             };
 
-            Value::Map(
+            PackStreamValue::Dict(
                 value
                     .into_iter()
                     .map(|(k, v)| transcode_field(v, config).map(|v| (k, v)))
@@ -491,7 +496,7 @@ pub(crate) fn transcode_field(field: JsonValue, config: &ActorConfig) -> Result<
 }
 
 enum IsJoltValue {
-    Yes(Value),
+    Yes(PackStreamValue),
     No(JsonMap<String, JsonValue>),
 }
 
@@ -537,7 +542,7 @@ fn transcode_jolt_value(
                     "Failed to parse f64 after sigil \"R\": {value:?} because {e}",
                 ))
             })?;
-            IsJoltValue::Yes(Value::Float(value))
+            IsJoltValue::Yes(PackStreamValue::Float(value))
         }
         "U" => {
             if !value.is_string() {
@@ -549,7 +554,7 @@ fn transcode_jolt_value(
         }
         "#" => {
             let bytes = parse_jolt_bytes(value)?;
-            IsJoltValue::Yes(Value::Bytes(bytes))
+            IsJoltValue::Yes(PackStreamValue::Bytes(bytes))
         }
         "[]" => {
             if !value.is_array() {
@@ -592,51 +597,54 @@ fn transcode_jolt_value(
                 )));
             };
             let bolt_point = BoltPoint::parse(&value)?;
-            IsJoltValue::Yes(Value::Struct(bolt_point.as_struct()))
+            IsJoltValue::Yes(PackStreamValue::Struct(bolt_point.as_struct()))
         }
         "()" => {
             let bolt_node = BoltNode::parse(value, jolt_version, config)?;
-            IsJoltValue::Yes(Value::Struct(bolt_node.into_struct()))
+            IsJoltValue::Yes(PackStreamValue::Struct(bolt_node.into_struct()))
         }
         "->" => {
             let bolt_relationship = BoltRelationship::parse(value, jolt_version, config)?;
-            IsJoltValue::Yes(Value::Struct(bolt_relationship.into_struct()))
+            IsJoltValue::Yes(PackStreamValue::Struct(bolt_relationship.into_struct()))
         }
         "<-" => {
             let mut bolt_relationship = BoltRelationship::parse(value, jolt_version, config)?;
             bolt_relationship.flip_direction();
-            IsJoltValue::Yes(Value::Struct(bolt_relationship.into_struct()))
+            IsJoltValue::Yes(PackStreamValue::Struct(bolt_relationship.into_struct()))
         }
         ".." => {
             let bolt_path = BoltPath::parse(value, jolt_version, config)?;
-            IsJoltValue::Yes(Value::Struct(bolt_path.into_struct()))
+            IsJoltValue::Yes(PackStreamValue::Struct(bolt_path.into_struct()))
         }
         _ => IsJoltValue::No([(sigil, value)].into_iter().collect()),
     })
 }
 
-fn transcode_date_value(s: &str) -> Option<Result<Value>> {
+fn transcode_date_value(s: &str) -> Option<Result<PackStreamValue>> {
     let bolt_date = opt_res_ret!(BoltDate::parse(s));
     let value_struct = opt_res_ret!(bolt_date.as_struct());
-    Some(Ok(Value::Struct(value_struct)))
+    Some(Ok(PackStreamValue::Struct(value_struct)))
 }
 
-fn transcode_time_value(s: &str) -> Option<Result<Value>> {
+fn transcode_time_value(s: &str) -> Option<Result<PackStreamValue>> {
     let bolt_time = opt_res_ret!(BoltTime::parse(s));
     let value_struct = opt_res_ret!(bolt_time.as_struct());
-    Some(Ok(Value::Struct(value_struct)))
+    Some(Ok(PackStreamValue::Struct(value_struct)))
 }
 
-fn transcode_date_time_value(s: &str, jolt_version: JoltVersion) -> Option<Result<Value>> {
+fn transcode_date_time_value(
+    s: &str,
+    jolt_version: JoltVersion,
+) -> Option<Result<PackStreamValue>> {
     let bolt_date_time = opt_res_ret!(BoltDateTime::parse(s));
     let value_struct = opt_res_ret!(bolt_date_time.as_struct(jolt_version));
-    Some(Ok(Value::Struct(value_struct)))
+    Some(Ok(PackStreamValue::Struct(value_struct)))
 }
 
-fn transcode_duration_value(s: &str) -> Option<Result<Value>> {
+fn transcode_duration_value(s: &str) -> Option<Result<PackStreamValue>> {
     let bolt_duration = opt_res_ret!(BoltDuration::parse(s));
     let value_struct = opt_res_ret!(bolt_duration.as_struct());
-    Some(Ok(Value::Struct(value_struct)))
+    Some(Ok(PackStreamValue::Struct(value_struct)))
 }
 
 struct ValidatorImpl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> {
@@ -693,7 +701,7 @@ fn create_validator(
     }))
 }
 
-fn build_no_fields_validator(message: &[Value]) -> anyhow::Result<()> {
+fn build_no_fields_validator(message: &[PackStreamValue]) -> anyhow::Result<()> {
     match message.len() {
         0 => Ok(()),
         _ => Err(anyhow!("Expected 0 fields")),
@@ -703,17 +711,17 @@ fn build_no_fields_validator(message: &[Value]) -> anyhow::Result<()> {
 fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<ValidateValueFn> {
     Ok(match field {
         JsonValue::Null => Box::new(|msg| match msg {
-            Value::Null => Ok(()),
+            PackStreamValue::Null => Ok(()),
             _ => Err(anyhow!("Expected null")),
         }),
         JsonValue::Bool(expected) => Box::new(move |msg| match msg {
-            Value::Boolean(received) if received == &expected => Ok(()),
+            PackStreamValue::Boolean(received) if received == &expected => Ok(()),
             _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
         }),
         JsonValue::Number(expected) if expected.is_i64() => {
             let expected = expected.as_i64().expect("checked in match arm");
             Box::new(move |msg| match msg {
-                Value::Integer(received) if received == &expected => Ok(()),
+                PackStreamValue::Integer(received) if received == &expected => Ok(()),
                 _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
             })
         }
@@ -724,7 +732,7 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
                 "json does not allow for NaN or Inf. Therefore, we don't handle those here",
             );
             Box::new(move |msg| match msg {
-                Value::Float(received) if received == &expected => Ok(()),
+                PackStreamValue::Float(received) if received == &expected => Ok(()),
                 _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
             })
         }
@@ -735,7 +743,7 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
         }
         JsonValue::String(expected) => Box::new(move |msg| match msg {
             _ if expected == "*" => Ok(()),
-            Value::String(received) => validate_str_field_eq(&expected, received),
+            PackStreamValue::String(received) => validate_str_field_eq(&expected, received),
             _ => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
         }),
         JsonValue::Array(expected) => {
@@ -744,7 +752,7 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
                 .map(|value| build_field_validator(value, config))
                 .collect::<Result<Vec<_>>>()?;
             Box::new(move |msg| {
-                let Value::List(received) = msg else {
+                let PackStreamValue::List(received) = msg else {
                     return Err(anyhow!("Expected list, found {:?}", msg));
                 };
                 if validators.len() != received.len() {
@@ -798,7 +806,7 @@ fn build_map_validator(
         .collect::<Result<HashMap<_, _>>>()?;
 
     Ok(Box::new(move |msg| {
-        let Value::Map(received) = msg else {
+        let PackStreamValue::Dict(received) = msg else {
             return Err(anyhow!("Expected map, found {:?}", msg));
         };
 
@@ -854,7 +862,7 @@ fn build_map_entry_validator(
                 .map(|value| build_field_validator(value, config))
                 .collect::<Result<Vec<_>>>()?;
             Box::new(move |msg| {
-                let Value::List(received) = msg else {
+                let PackStreamValue::List(received) = msg else {
                     return Err(anyhow!("Expected list, found {:?}", msg));
                 };
                 if validators.len() != received.len() {
@@ -919,7 +927,7 @@ fn build_jolt_validator(
     Ok(match versionless_sigil {
         "?" => {
             if is_match_all(&expected) {
-                match_any!("bool", Value::Boolean(_));
+                match_any!("bool", PackStreamValue::Boolean(_));
             }
             if !expected.is_boolean() {
                 return Err(ParseError::new(format!(
@@ -930,7 +938,7 @@ fn build_jolt_validator(
         }
         "Z" => {
             if is_match_all(&expected) {
-                match_any!("integer", Value::Integer(_));
+                match_any!("integer", PackStreamValue::Integer(_));
             }
             let JsonValue::String(expected) = expected else {
                 return Err(ParseError::new(format!(
@@ -949,7 +957,7 @@ fn build_jolt_validator(
         }
         "R" => {
             if is_match_all(&expected) {
-                match_any!("float", Value::Float(_));
+                match_any!("float", PackStreamValue::Float(_));
             }
             let JsonValue::String(expected) = expected else {
                 return Err(ParseError::new(format!(
@@ -961,14 +969,16 @@ fn build_jolt_validator(
                     "Failed to parse f64 after sigil \"R\": {expected:?} because {e}",
                 ))
             })?;
-            IsJoltValidator::Yes(Box::new(move |msg| match msg == &Value::Float(expected) {
-                true => Ok(()),
-                false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+            IsJoltValidator::Yes(Box::new(move |msg| {
+                match msg == &PackStreamValue::Float(expected) {
+                    true => Ok(()),
+                    false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
+                }
             }))
         }
         "U" => {
             if is_match_all(&expected) {
-                match_any!("string", Value::String(_));
+                match_any!("string", PackStreamValue::String(_));
             }
             if !expected.is_string() {
                 return Err(ParseError::new(format!(
@@ -979,17 +989,17 @@ fn build_jolt_validator(
         }
         "#" => {
             if is_match_all(&expected) {
-                match_any!("bytes", Value::Bytes(_));
+                match_any!("bytes", PackStreamValue::Bytes(_));
             }
             let bytes = parse_jolt_bytes(expected)?;
             IsJoltValidator::Yes(Box::new(move |msg| match msg {
-                Value::Bytes(received) if &bytes == received => Ok(()),
+                PackStreamValue::Bytes(received) if &bytes == received => Ok(()),
                 _ => Err(anyhow!("Expected bytes {:?} found {:?}", &bytes, msg)),
             }))
         }
         "[]" => {
             if is_match_all(&expected) {
-                match_any!("list", Value::List(_));
+                match_any!("list", PackStreamValue::List(_));
             }
             if !expected.is_array() {
                 return Err(ParseError::new(format!(
@@ -1000,7 +1010,7 @@ fn build_jolt_validator(
         }
         "{}" => {
             if is_match_all(&expected) {
-                match_any!("map", Value::Map(_));
+                match_any!("map", PackStreamValue::Dict(_));
             }
             let JsonValue::Object(expected) = expected else {
                 return Err(ParseError::new(format!(
@@ -1030,16 +1040,19 @@ fn build_jolt_validator(
         "@" => {
             if is_match_all(&expected) {
                 return Ok(IsJoltValidator::Yes(Box::new(|msg| match msg {
-                    Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                        (&TAG_POINT_2D, [Value::Integer(_), Value::Float(_), Value::Float(_)]) => {
-                            Ok(())
+                    PackStreamValue::Struct(Struct { tag, fields }) => {
+                        match (tag, fields.as_slice()) {
+                            (
+                                &TAG_POINT_2D,
+                                [PackStreamValue::Integer(_), PackStreamValue::Float(_), PackStreamValue::Float(_)],
+                            ) => Ok(()),
+                            (
+                                &TAG_POINT_3D,
+                                [PackStreamValue::Integer(_), PackStreamValue::Float(_), PackStreamValue::Float(_), PackStreamValue::Float(_)],
+                            ) => Ok(()),
+                            _ => Err(anyhow!("Expected any date struct found {msg:?}")),
                         }
-                        (
-                            &TAG_POINT_3D,
-                            [Value::Integer(_), Value::Float(_), Value::Float(_), Value::Float(_)],
-                        ) => Ok(()),
-                        _ => Err(anyhow!("Expected any date struct found {msg:?}")),
-                    },
+                    }
                     _ => Err(anyhow!("Expected any spatial struct found {msg:?}")),
                 })));
             }
@@ -1049,7 +1062,7 @@ fn build_jolt_validator(
                 )));
             };
             let bolt_point = BoltPoint::parse(&expected)?;
-            let expected = Value::Struct(bolt_point.as_struct());
+            let expected = PackStreamValue::Struct(bolt_point.as_struct());
             IsJoltValidator::Yes(Box::new(move |msg| match msg == &expected {
                 true => Ok(()),
                 false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
@@ -1205,8 +1218,8 @@ fn parse_hex_string(s: &str) -> Result<Vec<u8>> {
 fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
-            Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                (&TAG_DATE, [Value::Integer(_)]) => Ok(()),
+            PackStreamValue::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
+                (&TAG_DATE, [PackStreamValue::Integer(_)]) => Ok(()),
                 _ => Err(anyhow!("Expected any date struct found {msg:?}")),
             },
             _ => Err(anyhow!("Expected any date struct found {msg:?}")),
@@ -1236,9 +1249,9 @@ fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
 fn build_time_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
-            Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                (&TAG_LOCAL_TIME, [Value::Integer(_)]) => Ok(()),
-                (&TAG_TIME, [Value::Integer(_), Value::Integer(_)]) => Ok(()),
+            PackStreamValue::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
+                (&TAG_LOCAL_TIME, [PackStreamValue::Integer(_)]) => Ok(()),
+                (&TAG_TIME, [PackStreamValue::Integer(_), PackStreamValue::Integer(_)]) => Ok(()),
                 _ => Err(anyhow!("Expected any time struct found {msg:?}")),
             },
             _ => Err(anyhow!("Expected any time struct found {msg:?}")),
@@ -1264,30 +1277,32 @@ fn build_date_time_validator(
 ) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(move |msg| match msg {
-            Value::Struct(Struct { tag, fields }) => match (jolt_version, tag, fields.as_slice()) {
-                (
-                    JoltVersion::V1,
-                    0x66,
-                    [Value::Integer(_), Value::Integer(_), Value::String(_)],
-                ) => Ok(()),
-                (
-                    JoltVersion::V2,
-                    0x69,
-                    [Value::Integer(_), Value::Integer(_), Value::String(_)],
-                ) => Ok(()),
-                (
-                    JoltVersion::V1,
-                    0x46,
-                    [Value::Integer(_), Value::Integer(_), Value::Integer(_)],
-                ) => Ok(()),
-                (
-                    JoltVersion::V2,
-                    0x49,
-                    [Value::Integer(_), Value::Integer(_), Value::Integer(_)],
-                ) => Ok(()),
-                (_, 0x64, [Value::Integer(_), Value::Integer(_)]) => Ok(()),
-                _ => Err(anyhow!("Expected any date time struct found {msg:?}")),
-            },
+            PackStreamValue::Struct(Struct { tag, fields }) => {
+                match (jolt_version, tag, fields.as_slice()) {
+                    (
+                        JoltVersion::V1,
+                        0x66,
+                        [PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::String(_)],
+                    ) => Ok(()),
+                    (
+                        JoltVersion::V2,
+                        0x69,
+                        [PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::String(_)],
+                    ) => Ok(()),
+                    (
+                        JoltVersion::V1,
+                        0x46,
+                        [PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_)],
+                    ) => Ok(()),
+                    (
+                        JoltVersion::V2,
+                        0x49,
+                        [PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_)],
+                    ) => Ok(()),
+                    (_, 0x64, [PackStreamValue::Integer(_), PackStreamValue::Integer(_)]) => Ok(()),
+                    _ => Err(anyhow!("Expected any date time struct found {msg:?}")),
+                }
+            }
             _ => Err(anyhow!("Expected any date time struct found {msg:?}")),
         })));
     }
@@ -1310,10 +1325,10 @@ fn build_date_time_validator(
 fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
-            Value::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
+            PackStreamValue::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
                 (
                     &TAG_DURATION,
-                    [Value::Integer(_), Value::Integer(_), Value::Integer(_), Value::Integer(_)],
+                    [PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_)],
                 ) => Ok(()),
                 _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
             },
@@ -1328,7 +1343,7 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     } = opt_res_ret!(BoltDuration::parse(s));
     let total_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
     Some(Ok(Box::new(move |msg| match msg {
-        Value::Struct(received) => {
+        PackStreamValue::Struct(received) => {
             if received.tag != TAG_DURATION {
                 return Err(anyhow!(
                     "Expected duration (tag {TAG_DURATION:#X}), found {msg:?}",
@@ -1340,7 +1355,7 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
                         "Received invalid duration: {:?} (missing {name})",
                         received
                     )),
-                    Some(Value::Integer(value)) => Ok(*value),
+                    Some(PackStreamValue::Integer(value)) => Ok(*value),
                     Some(_) => Err(anyhow!(
                         "Received invalid duration: {:?} ({name} not integer)",
                         received
@@ -1376,7 +1391,7 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
 }
 
 fn build_struct_match_validator(expected: Struct) -> ValidateValueFn {
-    let expected = Value::Struct(expected);
+    let expected = PackStreamValue::Struct(expected);
     Box::new(move |msg| match msg == &expected {
         true => Ok(()),
         false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
@@ -1603,8 +1618,8 @@ mod test {
 
         let cm = BoltMessage::new(
             0x01,
-            vec![Value::Map(
-                indexmap! {String::from("foo") => Value::String(String::from("bar"))},
+            vec![PackStreamValue::Dict(
+                indexmap! {String::from("foo") => PackStreamValue::String(String::from("bar"))},
             )],
             BoltVersion::V5_0,
         );

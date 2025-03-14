@@ -24,27 +24,26 @@ use usize_cast::FromUsize;
 #[allow(unused)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub enum Value {
+pub enum PackStreamValue {
     Null,
     Boolean(bool),
     Integer(i64),
     Float(f64),
     Bytes(Vec<u8>),
     String(String),
-    List(Vec<Value>),
-    // TODO: rename to Dict to match PackStream terminology
-    Map(IndexMap<String, Value>),
+    List(Vec<PackStreamValue>),
+    Dict(IndexMap<String, PackStreamValue>),
     Struct(Struct),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Struct {
     pub tag: u8,
-    pub fields: Vec<Value>,
+    pub fields: Vec<PackStreamValue>,
 }
 
-impl Value {
-    pub(crate) fn from_data_consume_all(data: &[u8]) -> Result<Value> {
+impl PackStreamValue {
+    pub(crate) fn from_data_consume_all(data: &[u8]) -> Result<PackStreamValue> {
         let mut decoder = PackStreamDecoder::new(data, 0);
         let value = decoder.read()?;
         if decoder.index != data.len() {
@@ -66,31 +65,37 @@ impl Value {
     }
 }
 
-impl PartialEq for Value {
+impl PartialEq for PackStreamValue {
     fn eq(&self, other: &Self) -> bool {
         match self {
-            Value::Null => matches!(other, Value::Null),
-            Value::Boolean(v1) => matches!(other, Value::Boolean(v2) if v1 == v2),
-            Value::Integer(v1) => matches!(other, Value::Integer(v2) if v1 == v2),
-            Value::Float(v1) => match other {
-                Value::Float(v2) => v1.is_nan() && v2.is_nan() || v1.to_bits() == v2.to_bits(),
+            PackStreamValue::Null => matches!(other, PackStreamValue::Null),
+            PackStreamValue::Boolean(v1) => {
+                matches!(other, PackStreamValue::Boolean(v2) if v1 == v2)
+            }
+            PackStreamValue::Integer(v1) => {
+                matches!(other, PackStreamValue::Integer(v2) if v1 == v2)
+            }
+            PackStreamValue::Float(v1) => match other {
+                PackStreamValue::Float(v2) => {
+                    v1.is_nan() && v2.is_nan() || v1.to_bits() == v2.to_bits()
+                }
                 _ => false,
             },
-            Value::Bytes(v1) => matches!(other, Value::Bytes(v2) if v1 == v2),
-            Value::String(v1) => matches!(other, Value::String(v2) if v1 == v2),
-            Value::List(v1) => matches!(other, Value::List(v2) if v1 == v2),
-            Value::Map(v1) => matches!(other, Value::Map(v2) if v1 == v2),
-            Value::Struct(v1) => matches!(other, Value::Struct(v2) if v1 == v2),
+            PackStreamValue::Bytes(v1) => matches!(other, PackStreamValue::Bytes(v2) if v1 == v2),
+            PackStreamValue::String(v1) => matches!(other, PackStreamValue::String(v2) if v1 == v2),
+            PackStreamValue::List(v1) => matches!(other, PackStreamValue::List(v2) if v1 == v2),
+            PackStreamValue::Dict(v1) => matches!(other, PackStreamValue::Dict(v2) if v1 == v2),
+            PackStreamValue::Struct(v1) => matches!(other, PackStreamValue::Struct(v2) if v1 == v2),
         }
     }
 }
 
-impl Eq for Value {}
+impl Eq for PackStreamValue {}
 
 macro_rules! impl_value_from_into {
     ( $value:expr, $($ty:ty),* ) => {
         $(
-            impl From<$ty> for Value {
+            impl From<$ty> for PackStreamValue {
                 fn from(value: $ty) -> Self {
                     $value(value.into())
                 }
@@ -102,7 +107,7 @@ macro_rules! impl_value_from_into {
 macro_rules! impl_value_from_owned {
     ( $value:expr, $($ty:ty),* ) => {
         $(
-            impl From<$ty> for Value {
+            impl From<$ty> for PackStreamValue {
                 fn from(value: $ty) -> Self {
                     $value(value)
                 }
@@ -111,66 +116,66 @@ macro_rules! impl_value_from_owned {
     };
 }
 
-impl_value_from_into!(Value::Boolean, bool);
-impl_value_from_into!(Value::Integer, u8, u16, u32, i8, i16, i32, i64);
-impl_value_from_into!(Value::Float, f32, f64);
-impl_value_from_into!(Value::String, &str);
-impl_value_from_into!(Value::Bytes, &[u8]);
+impl_value_from_into!(PackStreamValue::Boolean, bool);
+impl_value_from_into!(PackStreamValue::Integer, u8, u16, u32, i8, i16, i32, i64);
+impl_value_from_into!(PackStreamValue::Float, f32, f64);
+impl_value_from_into!(PackStreamValue::String, &str);
+impl_value_from_into!(PackStreamValue::Bytes, &[u8]);
 
-impl_value_from_owned!(Value::String, String);
-impl_value_from_owned!(Value::Struct, Struct);
+impl_value_from_owned!(PackStreamValue::String, String);
+impl_value_from_owned!(PackStreamValue::Struct, Struct);
 // impl_value_from_owned!(Value::List, Vec<Value>);
 // impl_value_from_owned!(Value::Map, HashMap<String, Value>);
-impl<T: Into<Value>> From<IndexMap<String, T>> for Value {
+impl<T: Into<PackStreamValue>> From<IndexMap<String, T>> for PackStreamValue {
     fn from(value: IndexMap<String, T>) -> Self {
-        Value::Map(value.into_iter().map(|(k, v)| (k, v.into())).collect())
+        PackStreamValue::Dict(value.into_iter().map(|(k, v)| (k, v.into())).collect())
     }
 }
 
-impl<T: Into<Value>> From<Vec<T>> for Value {
+impl<T: Into<PackStreamValue>> From<Vec<T>> for PackStreamValue {
     fn from(value: Vec<T>) -> Self {
-        Value::List(value.into_iter().map(|v| v.into()).collect())
+        PackStreamValue::List(value.into_iter().map(|v| v.into()).collect())
     }
 }
 
-impl<T: Into<Value>> From<Option<T>> for Value {
+impl<T: Into<PackStreamValue>> From<Option<T>> for PackStreamValue {
     fn from(value: Option<T>) -> Self {
         match value {
-            None => Value::Null,
+            None => PackStreamValue::Null,
             Some(v) => v.into(),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        matches!(self, PackStreamValue::Null)
     }
 }
 
-impl TryFrom<Value> for bool {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for bool {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::Boolean(v) => Ok(v),
+            PackStreamValue::Boolean(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_bool(&self) -> bool {
-        matches!(self, Value::Boolean(_))
+        matches!(self, PackStreamValue::Boolean(_))
     }
 
     #[inline]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
-            Value::Boolean(v) => Some(*v),
+            PackStreamValue::Boolean(v) => Some(*v),
             _ => None,
         }
     }
@@ -182,28 +187,28 @@ impl Value {
     }
 }
 
-impl TryFrom<Value> for i64 {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for i64 {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::Integer(v) => Ok(v),
+            PackStreamValue::Integer(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_int(&self) -> bool {
-        matches!(self, Value::Integer(_))
+        matches!(self, PackStreamValue::Integer(_))
     }
 
     #[inline]
     pub fn as_int(&self) -> Option<i64> {
         match self {
-            Value::Integer(v) => Some(*v),
+            PackStreamValue::Integer(v) => Some(*v),
             _ => None,
         }
     }
@@ -215,28 +220,28 @@ impl Value {
     }
 }
 
-impl TryFrom<Value> for f64 {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for f64 {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::Float(v) => Ok(v),
+            PackStreamValue::Float(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_float(&self) -> bool {
-        matches!(self, Value::Float(_))
+        matches!(self, PackStreamValue::Float(_))
     }
 
     #[inline]
     pub fn as_float(&self) -> Option<f64> {
         match self {
-            Value::Float(v) => Some(*v),
+            PackStreamValue::Float(v) => Some(*v),
             _ => None,
         }
     }
@@ -248,28 +253,28 @@ impl Value {
     }
 }
 
-impl TryFrom<Value> for Vec<u8> {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for Vec<u8> {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::Bytes(v) => Ok(v),
+            PackStreamValue::Bytes(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_bytes(&self) -> bool {
-        matches!(self, Value::Bytes(_))
+        matches!(self, PackStreamValue::Bytes(_))
     }
 
     #[inline]
     pub fn as_bytes(&self) -> Option<&Vec<u8>> {
         match self {
-            Value::Bytes(v) => Some(v),
+            PackStreamValue::Bytes(v) => Some(v),
             _ => None,
         }
     }
@@ -281,28 +286,28 @@ impl Value {
     }
 }
 
-impl TryFrom<Value> for String {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for String {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::String(v) => Ok(v),
+            PackStreamValue::String(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_string(&self) -> bool {
-        matches!(self, Value::String(_))
+        matches!(self, PackStreamValue::String(_))
     }
 
     #[inline]
     pub fn as_string(&self) -> Option<&String> {
         match self {
-            Value::String(v) => Some(v),
+            PackStreamValue::String(v) => Some(v),
             _ => None,
         }
     }
@@ -314,101 +319,101 @@ impl Value {
     }
 }
 
-impl TryFrom<Value> for Vec<Value> {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for Vec<PackStreamValue> {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::List(v) => Ok(v),
+            PackStreamValue::List(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_list(&self) -> bool {
-        matches!(self, Value::List(_))
+        matches!(self, PackStreamValue::List(_))
     }
 
     #[inline]
-    pub fn as_list(&self) -> Option<&[Value]> {
+    pub fn as_list(&self) -> Option<&[PackStreamValue]> {
         match self {
-            Value::List(v) => Some(v),
+            PackStreamValue::List(v) => Some(v),
             _ => None,
         }
     }
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_list(self) -> Result<Vec<Value>, Self> {
+    pub fn try_into_list(self) -> Result<Vec<PackStreamValue>, Self> {
         self.try_into()
     }
 }
 
-impl TryFrom<Value> for IndexMap<String, Value> {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for IndexMap<String, PackStreamValue> {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::Map(v) => Ok(v),
+            PackStreamValue::Dict(v) => Ok(v),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_map(&self) -> bool {
-        matches!(self, Value::Map(_))
+        matches!(self, PackStreamValue::Dict(_))
     }
 
     #[inline]
-    pub fn as_map(&self) -> Option<&IndexMap<String, Value>> {
+    pub fn as_map(&self) -> Option<&IndexMap<String, PackStreamValue>> {
         match self {
-            Value::Map(v) => Some(v),
+            PackStreamValue::Dict(v) => Some(v),
             _ => None,
         }
     }
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_map(self) -> Result<IndexMap<String, Value>, Self> {
+    pub fn try_into_map(self) -> Result<IndexMap<String, PackStreamValue>, Self> {
         self.try_into()
     }
 }
 
-impl TryFrom<Value> for (u8, Vec<Value>) {
-    type Error = Value;
+impl TryFrom<PackStreamValue> for (u8, Vec<PackStreamValue>) {
+    type Error = PackStreamValue;
 
     #[inline]
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            Value::Struct(Struct { tag, fields }) => Ok((tag, fields)),
+            PackStreamValue::Struct(Struct { tag, fields }) => Ok((tag, fields)),
             _ => Err(value),
         }
     }
 }
 
-impl Value {
+impl PackStreamValue {
     #[inline]
     pub fn is_struct(&self) -> bool {
-        matches!(self, Value::Struct(_))
+        matches!(self, PackStreamValue::Struct(_))
     }
 
     #[inline]
-    pub fn as_struct(&self) -> Option<(u8, &Vec<Value>)> {
+    pub fn as_struct(&self) -> Option<(u8, &Vec<PackStreamValue>)> {
         match self {
-            Value::Struct(Struct { tag, fields }) => Some((*tag, fields)),
+            PackStreamValue::Struct(Struct { tag, fields }) => Some((*tag, fields)),
             _ => None,
         }
     }
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_struct(self) -> Result<(u8, Vec<Value>), Self> {
+    pub fn try_into_struct(self) -> Result<(u8, Vec<PackStreamValue>), Self> {
         self.try_into()
     }
 }
@@ -448,18 +453,18 @@ impl<'a> PackStreamDecoder<'a> {
         Self { bytes, index: idx }
     }
 
-    fn read(&mut self) -> Result<Value> {
+    fn read(&mut self) -> Result<PackStreamValue> {
         let marker = self.read_byte()?;
         self.read_value(marker)
     }
 
-    fn read_value(&mut self, marker: u8) -> Result<Value> {
+    fn read_value(&mut self, marker: u8) -> Result<PackStreamValue> {
         let high_nibble = marker & 0xF0;
 
         Ok(match marker {
             // tiny int
             _ if marker as i8 >= -16 => marker.into(),
-            NULL => Value::Null,
+            NULL => PackStreamValue::Null,
             FLOAT_64 => self.read_f64()?.into(),
             FALSE => false.into(),
             TRUE => true.into(),
@@ -526,7 +531,7 @@ impl<'a> PackStreamDecoder<'a> {
         })
     }
 
-    fn read_list(&mut self, length: usize) -> Result<Value> {
+    fn read_list(&mut self, length: usize) -> Result<PackStreamValue> {
         let mut items = Vec::with_capacity(length);
         for _ in 0..length {
             items.push(self.read()?);
@@ -534,11 +539,11 @@ impl<'a> PackStreamDecoder<'a> {
         Ok(items.into())
     }
 
-    fn read_string(&mut self, length: usize) -> Result<Value> {
+    fn read_string(&mut self, length: usize) -> Result<PackStreamValue> {
         self.read_raw_string(length).map(Into::into)
     }
 
-    fn read_map(&mut self, length: usize) -> Result<Value> {
+    fn read_map(&mut self, length: usize) -> Result<PackStreamValue> {
         let mut key_value_pairs = IndexMap::with_capacity(length);
         for _ in 0..length {
             let len = self.read_string_length()?;
@@ -549,19 +554,19 @@ impl<'a> PackStreamDecoder<'a> {
         Ok(key_value_pairs.into())
     }
 
-    fn read_bytes(&mut self, length: usize) -> Result<Value> {
+    fn read_bytes(&mut self, length: usize) -> Result<PackStreamValue> {
         let data = self.bytes.get(self.index..self.index + length);
         self.index += length;
         Ok(data.into())
     }
 
-    fn read_struct(&mut self, length: usize) -> Result<Value> {
+    fn read_struct(&mut self, length: usize) -> Result<PackStreamValue> {
         let tag = self.read_byte()?;
         let mut fields = Vec::with_capacity(length);
         for _ in 0..length {
             fields.push(self.read()?)
         }
-        let bolt_struct = Value::Struct(Struct { tag, fields });
+        let bolt_struct = PackStreamValue::Struct(Struct { tag, fields });
         Ok(bolt_struct)
     }
 
@@ -654,28 +659,28 @@ impl<'a> PackStreamSerializer<'a> {
         Self { data: writer }
     }
 
-    pub fn write(&mut self, value: &Value) {
+    pub fn write(&mut self, value: &PackStreamValue) {
         match value {
-            Value::Null => self.write_null(),
-            Value::Boolean(b) => self.write_bool(*b),
-            Value::Integer(i) => self.write_int(*i),
-            Value::Float(f) => self.write_float(*f),
-            Value::Bytes(b) => self.write_bytes(b),
-            Value::String(s) => self.write_string(s),
-            Value::List(l) => {
+            PackStreamValue::Null => self.write_null(),
+            PackStreamValue::Boolean(b) => self.write_bool(*b),
+            PackStreamValue::Integer(i) => self.write_int(*i),
+            PackStreamValue::Float(f) => self.write_float(*f),
+            PackStreamValue::Bytes(b) => self.write_bytes(b),
+            PackStreamValue::String(s) => self.write_string(s),
+            PackStreamValue::List(l) => {
                 self.write_list_header(u64::from_usize(l.len()));
                 for value in l {
                     self.write(value);
                 }
             }
-            Value::Map(m) => {
+            PackStreamValue::Dict(m) => {
                 self.write_dict_header(u64::from_usize(m.len()));
                 for (k, v) in m {
                     self.write_string(k);
                     self.write(v);
                 }
             }
-            Value::Struct(Struct { tag, fields }) => {
+            PackStreamValue::Struct(Struct { tag, fields }) => {
                 self.write_struct_header(
                     *tag,
                     fields

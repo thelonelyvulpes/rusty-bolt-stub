@@ -15,7 +15,7 @@ use crate::bolt_version::JoltVersion;
 use crate::parse_error::ParseError;
 use crate::parser::{transcode_field, ActorConfig};
 use crate::util::opt_res_ret;
-use crate::values::value::{Struct, Value};
+use crate::values::bolt_value::{PackStreamValue, Struct};
 
 pub(crate) const TAG_POINT_2D: u8 = 0x58;
 pub(crate) const TAG_POINT_3D: u8 = 0x59;
@@ -91,13 +91,13 @@ impl BoltPoint {
     pub(crate) fn as_struct(&self) -> Struct {
         let mut fields = Vec::with_capacity(4);
         fields.extend([
-            Value::Integer(self.srid),
-            Value::Float(self.x),
-            Value::Float(self.y),
+            PackStreamValue::Integer(self.srid),
+            PackStreamValue::Float(self.x),
+            PackStreamValue::Float(self.y),
         ]);
         match self.z {
-            Some(z) => fields.push(Value::Float(z)),
-            None => fields.push(Value::Null),
+            Some(z) => fields.push(PackStreamValue::Float(z)),
+            None => fields.push(PackStreamValue::Null),
         }
         let tag = match self.z {
             None => TAG_POINT_2D,
@@ -145,7 +145,7 @@ impl BoltDate {
         let days_since_epoch = self.date - NaiveDate::from_ymd_opt(0, 1, 1).unwrap();
         Some(Ok(Struct {
             tag: TAG_DATE,
-            fields: vec![Value::Integer(days_since_epoch.num_days())],
+            fields: vec![PackStreamValue::Integer(days_since_epoch.num_days())],
         }))
     }
 }
@@ -242,14 +242,14 @@ impl<'a> BoltTime<'a> {
             // local time
             None => Struct {
                 tag: TAG_LOCAL_TIME,
-                fields: vec![Value::Integer(nanos_since_midnight)],
+                fields: vec![PackStreamValue::Integer(nanos_since_midnight)],
             },
             // time
             Some(offset) => Struct {
                 tag: TAG_TIME,
                 fields: vec![
-                    Value::Integer(nanos_since_midnight),
-                    Value::Integer(offset.into()),
+                    PackStreamValue::Integer(nanos_since_midnight),
+                    PackStreamValue::Integer(offset.into()),
                 ],
             },
         }))
@@ -313,9 +313,9 @@ impl<'a> BoltDateTime<'a> {
                         Struct {
                             tag: 0x66,
                             fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::String(String::from(time_zone_id)),
+                                PackStreamValue::Integer(seconds),
+                                PackStreamValue::Integer(nanos.into()),
+                                PackStreamValue::String(String::from(time_zone_id)),
                             ],
                         }
                     }
@@ -327,9 +327,9 @@ impl<'a> BoltDateTime<'a> {
                         Struct {
                             tag: 0x69,
                             fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::String(String::from(time_zone_id)),
+                                PackStreamValue::Integer(seconds),
+                                PackStreamValue::Integer(nanos.into()),
+                                PackStreamValue::String(String::from(time_zone_id)),
                             ],
                         }
                     }
@@ -345,9 +345,9 @@ impl<'a> BoltDateTime<'a> {
                         Struct {
                             tag: 0x46,
                             fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::Integer(utc_offset_seconds.into()),
+                                PackStreamValue::Integer(seconds),
+                                PackStreamValue::Integer(nanos.into()),
+                                PackStreamValue::Integer(utc_offset_seconds.into()),
                             ],
                         }
                     }
@@ -360,9 +360,9 @@ impl<'a> BoltDateTime<'a> {
                         Struct {
                             tag: 0x49,
                             fields: vec![
-                                Value::Integer(seconds),
-                                Value::Integer(nanos.into()),
-                                Value::Integer(utc_offset_seconds.into()),
+                                PackStreamValue::Integer(seconds),
+                                PackStreamValue::Integer(nanos.into()),
+                                PackStreamValue::Integer(utc_offset_seconds.into()),
                             ],
                         }
                     }
@@ -380,7 +380,10 @@ impl<'a> BoltDateTime<'a> {
                 let nanos = date_time.timestamp_subsec_nanos();
                 Struct {
                     tag: 0x64,
-                    fields: vec![Value::Integer(seconds), Value::Integer(nanos.into())],
+                    fields: vec![
+                        PackStreamValue::Integer(seconds),
+                        PackStreamValue::Integer(nanos.into()),
+                    ],
                 }
             }
         }))
@@ -485,10 +488,10 @@ impl BoltDuration {
         Some(Ok(Struct {
             tag: TAG_DURATION,
             fields: vec![
-                Value::Integer(self.months),
-                Value::Integer(self.days),
-                Value::Integer(self.seconds),
-                Value::Integer(self.nanos),
+                PackStreamValue::Integer(self.months),
+                PackStreamValue::Integer(self.days),
+                PackStreamValue::Integer(self.seconds),
+                PackStreamValue::Integer(self.nanos),
             ],
         }))
     }
@@ -498,7 +501,7 @@ impl BoltDuration {
 pub(crate) struct BoltNode {
     pub(crate) id: i64,
     pub(crate) labels: Vec<String>,
-    pub(crate) properties: IndexMap<String, Value>,
+    pub(crate) properties: IndexMap<String, PackStreamValue>,
     pub(crate) element_id: Option<String>,
 }
 
@@ -549,12 +552,17 @@ impl BoltNode {
     pub(crate) fn into_struct(self) -> Struct {
         let mut fields = Vec::with_capacity(4);
         fields.extend([
-            Value::Integer(self.id),
-            Value::List(self.labels.into_iter().map(Value::String).collect()),
-            Value::Map(self.properties),
+            PackStreamValue::Integer(self.id),
+            PackStreamValue::List(
+                self.labels
+                    .into_iter()
+                    .map(PackStreamValue::String)
+                    .collect(),
+            ),
+            PackStreamValue::Dict(self.properties),
         ]);
         if let Some(element_id) = self.element_id {
-            fields.push(Value::String(element_id));
+            fields.push(PackStreamValue::String(element_id));
         }
         Struct {
             tag: TAG_NODE,
@@ -569,7 +577,7 @@ pub(crate) struct BoltRelationship {
     pub(crate) start_node_id: i64,
     pub(crate) rel_type: String,
     pub(crate) end_node_id: i64,
-    pub(crate) properties: IndexMap<String, Value>,
+    pub(crate) properties: IndexMap<String, PackStreamValue>,
     pub(crate) element_id_ext: Option<BoltRelationshipElementIdExt>,
 }
 
@@ -650,16 +658,18 @@ impl BoltRelationship {
     pub(crate) fn into_struct(self) -> Struct {
         let mut fields = Vec::with_capacity(8);
         fields.extend([
-            Value::Integer(self.id),
-            Value::Integer(self.start_node_id),
-            Value::Integer(self.end_node_id),
-            Value::String(self.rel_type),
-            Value::Map(self.properties),
+            PackStreamValue::Integer(self.id),
+            PackStreamValue::Integer(self.start_node_id),
+            PackStreamValue::Integer(self.end_node_id),
+            PackStreamValue::String(self.rel_type),
+            PackStreamValue::Dict(self.properties),
         ]);
         if let Some(element_id_ext) = self.element_id_ext {
-            fields.push(Value::String(element_id_ext.element_id));
-            fields.push(Value::String(element_id_ext.start_node_element_id));
-            fields.push(Value::String(element_id_ext.end_node_element_id));
+            fields.push(PackStreamValue::String(element_id_ext.element_id));
+            fields.push(PackStreamValue::String(
+                element_id_ext.start_node_element_id,
+            ));
+            fields.push(PackStreamValue::String(element_id_ext.end_node_element_id));
         }
         Struct {
             tag: TAG_RELATIONSHIP,
@@ -679,7 +689,7 @@ pub(crate) struct BoltPath {
 pub(crate) struct BoltUnboundRelationship {
     pub(crate) id: i64,
     pub(crate) rel_type: String,
-    pub(crate) properties: IndexMap<String, Value>,
+    pub(crate) properties: IndexMap<String, PackStreamValue>,
     pub(crate) element_id: Option<String>,
 }
 
@@ -698,12 +708,12 @@ impl BoltUnboundRelationship {
     pub(crate) fn into_struct(self) -> Struct {
         let mut fields = Vec::with_capacity(4);
         fields.extend([
-            Value::Integer(self.id),
-            Value::String(self.rel_type),
-            Value::Map(self.properties),
+            PackStreamValue::Integer(self.id),
+            PackStreamValue::String(self.rel_type),
+            PackStreamValue::Dict(self.properties),
         ]);
         if let Some(element_id) = self.element_id {
-            fields.push(Value::String(element_id));
+            fields.push(PackStreamValue::String(element_id));
         }
         Struct {
             tag: TAG_UNBOUND_RELATIONSHIP,
@@ -896,21 +906,26 @@ impl BoltPath {
     }
 
     pub(crate) fn into_struct(self) -> Struct {
-        let nodes = Value::List(
+        let nodes = PackStreamValue::List(
             self.nodes
                 .into_iter()
                 .map(BoltNode::into_struct)
-                .map(Value::Struct)
+                .map(PackStreamValue::Struct)
                 .collect(),
         );
-        let relationships = Value::List(
+        let relationships = PackStreamValue::List(
             self.relationships
                 .into_iter()
                 .map(BoltUnboundRelationship::into_struct)
-                .map(Value::Struct)
+                .map(PackStreamValue::Struct)
                 .collect(),
         );
-        let indices = Value::List(self.indices.into_iter().map(Value::Integer).collect());
+        let indices = PackStreamValue::List(
+            self.indices
+                .into_iter()
+                .map(PackStreamValue::Integer)
+                .collect(),
+        );
         Struct {
             tag: TAG_PATH,
             fields: vec![nodes, relationships, indices],
@@ -1078,7 +1093,7 @@ impl ExtractableField for Vec<String> {
     }
 }
 
-impl ExtractableField for IndexMap<String, Value> {
+impl ExtractableField for IndexMap<String, PackStreamValue> {
     fn extract(field: JsonValue, config: &ActorConfig) -> Result<Self, ExtractionFailure> {
         let JsonValue::Object(field) = field else {
             return Err(format!("to be a map, but found {field:?}").into());

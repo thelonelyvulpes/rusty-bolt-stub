@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicI64;
 
 use indexmap::{indexmap, IndexMap};
 
-use crate::values::value::Value;
+use crate::values::bolt_value::PackStreamValue;
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
 pub enum BoltVersion {
@@ -188,7 +188,7 @@ impl BoltVersion {
         })
     }
 
-    pub fn message_auto_response(&self, tag: u8) -> Option<(u8, Vec<Value>)> {
+    pub fn message_auto_response(&self, tag: u8) -> Option<(u8, Vec<PackStreamValue>)> {
         const SUCCESS_TAG: u8 = 0x70;
         let success_meta = match tag {
             0x01 => {
@@ -196,7 +196,7 @@ impl BoltVersion {
                 let mut success_map = IndexMap::with_capacity(4);
                 success_map.insert(
                     String::from("server"),
-                    Value::String(String::from(self.server_agent())),
+                    PackStreamValue::String(String::from(self.server_agent())),
                 );
                 if self >= &BoltVersion::V3 {
                     static CONNECTION_ID: AtomicI64 = AtomicI64::new(1);
@@ -205,26 +205,28 @@ impl BoltVersion {
                     assert_ne!(connection_id, 0, "Connection ID overflowed");
                     success_map.insert(
                         String::from("connection_id"),
-                        Value::String(format!("bolt-{connection_id}")),
+                        PackStreamValue::String(format!("bolt-{connection_id}")),
                     );
                 }
                 if self >= &BoltVersion::V5_7 {
                     success_map.insert(
                         String::from("protocol_version"),
-                        Value::String(self.to_string()),
+                        PackStreamValue::String(self.to_string()),
                     );
                 }
                 if self >= &BoltVersion::V5_8 {
                     success_map.insert(
                         String::from("hints"),
-                        Value::Map(indexmap! {String::from("ssr.enabled") => Value::Boolean(true)}),
+                        PackStreamValue::Dict(
+                            indexmap! {String::from("ssr.enabled") => PackStreamValue::Boolean(true)},
+                        ),
                     );
                 }
                 success_map
             }
             _ => Default::default(),
         };
-        Some((SUCCESS_TAG, vec![Value::Map(success_meta)]))
+        Some((SUCCESS_TAG, vec![PackStreamValue::Dict(success_meta)]))
     }
 
     fn server_agent(&self) -> &'static str {
