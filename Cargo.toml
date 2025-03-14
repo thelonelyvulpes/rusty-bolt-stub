@@ -13,7 +13,7 @@ tokio = { version = "1.40.0", features = ["full"] }
 tokio-util = { version = "0.7.12" }
 clap = { version = "4.5.16", features = ["derive"] }
 chrono = "0.4.38"
-itertools = "0.13.0"
+itertools = "0.14.0"
 chrono-tz = "0.10.0"
 duplicate = "2.0.0"
 indoc = "2.0.5"
@@ -26,4 +26,4 @@ log = "0.4.26"
 env_logger = "0.11.7"
 
 [dev-dependencies]
-rstest ="0.22.0"
+rstest = "0.25.0"
