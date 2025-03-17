@@ -2,10 +2,11 @@ use crate::bang_line::BangLine;
 use crate::context::Context;
 
 #[derive(Debug)]
-pub struct Script {
+pub struct Script<'a> {
     pub(crate) name: String,
     pub(crate) bang_lines: Vec<BangLine>,
     pub(crate) body: ScanBlock,
+    pub(crate) input: &'a str,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -39,12 +40,12 @@ pub struct ConditionBranch {
 
 pub mod actor_types {
     use crate::context::Context;
-    use crate::values::BoltMessage;
-
+    use crate::values::bolt_message::BoltMessage;
     use std::fmt::Debug;
 
     pub trait ScriptLine: Debug + Send + Sync {
-        fn original_line<'a>(&self, script: &'a str) -> &'a str;
+        fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str;
+        fn line_number(&self) -> Option<usize>;
     }
 
     pub trait ClientMessageValidator: ScriptLine {
@@ -79,23 +80,23 @@ pub mod actor_types {
         pub(crate) server_sender: Box<dyn ServerMessageSender>,
     }
 
-    impl ClientMessageValidator for AutoMessageHandler {
-        fn validate(&self, message: &BoltMessage) -> anyhow::Result<()> {
-            self.client_validator.validate(message)
-        }
-    }
-
-    impl ServerMessageSender for AutoMessageHandler {
-        fn send(&self) -> anyhow::Result<&[u8]> {
-            self.server_sender.send()
-        }
-    }
-
-    impl ScriptLine for AutoMessageHandler {
-        fn original_line<'a>(&self, script: &'a str) -> &'a str {
-            self.client_validator.original_line(script)
-        }
-    }
+    // impl ClientMessageValidator for AutoMessageHandler {
+    //     fn validate(&self, message: &BoltMessage) -> anyhow::Result<()> {
+    //         self.client_validator.validate(message)
+    //     }
+    // }
+    //
+    // impl ServerMessageSender for AutoMessageHandler {
+    //     fn send(&self) -> anyhow::Result<&[u8]> {
+    //         self.server_sender.send()
+    //     }
+    // }
+    //
+    // impl ScriptLine for AutoMessageHandler {
+    //     fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
+    //         self.client_validator.line_repr(script)
+    //     }
+    // }
 
     #[derive(Debug)]
     pub enum ActorBlock {

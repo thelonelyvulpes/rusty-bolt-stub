@@ -4,6 +4,7 @@
 mod bang_line;
 mod bolt_version;
 mod context;
+mod jolt;
 mod net;
 mod net_actor;
 mod parse_error;
@@ -18,10 +19,10 @@ mod values;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::parser::ActorScript;
 use anyhow::Context;
 use clap::Parser;
-
-use crate::parser::ActorScript;
+use log::LevelFilter;
 
 const LISTEN_ADDR_HELP: &str = "The base address on which to listen for incoming \
 connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localhost'. Each script \
@@ -40,9 +41,10 @@ struct StubArgs {
     #[arg(
         short,
         long,
+        action=clap::ArgAction::Count,
         help = "Show more detail about the client-server exchange."
     )]
-    verbose: bool,
+    verbose: u8,
     script: String,
     #[arg(short, long, default_value_t=5.0, help=GRACE_PERIOD_HELP)]
     grace_period: f32,
@@ -52,8 +54,20 @@ static SCRIPT: OnceLock<String> = OnceLock::new();
 static PARSED: OnceLock<ActorScript> = OnceLock::new();
 
 fn main() -> anyhow::Result<()> {
-    env_logger::builder().format_timestamp_millis().init();
     let args = StubArgs::parse();
+    let log_level = match args.verbose {
+        0 => LevelFilter::Off,
+        1 => LevelFilter::Info,
+        2 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    };
+    env_logger::builder()
+        .filter_level(log_level)
+        .format_timestamp_millis()
+        .init();
+    if args.verbose > 3 {
+        log::warn!("Verbose level capped at 3");
+    }
     let script_text = std::fs::read_to_string(&args.script)
         .with_context(|| format!("Failed to read script file: {}", &args.script))?;
     SCRIPT.get_or_init(move || script_text);

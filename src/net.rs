@@ -15,14 +15,14 @@ use crate::parser::ActorScript;
 
 pub struct Server {
     address: String,
-    server_script_cfg: &'static ActorScript,
+    server_script_cfg: &'static ActorScript<'static>,
     grace_period: Duration,
 }
 
 impl Server {
     pub fn new(
         address: &str,
-        server_script_cfg: &'static ActorScript,
+        server_script_cfg: &'static ActorScript<'static>,
         grace_period: Duration,
     ) -> Self {
         let address = if address.starts_with(":") {

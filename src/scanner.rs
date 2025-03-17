@@ -24,6 +24,8 @@ impl From<Input<'_>> for Context {
         Self {
             start_line_number,
             end_line_number: start_line_number + max(1, value.data().lines().count()) - 1,
+            start_byte: value.byte_offset(),
+            end_byte: value.byte_offset() + value.len(),
         }
     }
 }
@@ -41,6 +43,7 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
             name,
             bang_lines: bangs,
             body: ScanBlock::List(span.into(), vec![]),
+            input,
         });
     };
 
@@ -57,6 +60,7 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
         name,
         bang_lines: bangs,
         body: body.unwrap_or(ScanBlock::List(span.into(), vec![])),
+        input,
     })
 }
 
@@ -538,14 +542,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+    use nom_span::Spanned;
+    use rstest::rstest;
+
     use super::super::scanner;
     use super::{message, multi_message, Input};
     use crate::bang_line::BangLine;
     use crate::context::Context;
     use crate::types::ScanBlock;
-    use indoc::indoc;
-    use nom_span::Spanned;
-    use rstest::rstest;
 
     #[test]
     fn test_scan_minimal_script() {
@@ -566,10 +571,17 @@ mod tests {
         Spanned::new(input, true)
     }
 
-    fn new_ctx(start_line_number: usize, end_line_number: usize) -> Context {
+    fn new_ctx(
+        start_line_number: usize,
+        end_line_number: usize,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Context {
         Context {
             start_line_number,
             end_line_number,
+            start_byte,
+            end_byte,
         }
     }
 
@@ -583,17 +595,17 @@ mod tests {
         assert!(result.is_ok());
         let (rem, bl) = result.unwrap();
         assert_eq!(*rem, "\n");
-        assert_eq!(bl, BangLine::Version(new_ctx(1, 1), 16, Some(5)));
+        assert_eq!(bl, BangLine::Version(new_ctx(1, 1, 0, 12), 16, Some(5)));
     }
 
     #[rstest]
-    #[case::bolt_5_4("!: BOLT 5.4\n", BangLine::Version(new_ctx(1, 1), 5, Some(4)))]
-    #[case::bolt_5_0("!: BOLT 5.0\n", BangLine::Version(new_ctx(1, 1), 5, Some(0)))]
-    #[case::bolt_5("!: BOLT 5\n", BangLine::Version(new_ctx(1, 1), 5, None))]
-    #[case::restart("!: ALLOW RESTART\n", BangLine::AllowRestart(new_ctx(1, 1)))]
-    #[case::auto_reset("!: AUTO RESET\n", BangLine::Auto(new_ctx(1, 1),"RESET".into()))]
-    #[case::auto_foo("!: AUTO foo\n", BangLine::Auto(new_ctx(1, 1),"foo".into()))]
-    #[case::concurrent("!: ALLOW CONCURRENT\n", BangLine::Concurrent(new_ctx(1, 1)))]
+    #[case::bolt_5_4("!: BOLT 5.4\n", BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(4)))]
+    #[case::bolt_5_0("!: BOLT 5.0\n", BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(0)))]
+    #[case::bolt_5("!: BOLT 5\n", BangLine::Version(new_ctx(1, 1, 0, 9), 5, None))]
+    #[case::restart("!: ALLOW RESTART\n", BangLine::AllowRestart(new_ctx(1, 1, 0, 16)))]
+    #[case::auto_reset("!: AUTO RESET\n", BangLine::Auto(new_ctx(1, 1, 0, 13),"RESET".into()))]
+    #[case::auto_foo("!: AUTO foo\n", BangLine::Auto(new_ctx(1, 1, 0, 11),"foo".into()))]
+    #[case::concurrent("!: ALLOW CONCURRENT\n", BangLine::Concurrent(new_ctx(1, 1, 0, 19)))]
     // #[case::handshake("!: HANDSHAKE FF 00\n", BangLine::Handshake(vec![0xFF, 0x00]))]
     // #[case::handshake_empty("!: HANDSHAKE\n", BangLine::Handshake(vec![]))]
     // #[case::handshake_delay_zero("!: HANDSHAKE DELAY 0\n", BangLine::HandshakeDelay(0.))]
@@ -612,9 +624,18 @@ mod tests {
         let input = input.repeat(repetition);
         let result = dbg!(scanner::scan_script(input.as_str(), "test.script".into()));
         let result = result.unwrap();
+        let start_bytes = expected.ctx().start_byte;
+        let end_bytes = expected.ctx().end_byte;
+        let bytes_count = end_bytes - start_bytes;
         assert_eq!(result.bang_lines.len(), repetition);
         for (bl, line) in result.bang_lines.iter().zip(1..repetition + 1) {
-            *(expected.ctx_mut()) = new_ctx(line, line);
+            let byte_offset = (bytes_count + 1) * (line - 1);
+            *(expected.ctx_mut()) = new_ctx(
+                line,
+                line,
+                start_bytes + byte_offset,
+                end_bytes + byte_offset,
+            );
             assert_eq!(bl, &expected);
         }
     }
@@ -627,48 +648,57 @@ mod tests {
         assert_eq!(result.bang_lines.len(), 3);
         assert_eq!(
             result.bang_lines.first(),
-            Some(&BangLine::Version(new_ctx(1, 1), 5, Some(4)))
+            Some(&BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(4)))
         );
         assert_eq!(
             result.bang_lines.get(1),
-            Some(&BangLine::Auto(new_ctx(2, 2), "Nonsense".into()))
+            Some(&BangLine::Auto(new_ctx(2, 2, 12, 28), "Nonsense".into()))
         );
         assert_eq!(
             result.bang_lines.get(2),
-            Some(&BangLine::AllowRestart(new_ctx(3, 3)))
+            Some(&BangLine::AllowRestart(new_ctx(3, 3, 29, 45)))
         );
     }
 
     #[rstest]
     fn test_auto_bang_line(#[values("", "\n", "\t", " ", "\t\n\n\t  ")] ending: &'static str) {
-        let input = format!("!: AUTO Nonsense{ending}");
+        let base = "!: AUTO Nonsense";
+        let input = format!("{base}{ending}");
+        let bytes = base.len() + ending.find(char::is_whitespace).unwrap_or(ending.len());
         let (input, bl) = scanner::auto_bang_line(wrap_input(&input)).unwrap();
         assert_eq!(*input, ending);
-        assert_eq!(bl, BangLine::Auto(new_ctx(1, 1), "Nonsense".into()));
+        assert_eq!(
+            bl,
+            BangLine::Auto(new_ctx(1, 1, 0, bytes), "Nonsense".into())
+        );
     }
 
     #[rstest]
     fn test_auto_bang_line_script(
         #[values("", "\n", "\t", " ", "\t\n\n\t  ")] ending: &'static str,
     ) {
-        let input = format!("!: AUTO Nonsense{ending}");
+        let base = "!: AUTO Nonsense";
+        let input = format!("{base}{ending}");
+        let bytes = base.len() + ending.find(char::is_whitespace).unwrap_or(ending.len());
         let result = dbg!(scanner::scan_script(&input, "test.script".into()));
         let result = result.unwrap();
         assert_eq!(
             result.bang_lines.first(),
-            Some(&BangLine::Auto(new_ctx(1, 1), "Nonsense".into()))
+            Some(&BangLine::Auto(new_ctx(1, 1, 0, bytes), "Nonsense".into()))
         );
     }
 
     #[rstest]
     fn test_scan_concurrent_ok(#[values("", "\n", "\t", " ", "\t\n\n\t  ")] ending: &'static str) {
-        let input = format!("!: ALLOW CONCURRENT{ending}");
+        let base = "!: ALLOW CONCURRENT";
+        let input = format!("{base}{ending}");
+        let bytes = base.len() + ending.find(char::is_whitespace).unwrap_or(ending.len());
         let input = wrap_input(&input);
         let mut f = scanner::simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent);
         let result = f(input);
         let (rem, bang) = result.unwrap();
         assert_eq!(*rem, ending);
-        assert_eq!(bang, BangLine::Concurrent(new_ctx(1, 1)));
+        assert_eq!(bang, BangLine::Concurrent(new_ctx(1, 1, 0, bytes)));
     }
 
     // ##########
@@ -679,14 +709,17 @@ mod tests {
     // Simple Lines
     // ############
     #[rstest]
-    #[case::implicit("C: Foo a b\n   Bar lel lol")]
-    #[case::explicit("C: Foo a b\nC: Bar lel lol")]
-    #[case::implicit_space_post("C: Foo a b \n   Bar lel lol ")]
-    #[case::explicit_space_post("C: Foo a b \nC: Bar lel lol ")]
-    #[case::implicit_space_pre("C:  Foo a b \n    Bar lel lol")]
-    #[case::explicit_space_pre("C:  Foo a b \nC:  Bar lel lol")]
+    #[case::implicit("C: Foo a b\n   Bar lel lol", 10, 14, 25)]
+    #[case::explicit("C: Foo a b\nC: Bar lel lol", 10, 11, 25)]
+    #[case::implicit_space_post("C: Foo a b \n   Bar lel lol ", 11, 15, 27)]
+    #[case::explicit_space_post("C: Foo a b \nC: Bar lel lol ", 11, 12, 27)]
+    #[case::implicit_space_pre("C:  Foo a b \n    Bar lel lol", 12, 17, 28)]
+    #[case::explicit_space_pre("C:  Foo a b \nC:  Bar lel lol", 12, 13, 28)]
     fn test_multi_message(
         #[case] input: &'static str,
+        #[case] b_end_1: usize,
+        #[case] b_start_2: usize,
+        #[case] b_end_2: usize,
         #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n", "\n?}", "\n?}")] ending: &'static str,
     ) {
         let input = format!("{input}{ending}");
@@ -698,10 +731,18 @@ mod tests {
         assert_eq!(
             block,
             ScanBlock::List(
-                new_ctx(1, 2),
+                new_ctx(1, 2, 0, b_end_2),
                 vec![
-                    ScanBlock::ClientMessage(new_ctx(1, 1), "Foo".into(), Some("a b".into())),
-                    ScanBlock::ClientMessage(new_ctx(2, 2), "Bar".into(), Some("lel lol".into()))
+                    ScanBlock::ClientMessage(
+                        new_ctx(1, 1, 0, b_end_1),
+                        "Foo".into(),
+                        Some("a b".into())
+                    ),
+                    ScanBlock::ClientMessage(
+                        new_ctx(2, 2, b_start_2, b_end_2),
+                        "Bar".into(),
+                        Some("lel lol".into())
+                    )
                 ]
             )
         );
@@ -720,55 +761,67 @@ mod tests {
         assert_eq!(
             block,
             ScanBlock::List(
-                new_ctx(1, 2),
+                new_ctx(1, 2, 0, 25),
                 vec![
-                    ScanBlock::ClientMessage(new_ctx(1, 1), "Foo".into(), Some("a b".into())),
-                    ScanBlock::ClientMessage(new_ctx(2, 2), "Bar".into(), Some("lel lol".into()))
+                    ScanBlock::ClientMessage(
+                        new_ctx(1, 1, 0, 10),
+                        "Foo".into(),
+                        Some("a b".into())
+                    ),
+                    ScanBlock::ClientMessage(
+                        new_ctx(2, 2, 11, 25),
+                        "Bar".into(),
+                        Some("lel lol".into())
+                    )
                 ]
             )
         );
     }
 
     #[rstest]
-    #[case::no_space("C:RUN")]
-    #[case::clean("C: RUN")]
-    #[case::trailing("C: RUN  ")]
-    #[case::messy("C:   RUN  ")]
-    fn test_client_message_with_no_args(#[case] input: &str) {
+    #[case::no_space("C:RUN", 5)]
+    #[case::clean("C: RUN", 6)]
+    #[case::trailing("C: RUN  ", 8)]
+    #[case::messy("C:   RUN  ", 10)]
+    fn test_client_message_with_no_args(#[case] input: &str, #[case] bytes: usize) {
         let result = message(Some("C:"), ScanBlock::ClientMessage)(wrap_input(input));
         let (rem, block) = result.unwrap();
         assert_eq!(*rem, "");
         assert_eq!(
             block,
-            ScanBlock::ClientMessage(new_ctx(1, 1), "RUN".into(), None)
+            ScanBlock::ClientMessage(new_ctx(1, 1, 0, bytes), "RUN".into(), None)
         );
     }
 
     #[rstest]
-    #[case::no_space("C:RUN foo bar")]
-    #[case::no_space("C: RUN foo bar")]
-    #[case::trailing("C: RUN foo bar  ")]
-    #[case::messy("C:  RUN   foo bar  ")]
-    fn test_client_message_con_args(#[case] input: &str) {
+    #[case::no_space("C:RUN foo bar", 13)]
+    #[case::no_space("C: RUN foo bar", 14)]
+    #[case::trailing("C: RUN foo bar  ", 16)]
+    #[case::messy("C:  RUN   foo bar  ", 19)]
+    fn test_client_message_con_args(#[case] input: &str, #[case] bytes: usize) {
         let result = message(Some("C:"), ScanBlock::ClientMessage)(wrap_input(input));
         let (rem, block) = result.unwrap();
         assert_eq!(*rem, "");
         assert_eq!(
             block,
-            ScanBlock::ClientMessage(new_ctx(1, 1), "RUN".into(), Some("foo bar".into()))
+            ScanBlock::ClientMessage(
+                new_ctx(1, 1, 0, bytes),
+                "RUN".into(),
+                Some("foo bar".into())
+            )
         );
     }
 
     #[rstest]
-    #[case::no_space("#C:RUN foo bar")]
-    #[case::no_space("#C: RUN foo bar")]
-    #[case::trailing("#C: RUN foo bar  ")]
-    #[case::messy("#C:  RUN   foo bar  ")]
-    fn test_comment(#[case] input: &str) {
+    #[case::no_space("#C:RUN foo bar", 14)]
+    #[case::no_space("#C: RUN foo bar", 15)]
+    #[case::trailing("#C: RUN foo bar  ", 17)]
+    #[case::messy("#C:  RUN   foo bar  ", 20)]
+    fn test_comment(#[case] input: &str, #[case] bytes: usize) {
         let result = scanner::comment(wrap_input(input));
         let (rem, block) = result.unwrap();
         assert_eq!(*rem, "");
-        assert_eq!(block, ScanBlock::Comment(new_ctx(1, 1)));
+        assert_eq!(block, ScanBlock::Comment(new_ctx(1, 1, 0, bytes)));
     }
 
     #[rstest]
@@ -782,7 +835,7 @@ mod tests {
         assert_eq!(*rem, "");
         assert_eq!(
             block,
-            ScanBlock::Python(new_ctx(1, 1), "print('Hello, World!')".into())
+            ScanBlock::Python(new_ctx(1, 1, 0, 26), "print('Hello, World!')".into())
         );
     }
 
@@ -798,8 +851,8 @@ mod tests {
         assert_eq!(
             blocks,
             vec![
-                ScanBlock::ClientMessage(new_ctx(2, 2), "RUN".into(), None),
-                ScanBlock::ServerMessage(new_ctx(3, 3), "OK".into(), None),
+                ScanBlock::ClientMessage(new_ctx(2, 2, 7, 13), "RUN".into(), None),
+                ScanBlock::ServerMessage(new_ctx(3, 3, 18, 23), "OK".into(), None),
             ]
         );
     }
@@ -814,13 +867,13 @@ mod tests {
             blocks,
             vec![
                 ScanBlock::List(
-                    new_ctx(2, 3),
+                    new_ctx(2, 3, 7, 24),
                     vec![
-                        ScanBlock::ClientMessage(new_ctx(2, 2), "RUN1".into(), None),
-                        ScanBlock::ServerMessage(new_ctx(3, 3), "OK".into(), None),
+                        ScanBlock::ClientMessage(new_ctx(2, 2, 7, 14), "RUN1".into(), None),
+                        ScanBlock::ServerMessage(new_ctx(3, 3, 19, 24), "OK".into(), None),
                     ]
                 ),
-                ScanBlock::ClientMessage(new_ctx(5, 5), "RUN2".into(), None),
+                ScanBlock::ClientMessage(new_ctx(5, 5, 34, 41), "RUN2".into(), None),
             ]
         );
     }

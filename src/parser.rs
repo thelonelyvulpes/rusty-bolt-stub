@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cell::LazyCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
@@ -14,6 +13,7 @@ use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 use crate::bang_line::BangLine;
 use crate::bolt_version::{BoltVersion, JoltVersion};
 use crate::context::Context;
+use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
 use crate::serde_json_ext;
 use crate::str_byte;
@@ -22,18 +22,18 @@ use crate::types::actor_types::{
 };
 use crate::types::{ScanBlock, Script};
 use crate::util::opt_res_ret;
-use crate::values::bolt_value::{PackStreamValue, Struct};
-use crate::values::structs::{
-    BoltDate, BoltDateTime, BoltDuration, BoltNode, BoltPath, BoltPoint, BoltRelationship,
-    BoltTime, TAG_DATE, TAG_DURATION, TAG_LOCAL_TIME, TAG_POINT_2D, TAG_POINT_3D, TAG_TIME,
+use crate::values::bolt_message::BoltMessage;
+use crate::values::bolt_struct::{
+    JoltDate, JoltDateTime, JoltDuration, JoltNode, JoltPath, JoltPoint, JoltRelationship,
+    JoltTime, TAG_DATE, TAG_DURATION, TAG_LOCAL_TIME, TAG_POINT_2D, TAG_POINT_3D, TAG_TIME,
 };
-use crate::values::BoltMessage;
+use crate::values::pack_stream_value::{PackStreamStruct, PackStreamValue};
 
 #[derive(Debug)]
-pub struct ActorScript {
+pub struct ActorScript<'a> {
     pub config: ActorConfig,
     pub tree: ActorBlock,
-    pub script: Script,
+    pub script: Script<'a>,
 }
 
 #[derive(Debug)]
@@ -359,13 +359,14 @@ fn create_auto_message_handler(
                 config.bolt_version,
             ))
         })?;
-    let data = message_data(server_message_tag, server_message_fields);
-    let server_sender = Box::new(SenderBytes::new(
-        data,
-        "AUTO".into(), // TODO: get the actual name of the server message
-        None,          // TODO: get the body string representation of the server message
-        ctx,
-    ));
+    let message = BoltMessage::new(
+        server_message_tag,
+        server_message_fields,
+        config.bolt_version,
+    );
+    let repr = message.repr();
+    let data = message.into_data();
+    let server_sender = Box::new(SenderBytes::new(data, SenderBytesLine::Repr(repr)));
     Ok(AutoMessageHandler {
         client_validator,
         server_sender,
@@ -387,54 +388,69 @@ fn create_message_sender(
                 config.bolt_version
             ))
         })?;
-    let data = message_data(tag, transcode_body(message_body, config)?);
+    let fields = transcode_body(message_body, config)?;
+    let data = BoltMessage::new(tag, fields, config.bolt_version).into_data();
 
     Ok(Box::new(SenderBytes::new(
         data,
-        message_name.into(),
-        message_body.map(Into::into),
-        ctx,
+        SenderBytesLine::Ctx {
+            message_name: message_name.into(),
+            message_body: message_body.map(Into::into),
+            ctx,
+        },
     )))
-}
-
-fn message_data(tag: u8, fields: Vec<PackStreamValue>) -> Vec<u8> {
-    PackStreamValue::Struct(Struct { tag, fields }).to_data()
 }
 
 struct SenderBytes {
     pub data: Vec<u8>,
-    pub message_name: String,
-    pub message_body: Option<String>,
-    pub ctx: Context,
+    pub line: SenderBytesLine,
+}
+
+#[derive(Debug)]
+enum SenderBytesLine {
+    Ctx {
+        ctx: Context,
+        message_name: String,
+        message_body: Option<String>,
+    },
+    Repr(String),
 }
 
 impl SenderBytes {
-    pub fn new(
-        data: Vec<u8>,
-        message_name: Cow<str>,
-        message_body: Option<Cow<str>>,
-        ctx: Context,
-    ) -> Self {
-        Self {
-            data,
-            message_name: message_name.into_owned(),
-            message_body: message_body.map(Cow::into_owned),
-            ctx,
-        }
+    pub fn new(data: Vec<u8>, line: SenderBytesLine) -> Self {
+        Self { data, line }
     }
 }
 
 impl ScriptLine for SenderBytes {
-    fn original_line<'a>(&self, script: &'a str) -> &'a str {
-        self.ctx.original_line(script)
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
+        match &self.line {
+            SenderBytesLine::Ctx { ctx, .. } => ctx.original_line(script),
+            SenderBytesLine::Repr(repr) => repr,
+        }
+    }
+    fn line_number(&self) -> Option<usize> {
+        match &self.line {
+            SenderBytesLine::Ctx { ctx, .. } => Some(ctx.start_line_number),
+            SenderBytesLine::Repr(_) => None,
+        }
     }
 }
 
 impl Debug for SenderBytes {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self.message_body {
-            None => write!(f, "{}", self.message_name),
-            Some(body) => write!(f, "{} {}", self.message_name, body),
+        match &self.line {
+            SenderBytesLine::Ctx {
+                message_name,
+                message_body,
+                ..
+            } => match message_body {
+                None => write!(f, "{message_name}"),
+                Some(body) => write!(f, "{message_name} {body}"),
+            },
+            SenderBytesLine::Repr(repr) => {
+                write!(f, "SenderBytes {repr:?}")
+            }
         }
     }
 }
@@ -509,8 +525,11 @@ fn transcode_jolt_value(
     }
     let (sigil, value) = value.into_iter().next().expect("non-empty check above");
     let (versionless_sigil, jolt_version) = parse_jolt_sigil(&sigil, config)?;
-    Ok(match versionless_sigil {
-        "?" => {
+    let Some(sigil) = JoltSigil::from_str(versionless_sigil) else {
+        return Ok(IsJoltValue::No([(sigil, value)].into_iter().collect()));
+    };
+    Ok(match sigil {
+        JoltSigil::Bool => {
             if !value.is_boolean() {
                 return Err(ParseError::new(format!(
                     "Expected bool after sigil \"?\", but found {value:?}",
@@ -518,7 +537,7 @@ fn transcode_jolt_value(
             }
             IsJoltValue::Yes(transcode_field(value, config)?)
         }
-        "Z" => {
+        JoltSigil::Integer => {
             let JsonValue::String(value) = value else {
                 return Err(ParseError::new(format!(
                     "Expected string after sigil \"Z\", but found {value:?}",
@@ -531,7 +550,7 @@ fn transcode_jolt_value(
             })?;
             IsJoltValue::Yes(transcode_field(JsonValue::Number(value.into()), config)?)
         }
-        "R" => {
+        JoltSigil::Float => {
             let JsonValue::String(value) = value else {
                 return Err(ParseError::new(format!(
                     "Expected string after sigil \"R\", but found {value:?}",
@@ -544,7 +563,7 @@ fn transcode_jolt_value(
             })?;
             IsJoltValue::Yes(PackStreamValue::Float(value))
         }
-        "U" => {
+        JoltSigil::String => {
             if !value.is_string() {
                 return Err(ParseError::new(format!(
                     "Expected string after sigil \"U\", but found {value:?}",
@@ -552,11 +571,11 @@ fn transcode_jolt_value(
             }
             IsJoltValue::Yes(transcode_field(value, config)?)
         }
-        "#" => {
+        JoltSigil::Bytes => {
             let bytes = parse_jolt_bytes(value)?;
             IsJoltValue::Yes(PackStreamValue::Bytes(bytes))
         }
-        "[]" => {
+        JoltSigil::List => {
             if !value.is_array() {
                 return Err(ParseError::new(format!(
                     "Expected array after sigil \"[]\", but found {value:?}",
@@ -564,7 +583,7 @@ fn transcode_jolt_value(
             }
             IsJoltValue::Yes(transcode_field(value, config)?)
         }
-        "{}" => {
+        JoltSigil::Dict => {
             if !value.is_object() {
                 return Err(ParseError::new(format!(
                     "Expected object after sigil \"{{}}\", but found {value:?}",
@@ -572,7 +591,7 @@ fn transcode_jolt_value(
             };
             IsJoltValue::Yes(transcode_field(value, config)?)
         }
-        "T" => {
+        JoltSigil::Temporal => {
             let JsonValue::String(value) = value else {
                 return Err(ParseError::new(format!(
                     "Expected temporal string after sigil \"T\", but found {value:?}",
@@ -590,44 +609,43 @@ fn transcode_jolt_value(
                 })?;
             IsJoltValue::Yes(value)
         }
-        "@" => {
+        JoltSigil::Spatial => {
             let JsonValue::String(value) = value else {
                 return Err(ParseError::new(format!(
                     "Expected spatial string after sigil \"@\", but found {value:?}",
                 )));
             };
-            let bolt_point = BoltPoint::parse(&value)?;
+            let bolt_point = JoltPoint::parse(&value)?;
             IsJoltValue::Yes(PackStreamValue::Struct(bolt_point.as_struct()))
         }
-        "()" => {
-            let bolt_node = BoltNode::parse(value, jolt_version, config)?;
+        JoltSigil::Node => {
+            let bolt_node = JoltNode::parse(value, jolt_version, config)?;
             IsJoltValue::Yes(PackStreamValue::Struct(bolt_node.into_struct()))
         }
-        "->" => {
-            let bolt_relationship = BoltRelationship::parse(value, jolt_version, config)?;
+        JoltSigil::RelationshipForward => {
+            let bolt_relationship = JoltRelationship::parse(value, jolt_version, config)?;
             IsJoltValue::Yes(PackStreamValue::Struct(bolt_relationship.into_struct()))
         }
-        "<-" => {
-            let mut bolt_relationship = BoltRelationship::parse(value, jolt_version, config)?;
+        JoltSigil::RelationshipBackward => {
+            let mut bolt_relationship = JoltRelationship::parse(value, jolt_version, config)?;
             bolt_relationship.flip_direction();
             IsJoltValue::Yes(PackStreamValue::Struct(bolt_relationship.into_struct()))
         }
-        ".." => {
-            let bolt_path = BoltPath::parse(value, jolt_version, config)?;
+        JoltSigil::Path => {
+            let bolt_path = JoltPath::parse(value, jolt_version, config)?;
             IsJoltValue::Yes(PackStreamValue::Struct(bolt_path.into_struct()))
         }
-        _ => IsJoltValue::No([(sigil, value)].into_iter().collect()),
     })
 }
 
 fn transcode_date_value(s: &str) -> Option<Result<PackStreamValue>> {
-    let bolt_date = opt_res_ret!(BoltDate::parse(s));
+    let bolt_date = opt_res_ret!(JoltDate::parse(s));
     let value_struct = opt_res_ret!(bolt_date.as_struct());
     Some(Ok(PackStreamValue::Struct(value_struct)))
 }
 
 fn transcode_time_value(s: &str) -> Option<Result<PackStreamValue>> {
-    let bolt_time = opt_res_ret!(BoltTime::parse(s));
+    let bolt_time = opt_res_ret!(JoltTime::parse(s));
     let value_struct = opt_res_ret!(bolt_time.as_struct());
     Some(Ok(PackStreamValue::Struct(value_struct)))
 }
@@ -636,13 +654,13 @@ fn transcode_date_time_value(
     s: &str,
     jolt_version: JoltVersion,
 ) -> Option<Result<PackStreamValue>> {
-    let bolt_date_time = opt_res_ret!(BoltDateTime::parse(s));
-    let value_struct = opt_res_ret!(bolt_date_time.as_struct(jolt_version));
+    let bolt_date_time = opt_res_ret!(JoltDateTime::parse(s));
+    let value_struct = opt_res_ret!(bolt_date_time.into_struct(jolt_version));
     Some(Ok(PackStreamValue::Struct(value_struct)))
 }
 
 fn transcode_duration_value(s: &str) -> Option<Result<PackStreamValue>> {
-    let bolt_duration = opt_res_ret!(BoltDuration::parse(s));
+    let bolt_duration = opt_res_ret!(JoltDuration::parse(s));
     let value_struct = opt_res_ret!(bolt_duration.as_struct());
     Some(Ok(PackStreamValue::Struct(value_struct)))
 }
@@ -661,8 +679,11 @@ impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> Debug for Validato
 }
 
 impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ScriptLine for ValidatorImpl<T> {
-    fn original_line<'a>(&self, script: &'a str) -> &'a str {
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
         self.ctx.original_line(script)
+    }
+    fn line_number(&self) -> Option<usize> {
+        Some(self.ctx.start_line_number)
     }
 }
 
@@ -924,8 +945,13 @@ fn build_jolt_validator(
     }
     let (sigil, expected) = expected.into_iter().next().expect("non-empty check above");
     let (versionless_sigil, jolt_version) = parse_jolt_sigil(&sigil, config)?;
-    Ok(match versionless_sigil {
-        "?" => {
+    let Some(parsed_sigil) = JoltSigil::from_str(versionless_sigil) else {
+        return Ok(IsJoltValidator::No(
+            [(sigil, expected)].into_iter().collect(),
+        ));
+    };
+    Ok(match parsed_sigil {
+        JoltSigil::Bool => {
             if is_match_all(&expected) {
                 match_any!("bool", PackStreamValue::Boolean(_));
             }
@@ -936,7 +962,7 @@ fn build_jolt_validator(
             }
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
         }
-        "Z" => {
+        JoltSigil::Integer => {
             if is_match_all(&expected) {
                 match_any!("integer", PackStreamValue::Integer(_));
             }
@@ -955,7 +981,7 @@ fn build_jolt_validator(
                 config,
             )?)
         }
-        "R" => {
+        JoltSigil::Float => {
             if is_match_all(&expected) {
                 match_any!("float", PackStreamValue::Float(_));
             }
@@ -976,7 +1002,7 @@ fn build_jolt_validator(
                 }
             }))
         }
-        "U" => {
+        JoltSigil::String => {
             if is_match_all(&expected) {
                 match_any!("string", PackStreamValue::String(_));
             }
@@ -987,7 +1013,7 @@ fn build_jolt_validator(
             }
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
         }
-        "#" => {
+        JoltSigil::Bytes => {
             if is_match_all(&expected) {
                 match_any!("bytes", PackStreamValue::Bytes(_));
             }
@@ -997,7 +1023,7 @@ fn build_jolt_validator(
                 _ => Err(anyhow!("Expected bytes {:?} found {:?}", &bytes, msg)),
             }))
         }
-        "[]" => {
+        JoltSigil::List => {
             if is_match_all(&expected) {
                 match_any!("list", PackStreamValue::List(_));
             }
@@ -1008,7 +1034,7 @@ fn build_jolt_validator(
             }
             IsJoltValidator::Yes(build_field_validator(expected, config)?)
         }
-        "{}" => {
+        JoltSigil::Dict => {
             if is_match_all(&expected) {
                 match_any!("map", PackStreamValue::Dict(_));
             }
@@ -1019,7 +1045,7 @@ fn build_jolt_validator(
             };
             IsJoltValidator::Yes(build_map_validator(expected, config)?)
         }
-        "T" => {
+        JoltSigil::Temporal => {
             let JsonValue::String(expected) = expected else {
                 return Err(ParseError::new(format!(
                     "Expected temporal string after sigil \"T\", but found {expected:?}",
@@ -1037,10 +1063,10 @@ fn build_jolt_validator(
                 })?;
             IsJoltValidator::Yes(validator)
         }
-        "@" => {
+        JoltSigil::Spatial => {
             if is_match_all(&expected) {
                 return Ok(IsJoltValidator::Yes(Box::new(|msg| match msg {
-                    PackStreamValue::Struct(Struct { tag, fields }) => {
+                    PackStreamValue::Struct(PackStreamStruct { tag, fields }) => {
                         match (tag, fields.as_slice()) {
                             (
                                 &TAG_POINT_2D,
@@ -1061,14 +1087,14 @@ fn build_jolt_validator(
                     "Expected spatial string after sigil \"@\", but found {expected:?}",
                 )));
             };
-            let bolt_point = BoltPoint::parse(&expected)?;
+            let bolt_point = JoltPoint::parse(&expected)?;
             let expected = PackStreamValue::Struct(bolt_point.as_struct());
             IsJoltValidator::Yes(Box::new(move |msg| match msg == &expected {
                 true => Ok(()),
                 false => Err(anyhow!("Expected {:?} found {:?}", expected, msg)),
             }))
         }
-        "()" => {
+        JoltSigil::Node => {
             let fixed_syntax = format!(
                 r#"{{"\{sigil}": {}}}"#,
                 serde_json_ext::compact_pretty_print(&expected)
@@ -1079,7 +1105,7 @@ fn build_jolt_validator(
                 If you meant to match a map, use `{fixed_syntax}` instead.",
             )));
         }
-        "->" | "<-" => {
+        JoltSigil::RelationshipForward | JoltSigil::RelationshipBackward => {
             let fixed_syntax = format!(
                 r#"{{"\{sigil}": {}}}"#,
                 serde_json_ext::compact_pretty_print(&expected)
@@ -1090,7 +1116,7 @@ fn build_jolt_validator(
                 If you meant to match a map, use `{fixed_syntax}` instead.",
             )));
         }
-        ".." => {
+        JoltSigil::Path => {
             let fixed_syntax = format!(
                 r#"{{"\{sigil}": {}}}"#,
                 serde_json_ext::compact_pretty_print(&expected)
@@ -1101,7 +1127,6 @@ fn build_jolt_validator(
                 If you meant to match a map, use `{fixed_syntax}` instead.",
             )));
         }
-        _ => IsJoltValidator::No([(sigil, expected)].into_iter().collect()),
     })
 }
 
@@ -1218,14 +1243,16 @@ fn parse_hex_string(s: &str) -> Result<Vec<u8>> {
 fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
-            PackStreamValue::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                (&TAG_DATE, [PackStreamValue::Integer(_)]) => Ok(()),
-                _ => Err(anyhow!("Expected any date struct found {msg:?}")),
-            },
+            PackStreamValue::Struct(PackStreamStruct { tag, fields }) => {
+                match (tag, fields.as_slice()) {
+                    (&TAG_DATE, [PackStreamValue::Integer(_)]) => Ok(()),
+                    _ => Err(anyhow!("Expected any date struct found {msg:?}")),
+                }
+            }
             _ => Err(anyhow!("Expected any date struct found {msg:?}")),
         })));
     }
-    let bolt_date = opt_res_ret!(BoltDate::parse(s));
+    let bolt_date = opt_res_ret!(JoltDate::parse(s));
     let expected_struct = opt_res_ret!(bolt_date.as_struct());
     Some(Ok(build_struct_match_validator(expected_struct)))
 }
@@ -1249,15 +1276,19 @@ fn build_date_validator(s: &str) -> Option<Result<ValidateValueFn>> {
 fn build_time_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
-            PackStreamValue::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                (&TAG_LOCAL_TIME, [PackStreamValue::Integer(_)]) => Ok(()),
-                (&TAG_TIME, [PackStreamValue::Integer(_), PackStreamValue::Integer(_)]) => Ok(()),
-                _ => Err(anyhow!("Expected any time struct found {msg:?}")),
-            },
+            PackStreamValue::Struct(PackStreamStruct { tag, fields }) => {
+                match (tag, fields.as_slice()) {
+                    (&TAG_LOCAL_TIME, [PackStreamValue::Integer(_)]) => Ok(()),
+                    (&TAG_TIME, [PackStreamValue::Integer(_), PackStreamValue::Integer(_)]) => {
+                        Ok(())
+                    }
+                    _ => Err(anyhow!("Expected any time struct found {msg:?}")),
+                }
+            }
             _ => Err(anyhow!("Expected any time struct found {msg:?}")),
         })));
     }
-    let bolt_time = opt_res_ret!(BoltTime::parse(s));
+    let bolt_time = opt_res_ret!(JoltTime::parse(s));
     let expected_struct = opt_res_ret!(bolt_time.as_struct());
     Some(Ok(build_struct_match_validator(expected_struct)))
 }
@@ -1277,7 +1308,7 @@ fn build_date_time_validator(
 ) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(move |msg| match msg {
-            PackStreamValue::Struct(Struct { tag, fields }) => {
+            PackStreamValue::Struct(PackStreamStruct { tag, fields }) => {
                 match (jolt_version, tag, fields.as_slice()) {
                     (
                         JoltVersion::V1,
@@ -1306,8 +1337,8 @@ fn build_date_time_validator(
             _ => Err(anyhow!("Expected any date time struct found {msg:?}")),
         })));
     }
-    let bolt_date_time = opt_res_ret!(BoltDateTime::parse(s));
-    let expected_struct = opt_res_ret!(bolt_date_time.as_struct(jolt_version));
+    let bolt_date_time = opt_res_ret!(JoltDateTime::parse(s));
+    let expected_struct = opt_res_ret!(bolt_date_time.into_struct(jolt_version));
     Some(Ok(build_struct_match_validator(expected_struct)))
 }
 
@@ -1325,22 +1356,24 @@ fn build_date_time_validator(
 fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     if s == "*" {
         return Some(Ok(Box::new(|msg| match msg {
-            PackStreamValue::Struct(Struct { tag, fields }) => match (tag, fields.as_slice()) {
-                (
-                    &TAG_DURATION,
-                    [PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_)],
-                ) => Ok(()),
-                _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
-            },
+            PackStreamValue::Struct(PackStreamStruct { tag, fields }) => {
+                match (tag, fields.as_slice()) {
+                    (
+                        &TAG_DURATION,
+                        [PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_), PackStreamValue::Integer(_)],
+                    ) => Ok(()),
+                    _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
+                }
+            }
             _ => Err(anyhow!("Expected any duration struct found {msg:?}")),
         })));
     }
-    let BoltDuration {
+    let JoltDuration {
         months,
         days,
         seconds,
         nanos,
-    } = opt_res_ret!(BoltDuration::parse(s));
+    } = opt_res_ret!(JoltDuration::parse(s));
     let total_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
     Some(Ok(Box::new(move |msg| match msg {
         PackStreamValue::Struct(received) => {
@@ -1349,7 +1382,11 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
                     "Expected duration (tag {TAG_DURATION:#X}), found {msg:?}",
                 ));
             }
-            fn get_int_field(i: usize, name: &str, received: &Struct) -> anyhow::Result<i64> {
+            fn get_int_field(
+                i: usize,
+                name: &str,
+                received: &PackStreamStruct,
+            ) -> anyhow::Result<i64> {
                 match received.fields.get(i) {
                     None => Err(anyhow!(
                         "Received invalid duration: {:?} (missing {name})",
@@ -1390,7 +1427,7 @@ fn build_duration_validator(s: &str) -> Option<Result<ValidateValueFn>> {
     })))
 }
 
-fn build_struct_match_validator(expected: Struct) -> ValidateValueFn {
+fn build_struct_match_validator(expected: PackStreamStruct) -> ValidateValueFn {
     let expected = PackStreamValue::Struct(expected);
     Box::new(move |msg| match msg == &expected {
         true => Ok(()),
@@ -1606,6 +1643,8 @@ mod test {
         let ctx = Context {
             start_line_number: 0,
             end_line_number: 0,
+            start_byte: 0,
+            end_byte: 0,
         };
         let cfg = ActorConfig {
             bolt_version: BoltVersion::V5_0,

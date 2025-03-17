@@ -11,24 +11,19 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
 };
 use crate::values;
-use crate::values::bolt_value::Struct;
-use crate::values::BoltMessage;
+use crate::values::bolt_message::BoltMessage;
+use crate::values::pack_stream_value::PackStreamStruct;
 
-pub struct NetActor<T> {
+pub struct NetActor<'a, T> {
     ct: CancellationToken,
     conn: T,
     name: String,
-    script: &'static ActorScript,
+    script: &'a ActorScript<'a>,
     peeked_message: Option<BoltMessage>,
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
-    pub fn new(
-        ct: CancellationToken,
-        conn: T,
-        name: String,
-        script: &'static ActorScript,
-    ) -> NetActor<T> {
+impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
+    pub fn new(ct: CancellationToken, conn: T, name: String, script: &'a ActorScript) -> Self {
         NetActor {
             ct,
             conn,
@@ -102,7 +97,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                     if validator.validate(peeked_message).is_err() {
                         return Ok(false);
                     }
-                    _ = self.read_message().await?; // consume the message
+                    _ = self.read_message(*validator).await?; // consume the message
                     debug!("client line ({ctx}) matched: done");
                     state.done = true;
                     Ok(true)
@@ -224,9 +219,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
                 {
                     return Ok(false);
                 }
-                _ = self.read_message().await?; // consume the message
-                let response = auto_handler.server_sender.send()?;
-                self.write_message(response).await.context(*ctx)?;
+                _ = self.read_message(&*auto_handler.client_validator).await?; // consume the message
+                self.write_message(&*auto_handler.server_sender)
+                    .await
+                    .context(*ctx)?;
                 debug!("auto message ({ctx}) matched: done");
                 state.done = true;
                 Ok(true)
@@ -263,8 +259,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
             BlockWithState::ServerMessageSend(state, ctx, sender) => match state.done {
                 true => Ok(()),
                 false => {
-                    let data = sender.send()?;
-                    self.write_message(data).await.context(*ctx)?;
+                    self.write_message(*sender).await.context(*ctx)?;
                     state.done = true;
                     debug!("server line ({ctx}) written: done");
                     Ok(())
@@ -342,6 +337,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
     }
 
     async fn handshake(&mut self) -> Result<()> {
+        // TODO: Log handshake
         let mut buffer = [0u8; 20];
         select! {
             res = self.conn.read_exact(&mut buffer) => {
@@ -445,11 +441,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         }
     }
 
-    async fn read_message(&mut self) -> Result<BoltMessage> {
+    async fn read_message(&mut self, line: &dyn ClientMessageValidator) -> Result<BoltMessage> {
         if let Some(peeked) = self.peeked_message.take() {
+            info!("{}", self.fmt_writer_message(&peeked, line));
             return Ok(peeked);
         }
-        Self::read_unbuffered_message(&mut self.conn, self.script.config.bolt_version).await
+        let res =
+            Self::read_unbuffered_message(&mut self.conn, self.script.config.bolt_version).await?;
+        info!("{}", self.fmt_writer_message(&res, line));
+        Ok(res)
+    }
+
+    fn fmt_writer_message(&self, msg: &BoltMessage, sender: &dyn ClientMessageValidator) -> String {
+        let line = msg.repr();
+        match sender.line_number() {
+            None => format!("(   ?) C: {line}"),
+            Some(line_number) => format!("({line_number:4}) C: {line}"),
+        }
     }
 
     async fn read_unbuffered_message(
@@ -475,9 +483,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         parse_message(message_buffer, bolt_version)
     }
 
-    async fn write_message(&mut self, mut data: &[u8]) -> Result<()> {
-        // TODO: proper message formatting
-        info!("{data:?}");
+    async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> Result<()> {
+        let mut data = sender.send()?;
+        info!("{}", self.fmt_sender_message(sender));
         while !data.is_empty() {
             let chunk_size = data.len().min(0xFFFF);
             // chunk header
@@ -491,6 +499,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<T> {
         // message end
         self.conn.write_all(&[0, 0]).await?;
         Ok(())
+    }
+
+    fn fmt_sender_message(&self, sender: &dyn ServerMessageSender) -> String {
+        let line = sender.line_repr(self.script.script.input);
+        match sender.line_number() {
+            None => format!("(AUTO) S: {line}"),
+            Some(line_number) => format!("({line_number:4}) S: {line}"),
+        }
     }
 
     async fn peek_message<'buf>(
@@ -677,14 +693,14 @@ fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> Result<BoltMessage
         ));
     }
 
-    let value = values::bolt_value::PackStreamValue::from_data_consume_all(&data)
+    let value = values::pack_stream_value::PackStreamValue::from_data_consume_all(&data)
         .context("Parsing bolt message")?;
-    let values::bolt_value::PackStreamValue::Struct(Struct { tag, fields }) = value else {
+    let values::pack_stream_value::PackStreamValue::Struct(PackStreamStruct { tag, fields }) =
+        value
+    else {
         return Err(anyhow!("Expected a bolt message but got: {:?}.", value));
     };
-    // TODO: get rid of the debug format and properly log the message in a pretty format
     let msg = BoltMessage::new(tag, fields, bolt_version);
-    info!("{msg:?}");
     Ok(msg)
 }
 
@@ -705,8 +721,11 @@ mod tests {
         }
 
         impl ScriptLine for TestValidator {
-            fn original_line<'a>(&self, _script: &'a str) -> &'a str {
+            fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, _script: &'a str) -> &'c str {
                 ""
+            }
+            fn line_number(&self) -> Option<usize> {
+                None
             }
         }
 
@@ -725,23 +744,23 @@ mod tests {
             }
         }
 
+        fn make_ctx(start_line_number: usize, end_line_number: usize) -> Context {
+            Context {
+                start_line_number,
+                end_line_number,
+                start_byte: 0,
+                end_byte: 0,
+            }
+        }
+
         #[test]
         fn should_ok() {
             let test_block = ActorBlock::Alt(
-                Context {
-                    start_line_number: 0,
-                    end_line_number: 1,
-                },
+                make_ctx(0, 1),
                 vec![ActorBlock::BlockList(
-                    Context {
-                        start_line_number: 1,
-                        end_line_number: 3,
-                    },
+                    make_ctx(1, 3),
                     vec![ActorBlock::ClientMessageValidate(
-                        Context {
-                            start_line_number: 2,
-                            end_line_number: 2,
-                        },
+                        make_ctx(2, 2),
                         Box::new(TestValidator { valid: true }),
                     )],
                 )],
@@ -756,20 +775,11 @@ mod tests {
         #[test]
         fn should_fail() {
             let test_block = ActorBlock::Alt(
-                Context {
-                    start_line_number: 0,
-                    end_line_number: 1,
-                },
+                make_ctx(0, 1),
                 vec![ActorBlock::BlockList(
-                    Context {
-                        start_line_number: 1,
-                        end_line_number: 3,
-                    },
+                    make_ctx(1, 3),
                     vec![ActorBlock::ClientMessageValidate(
-                        Context {
-                            start_line_number: 2,
-                            end_line_number: 2,
-                        },
+                        make_ctx(2, 2),
                         Box::new(TestValidator { valid: false }),
                     )],
                 )],
@@ -784,58 +794,31 @@ mod tests {
         #[test]
         fn nested_pass() {
             let test_block = ActorBlock::Alt(
-                Context {
-                    start_line_number: 0,
-                    end_line_number: 1,
-                },
+                make_ctx(0, 1),
                 vec![
                     ActorBlock::BlockList(
-                        Context {
-                            start_line_number: 1,
-                            end_line_number: 3,
-                        },
+                        make_ctx(1, 3),
                         vec![ActorBlock::ClientMessageValidate(
-                            Context {
-                                start_line_number: 2,
-                                end_line_number: 2,
-                            },
+                            make_ctx(2, 2),
                             Box::new(TestValidator { valid: false }),
                         )],
                     ),
                     ActorBlock::BlockList(
-                        Context {
-                            start_line_number: 1,
-                            end_line_number: 3,
-                        },
+                        make_ctx(1, 3),
                         vec![ActorBlock::Alt(
-                            Context {
-                                start_line_number: 0,
-                                end_line_number: 1,
-                            },
+                            make_ctx(0, 1),
                             vec![
                                 ActorBlock::BlockList(
-                                    Context {
-                                        start_line_number: 1,
-                                        end_line_number: 3,
-                                    },
+                                    make_ctx(1, 3),
                                     vec![ActorBlock::ClientMessageValidate(
-                                        Context {
-                                            start_line_number: 2,
-                                            end_line_number: 2,
-                                        },
+                                        make_ctx(2, 2),
                                         Box::new(TestValidator { valid: false }),
                                     )],
                                 ),
                                 ActorBlock::BlockList(
-                                    Context {
-                                        start_line_number: 1,
-                                        end_line_number: 3,
-                                    },
+                                    make_ctx(1, 3),
                                     vec![ActorBlock::ClientMessageValidate(
-                                        Context {
-                                            start_line_number: 2,
-                                            end_line_number: 2,
-                                        },
+                                        make_ctx(2, 2),
                                         Box::new(TestValidator { valid: true }),
                                     )],
                                 ),
@@ -854,58 +837,31 @@ mod tests {
         #[test]
         fn nested_failure() {
             let test_block = ActorBlock::Alt(
-                Context {
-                    start_line_number: 0,
-                    end_line_number: 1,
-                },
+                make_ctx(0, 1),
                 vec![
                     ActorBlock::BlockList(
-                        Context {
-                            start_line_number: 1,
-                            end_line_number: 3,
-                        },
+                        make_ctx(1, 3),
                         vec![ActorBlock::ClientMessageValidate(
-                            Context {
-                                start_line_number: 2,
-                                end_line_number: 2,
-                            },
+                            make_ctx(2, 2),
                             Box::new(TestValidator { valid: false }),
                         )],
                     ),
                     ActorBlock::BlockList(
-                        Context {
-                            start_line_number: 1,
-                            end_line_number: 3,
-                        },
+                        make_ctx(1, 3),
                         vec![ActorBlock::Alt(
-                            Context {
-                                start_line_number: 0,
-                                end_line_number: 1,
-                            },
+                            make_ctx(0, 1),
                             vec![
                                 ActorBlock::BlockList(
-                                    Context {
-                                        start_line_number: 1,
-                                        end_line_number: 3,
-                                    },
+                                    make_ctx(1, 3),
                                     vec![ActorBlock::ClientMessageValidate(
-                                        Context {
-                                            start_line_number: 2,
-                                            end_line_number: 2,
-                                        },
+                                        make_ctx(2, 2),
                                         Box::new(TestValidator { valid: false }),
                                     )],
                                 ),
                                 ActorBlock::BlockList(
-                                    Context {
-                                        start_line_number: 1,
-                                        end_line_number: 3,
-                                    },
+                                    make_ctx(1, 3),
                                     vec![ActorBlock::ClientMessageValidate(
-                                        Context {
-                                            start_line_number: 2,
-                                            end_line_number: 2,
-                                        },
+                                        make_ctx(2, 2),
                                         Box::new(TestValidator { valid: false }),
                                     )],
                                 ),

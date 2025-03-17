@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicI64;
 
 use indexmap::{indexmap, IndexMap};
 
-use crate::values::bolt_value::PackStreamValue;
+use crate::values::pack_stream_value::PackStreamValue;
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
 pub enum BoltVersion {
@@ -155,7 +155,17 @@ impl BoltVersion {
         })
     }
 
-    pub fn message_name_from_request(&self, tag: u8) -> Option<&'static str> {
+    pub fn message_tag_from_response(&self, name: &str) -> Option<u8> {
+        Some(match name {
+            "SUCCESS" => 0x70,
+            "IGNORED" => 0x7E,
+            "FAILURE" => 0x7F,
+            "RECORD" => 0x71,
+            _ => return None,
+        })
+    }
+
+    pub fn message_name_from_tag(&self, tag: u8) -> Option<&'static str> {
         Some(match tag {
             0x01 if self < &BoltVersion::V3 => "INIT",
             0x01 if self >= &BoltVersion::V3 => "HELLO",
@@ -174,16 +184,10 @@ impl BoltVersion {
             0x12 => "COMMIT",
             0x13 => "ROLLBACK",
             0x66 if self >= &BoltVersion::V4_3 => "ROUTE",
-            _ => return None,
-        })
-    }
-
-    pub fn message_tag_from_response(&self, name: &str) -> Option<u8> {
-        Some(match name {
-            "SUCCESS" => 0x70,
-            "IGNORED" => 0x7E,
-            "FAILURE" => 0x7F,
-            "RECORD" => 0x71,
+            0x70 => "SUCCESS",
+            0x7E => "IGNORED",
+            0x7F => "FAILURE",
+            0x71 => "RECORD",
             _ => return None,
         })
     }

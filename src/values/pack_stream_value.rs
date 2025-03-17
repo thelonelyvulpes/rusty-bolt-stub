@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::convert::Into;
+use std::fmt::{Display, Formatter};
 use std::io::Write;
 
 use anyhow::{anyhow, Result};
@@ -20,7 +21,10 @@ use indexmap::IndexMap;
 use nom::ToUsize;
 use usize_cast::FromUsize;
 
-// TODO: rename to BoltValue
+use crate::bolt_version::JoltVersion;
+use crate::jolt::JoltSigil;
+use crate::values::bolt_struct::BoltStruct;
+
 #[allow(unused)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -33,11 +37,11 @@ pub enum PackStreamValue {
     String(String),
     List(Vec<PackStreamValue>),
     Dict(IndexMap<String, PackStreamValue>),
-    Struct(Struct),
+    Struct(PackStreamStruct),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Struct {
+pub struct PackStreamStruct {
     pub tag: u8,
     pub fields: Vec<PackStreamValue>,
 }
@@ -57,7 +61,7 @@ impl PackStreamValue {
         Ok(value)
     }
 
-    pub(crate) fn to_data(&self) -> Vec<u8> {
+    pub(crate) fn as_data(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(128);
         let mut serializer = PackStreamSerializer::new(&mut data);
         serializer.write(self);
@@ -123,7 +127,7 @@ impl_value_from_into!(PackStreamValue::String, &str);
 impl_value_from_into!(PackStreamValue::Bytes, &[u8]);
 
 impl_value_from_owned!(PackStreamValue::String, String);
-impl_value_from_owned!(PackStreamValue::Struct, Struct);
+impl_value_from_owned!(PackStreamValue::Struct, PackStreamStruct);
 // impl_value_from_owned!(Value::List, Vec<Value>);
 // impl_value_from_owned!(Value::Map, HashMap<String, Value>);
 impl<T: Into<PackStreamValue>> From<IndexMap<String, T>> for PackStreamValue {
@@ -385,13 +389,13 @@ impl PackStreamValue {
     }
 }
 
-impl TryFrom<PackStreamValue> for (u8, Vec<PackStreamValue>) {
+impl TryFrom<PackStreamValue> for PackStreamStruct {
     type Error = PackStreamValue;
 
     #[inline]
     fn try_from(value: PackStreamValue) -> Result<Self, Self::Error> {
         match value {
-            PackStreamValue::Struct(Struct { tag, fields }) => Ok((tag, fields)),
+            PackStreamValue::Struct(struct_) => Ok(struct_),
             _ => Err(value),
         }
     }
@@ -404,16 +408,16 @@ impl PackStreamValue {
     }
 
     #[inline]
-    pub fn as_struct(&self) -> Option<(u8, &Vec<PackStreamValue>)> {
+    pub fn as_struct(&self) -> Option<&PackStreamStruct> {
         match self {
-            PackStreamValue::Struct(Struct { tag, fields }) => Some((*tag, fields)),
+            PackStreamValue::Struct(struct_) => Some(struct_),
             _ => None,
         }
     }
 
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_into_struct(self) -> Result<(u8, Vec<PackStreamValue>), Self> {
+    pub fn try_into_struct(self) -> Result<PackStreamStruct, Self> {
         self.try_into()
     }
 }
@@ -566,7 +570,7 @@ impl<'a> PackStreamDecoder<'a> {
         for _ in 0..length {
             fields.push(self.read()?)
         }
-        let bolt_struct = PackStreamValue::Struct(Struct { tag, fields });
+        let bolt_struct = PackStreamValue::Struct(PackStreamStruct { tag, fields });
         Ok(bolt_struct)
     }
 
@@ -680,7 +684,7 @@ impl<'a> PackStreamSerializer<'a> {
                     self.write(v);
                 }
             }
-            PackStreamValue::Struct(Struct { tag, fields }) => {
+            PackStreamValue::Struct(PackStreamStruct { tag, fields }) => {
                 self.write_struct_header(
                     *tag,
                     fields
@@ -808,4 +812,105 @@ impl<'a> PackStreamSerializer<'a> {
     fn write_struct_header(&mut self, tag: u8, size: u8) {
         self.write_all(&[0xB0 + size, tag]);
     }
+}
+
+pub(crate) fn value_jolt_fmt(
+    value: &PackStreamValue,
+    jolt_version: JoltVersion,
+) -> impl Display + '_ {
+    struct Repr<'a> {
+        value: &'a PackStreamValue,
+        jolt_version: JoltVersion,
+    }
+
+    impl Display for Repr<'_> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            match self.value {
+                PackStreamValue::Null => f.write_str("null"),
+                PackStreamValue::Boolean(b) => Display::fmt(&b, f),
+                PackStreamValue::Integer(i) => Display::fmt(&i, f),
+                PackStreamValue::Float(v) => Display::fmt(&v, f),
+                PackStreamValue::Bytes(b) => {
+                    f.write_str(r##"{{"#": "##)?;
+                    let mut bytes = b.iter();
+                    match bytes.next() {
+                        None => {}
+                        Some(first) => {
+                            write!(f, "{first:02X}")?;
+                            for u in bytes {
+                                write!(f, " {u:02X}")?;
+                            }
+                        }
+                    }
+                    f.write_str("}")
+                }
+                PackStreamValue::String(s) => std::fmt::Debug::fmt(&s, f),
+                PackStreamValue::List(l) => {
+                    f.write_str("[")?;
+                    write_joined_values(f, l, self.jolt_version)?;
+                    f.write_str("]")
+                }
+                PackStreamValue::Dict(m) => {
+                    let (start, end) = match m.keys().next().and_then(|k| JoltSigil::from_str(k)) {
+                        Some(_) => {
+                            // dict could be confused with Jolt => encode as Jolt Dict
+                            (r#"{"{}": {"#, "}}")
+                        }
+                        None => ("{", "}"),
+                    };
+                    f.write_str(start)?;
+                    write_joined_entries(f, m.iter(), self.jolt_version)?;
+                    f.write_str(end)
+                }
+                PackStreamValue::Struct(s) => match BoltStruct::read(s, self.jolt_version) {
+                    None => {
+                        write!(f, "Struct[{:#04X}]{{", s.tag)?;
+                        write_joined_values(f, &s.fields, self.jolt_version)?;
+                        f.write_str("}}")
+                    }
+                    Some(bolt_struct) => Display::fmt(&bolt_struct.jolt_fmt(self.jolt_version), f),
+                },
+            }
+        }
+    }
+
+    Repr {
+        value,
+        jolt_version,
+    }
+}
+
+pub(super) fn write_joined_values(
+    f: &mut Formatter<'_>,
+    values: &[PackStreamValue],
+    jolt_version: JoltVersion,
+) -> std::fmt::Result {
+    let mut values = values.iter();
+    if let Some(value) = values.next() {
+        Display::fmt(&value_jolt_fmt(value, jolt_version), f)?;
+        for value in values {
+            f.write_str(", ")?;
+            Display::fmt(&value_jolt_fmt(value, jolt_version), f)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn write_joined_entries<'e>(
+    f: &mut Formatter<'_>,
+    mut entries: impl Iterator<Item = (&'e String, &'e PackStreamValue)>,
+    jolt_version: JoltVersion,
+) -> std::fmt::Result {
+    if let Some((k, v)) = entries.next() {
+        std::fmt::Debug::fmt(k, f)?;
+        f.write_str(": ")?;
+        Display::fmt(&value_jolt_fmt(v, jolt_version), f)?;
+        for (k, v) in entries {
+            f.write_str(", ")?;
+            std::fmt::Debug::fmt(k, f)?;
+            f.write_str(": ")?;
+            Display::fmt(&value_jolt_fmt(v, jolt_version), f)?;
+        }
+    }
+    Ok(())
 }
