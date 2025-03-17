@@ -443,16 +443,16 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
 
     async fn read_message(&mut self, line: &dyn ClientMessageValidator) -> Result<BoltMessage> {
         if let Some(peeked) = self.peeked_message.take() {
-            info!("{}", self.fmt_writer_message(&peeked, line));
+            info!("{}", self.fmt_reader_message(&peeked, line));
             return Ok(peeked);
         }
         let res =
             Self::read_unbuffered_message(&mut self.conn, self.script.config.bolt_version).await?;
-        info!("{}", self.fmt_writer_message(&res, line));
+        info!("{}", self.fmt_reader_message(&res, line));
         Ok(res)
     }
 
-    fn fmt_writer_message(&self, msg: &BoltMessage, sender: &dyn ClientMessageValidator) -> String {
+    fn fmt_reader_message(&self, msg: &BoltMessage, sender: &dyn ClientMessageValidator) -> String {
         let line = msg.repr();
         match sender.line_number() {
             None => format!("(   ?) C: {line}"),
