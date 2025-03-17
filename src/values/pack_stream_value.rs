@@ -52,7 +52,7 @@ impl PackStreamValue {
         let value = decoder.read()?;
         if decoder.index != data.len() {
             return Err(anyhow!(
-                "Unconsumed data ({} byes) {:?} read: {:?}",
+                "Unconsumed data ({} bytes) {:?} read: {:?}",
                 data.len() - decoder.index,
                 data,
                 value

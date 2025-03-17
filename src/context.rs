@@ -11,11 +11,11 @@ pub struct Context {
 
 impl Display for Context {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "lines {}-{}",
-            self.start_line_number, self.end_line_number
-        )
+        let (start, end) = (self.start_line_number, self.end_line_number);
+        if start == end {
+            return write!(f, "line {start}");
+        }
+        write!(f, "lines {start}-{end}")
     }
 }
 

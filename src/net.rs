@@ -105,13 +105,17 @@ impl Server {
                             let script = self.server_script_cfg;
                             let name = addr.to_string();
                             let mut actor = NetActor::new(
-                                connection_cancellation_token,
+                                connection_cancellation_token.child_token(),
                                 conn,
                                 name,
                                 script,
                             );
                             handles.spawn(async move {
-                                actor.run_client_connection().await
+                                let res = actor.run_client_connection().await;
+                                if res.is_err() {
+                                    connection_cancellation_token.cancel();
+                                }
+                                res
                             });
 
                             if !concurrent || !restarts {

@@ -37,19 +37,38 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     pub async fn run_client_connection(&mut self) -> Result<()> {
         self.handshake().await?;
         let mut block = BlockWithState::new(&self.script.tree);
+        match self.run_block(&mut block).await {
+            Err(err) if block.can_skip() => {
+                debug!("Ignoring server action error because script reached the end: {err:#}");
+                Ok(())
+            }
+            res => res,
+        }
+    }
+
+    async fn run_block(&mut self, block: &mut BlockWithState<'_>) -> Result<()> {
         loop {
-            self.server_action(&mut block).await?;
+            self.server_action(block).await?;
             if block.done() {
                 break;
             }
-            if !self.try_consume(&mut block).await? {
-                let msg = self.format_script_missmatch(&block);
-                return Err(anyhow::Error::msg(msg));
+            match self.try_consume(block).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let msg = self.format_script_missmatch(block);
+                    return Err(anyhow::Error::msg(msg));
+                }
+                Err(err) => {
+                    let msg = self.format_scrip_read_failure(block, &err);
+                    return Err(anyhow::Error::msg(msg));
+                }
             }
         }
         Ok(())
     }
 
+    /// Doesn't progress the state if the call fails.
+    ///
     /// # Returns
     /// bool indicates if a message could be consumed `true` or there was a script mismatch `false`
     async fn try_consume(&mut self, block: &mut BlockWithState<'_>) -> Result<bool> {
@@ -221,7 +240,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 _ = self.read_message(&*auto_handler.client_validator).await?; // consume the message
                 self.write_message(&*auto_handler.server_sender)
                     .await
-                    .context(*ctx)?;
+                    .with_context(|| format!("Reading on {ctx}"))?;
                 debug!("auto message ({ctx}) matched: done");
                 state.done = true;
                 Ok(true)
@@ -234,15 +253,20 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         }
     }
 
+    /// Progresses the state even if the call fails.
     async fn server_action(&mut self, block: &mut BlockWithState<'_>) -> Result<()> {
         match block {
             BlockWithState::BlockList(state, ctx, blocks) => {
                 let blocks_len = blocks.len();
+                let mut error = None;
                 loop {
                     let Some(block) = blocks.get_mut(state.current_block) else {
                         break;
                     };
-                    Box::pin(self.server_action(block)).await?;
+                    let res = Box::pin(self.server_action(block)).await;
+                    if let Err(err) = res {
+                        error.get_or_insert(err);
+                    }
                     if !block.done() {
                         break;
                     }
@@ -253,15 +277,22 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         state.current_block + 1
                     );
                 }
-                Ok(())
+                match error {
+                    None => Ok(()),
+                    Some(err) => Err(err),
+                }
             }
             BlockWithState::ServerMessageSend(state, ctx, sender) => match state.done {
                 true => Ok(()),
                 false => {
-                    self.write_message(*sender).await.context(*ctx)?;
+                    let res = self
+                        .write_message(*sender)
+                        .await
+                        .with_context(|| format!("Sending on {ctx}"))
+                        .inspect_err(|err| info!("Error sending message: {err}"));
                     state.done = true;
-                    debug!("server line ({ctx}) written: done");
-                    Ok(())
+                    debug!("server line ({ctx}): done");
+                    res
                 }
             },
             BlockWithState::Python(state, _, _command) => match state.done {
@@ -275,29 +306,36 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             BlockWithState::Alt(state, ctx, blocks) => match state {
                 BranchState::Init => Ok(()),
                 BranchState::InBlock(i) => {
-                    Box::pin(self.server_action(&mut blocks[*i])).await?;
+                    let res = Box::pin(self.server_action(&mut blocks[*i])).await;
                     if blocks[*i].done() {
                         debug!("alt block ({ctx}) child {} done: moving to Done", *i + 1);
                         *state = BranchState::Done
                     }
-                    Ok(())
+                    res
                 }
                 BranchState::Done => Ok(()),
             },
             BlockWithState::Parallel(state, ctx, blocks) => match state.done {
                 true => Ok(()),
                 false => {
+                    let mut error = None;
                     for block in blocks.iter_mut() {
                         if block.done() {
                             continue;
                         }
-                        Box::pin(self.server_action(block)).await?;
+                        let res = Box::pin(self.server_action(block)).await;
+                        if let Err(err) = res {
+                            error.get_or_insert(err);
+                        }
                     }
                     if blocks.iter().all(BlockWithState::done) {
                         debug!("parallel block ({ctx}) all children done: moving to Done");
                         state.done = true;
                     }
-                    Ok(())
+                    match error {
+                        None => Ok(()),
+                        Some(err) => Err(err),
+                    }
                 }
             },
             BlockWithState::Optional(state, ctx, block) => match state {
@@ -341,9 +379,36 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             Some(msg) => msg.repr(),
         };
         let script_name = &self.script.script.name;
+        let possible_verifiers = self.format_possible_verifiers(current_block);
+
+        format!(
+            "Script mismatch in {script_name:?}:\n\
+            Expected on of:\n\
+            {possible_verifiers}\n\n\
+            Received:\n\
+            {received}"
+        )
+    }
+
+    fn format_scrip_read_failure(
+        &self,
+        current_block: &BlockWithState<'_>,
+        err: &anyhow::Error,
+    ) -> String {
+        let script_name = &self.script.script.name;
+        let possible_verifiers = self.format_possible_verifiers(current_block);
+
+        format!(
+            "Read failure in {script_name:?}: {err:#}\n\
+            Expected on of:\n\
+            {possible_verifiers}"
+        )
+    }
+
+    fn format_possible_verifiers(&self, current_block: &BlockWithState<'_>) -> String {
         let possible_verifiers = &mut Vec::new();
         Self::current_verifiers(current_block, possible_verifiers);
-        let possible_verifiers = possible_verifiers
+        possible_verifiers
             .iter()
             .map(|v| {
                 let line = v.line_repr(self.script.script.input);
@@ -353,15 +418,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 }
             })
             .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            "Script mismatch in {script_name:?}:\n\
-            Expected on of:\n\
-            {possible_verifiers}\n\n\
-            Received:\n\
-            {received}"
-        )
+            .join("\n")
     }
 
     fn current_verifiers<'b>(
