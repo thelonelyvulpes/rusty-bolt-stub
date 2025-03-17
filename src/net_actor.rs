@@ -72,16 +72,16 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         }
                         return Ok(true);
                     }
-                    if block.can_skip() {
-                        state.current_block += 1;
-                        debug!(
-                            "list child block didn't match, but is skippable: \
-                            moving block list ({}) to {}/{blocks_len}",
-                            ctx,
-                            state.current_block + 1
-                        );
-                        continue;
+                    if !block.can_skip() {
+                        break;
                     }
+                    state.current_block += 1;
+                    debug!(
+                        "list child block didn't match, but is skippable: \
+                        moving block list ({}) to {}/{blocks_len}",
+                        ctx,
+                        state.current_block + 1
+                    );
                 }
                 Ok(false)
             }
@@ -230,7 +230,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             BlockWithState::ServerMessageSend(..)
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {
-                panic!("Should've called server_action before: {block:?}")
+                panic!("Should've called server_action before {block:?}")
             }
         }
     }
