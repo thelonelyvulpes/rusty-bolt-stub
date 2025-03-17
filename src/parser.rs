@@ -51,13 +51,13 @@ type ValidateValuesFn =
     Box<dyn Fn(&[PackStreamValue]) -> anyhow::Result<()> + 'static + Send + Sync>;
 
 pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
-    fn script_excerpt(script: &str, start: usize, end: usize) -> String {
+    fn script_excerpt(script: &str, start: usize, end: usize, column: Option<usize>) -> String {
         const CONTEXT_LINES: usize = 3;
 
         let line_num_max = script.lines().count();
         let line_num_width = line_num_max.to_string().len();
         let lines = script.lines().enumerate();
-        let mut excerpt_lines = Vec::<String>::with_capacity(end - start + 3 + 2 * CONTEXT_LINES);
+        let mut excerpt_lines = Vec::<String>::with_capacity(end - start + 4 + 2 + CONTEXT_LINES);
         if start.saturating_sub(CONTEXT_LINES) > 1 {
             excerpt_lines.push(format!("  {: >width$} ...", "", width = line_num_width));
         }
@@ -81,6 +81,19 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
                     "> {line_num: >width$} {line}",
                     width = line_num_width
                 ));
+            }
+            if let Some(column) = column {
+                if line_num == start {
+                    let spaces = line[..column].chars().count();
+                    excerpt_lines.push(
+                        std::iter::repeat(" ")
+                            .take(spaces + 3 + line_num_width)
+                            .chain(["^"].into_iter())
+                            .collect::<String>(),
+                    );
+                }
+            }
+            if line_num <= end {
                 continue;
             }
             // context after the excerpt
@@ -99,6 +112,17 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
         excerpt_lines.join("\n")
     }
 
+    fn get_line_offset(s: &str, line_nr: usize) -> usize {
+        let mut offset = 0;
+        for (i, line) in s.lines().enumerate() {
+            if i + 1 == line_nr {
+                return offset;
+            }
+            offset += line.len() + 1;
+        }
+        offset
+    }
+
     match res {
         Ok(t) => Ok(t),
         Err(mut e) => {
@@ -106,12 +130,23 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
             Err(match ctx {
                 None => anyhow::anyhow!("Error parsing script: {}", e.message),
                 Some(ctx) => {
+                    let start_line_offset = get_line_offset(script, ctx.start_line_number);
+                    let column = Some(ctx.start_byte - start_line_offset);
+                    // dbg!(&script[277..313]);
+                    // dbg!(&script[260..313]);
+                    // dbg!(&script[311..313]);
+                    // dbg!(&script[start_line_offset + column.unwrap()..313]);
                     if ctx.start_line_number == ctx.end_line_number {
                         anyhow::anyhow!(
                             "Error parsing script on line ({}): {}\n{}",
                             ctx.start_line_number,
                             e.message,
-                            script_excerpt(script, ctx.start_line_number, ctx.end_line_number)
+                            script_excerpt(
+                                script,
+                                ctx.start_line_number,
+                                ctx.end_line_number,
+                                column
+                            )
                         )
                     } else {
                         anyhow::anyhow!(
@@ -119,7 +154,12 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
                             ctx.start_line_number,
                             ctx.end_line_number,
                             e.message,
-                            script_excerpt(script, ctx.start_line_number, ctx.end_line_number)
+                            script_excerpt(
+                                script,
+                                ctx.start_line_number,
+                                ctx.end_line_number,
+                                column
+                            )
                         )
                     }
                 }
@@ -280,32 +320,42 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             validate_non_empty(&b, Some("inside a repeat block"))?;
             Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
         }
-        ScanBlock::ClientMessage(ctx, message_name, body_string) => {
-            let validator = create_validator(message_name, body_string.as_deref(), *ctx, config)
-                .map_err(|mut e| {
-                    e.ctx.get_or_insert(*ctx);
-                    e
-                })?;
+        ScanBlock::ClientMessage(ctx, message_name, body) => {
+            let validator = create_validator(
+                message_name,
+                *ctx,
+                body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
+                config,
+            )
+            .map_err(|mut e| {
+                e.ctx.get_or_insert(*ctx);
+                e
+            })?;
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
-        ScanBlock::ServerMessage(ctx, message_name, body_string) => {
+        ScanBlock::ServerMessage(ctx, message_name, body) => {
             // TODO: Implement parser for the special messages like S: <Sleep 2>
-            let server_message_sender =
-                create_message_sender(message_name, body_string.as_deref(), *ctx, config).map_err(
-                    |mut e| {
-                        e.ctx.get_or_insert(*ctx);
-                        e
-                    },
-                )?;
+            let server_message_sender = create_message_sender(
+                message_name,
+                *ctx,
+                body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
+                config,
+            )
+            .map_err(|mut e| {
+                e.ctx.get_or_insert(*ctx);
+                e
+            })?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
-        ScanBlock::AutoMessage(ctx, client_message_name, client_body_string) => {
+        ScanBlock::AutoMessage(ctx, client_message_name, client_body) => {
             Ok(ActorBlock::AutoMessage(
                 *ctx,
                 create_auto_message_handler(
                     client_message_name,
-                    client_body_string.as_deref(),
                     *ctx,
+                    client_body
+                        .as_ref()
+                        .map(|(ctx, body)| (*ctx, body.as_str())),
                     config,
                 )?,
             ))
@@ -341,11 +391,11 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
 
 fn create_auto_message_handler(
     client_message_name: &str,
-    client_body_string: Option<&str>,
     ctx: Context,
+    client_body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<AutoMessageHandler> {
-    let client_validator = create_validator(client_message_name, client_body_string, ctx, config)?;
+    let client_validator = create_validator(client_message_name, ctx, client_body, config)?;
     let client_message_tag = config
         .bolt_version
         .message_tag_from_request(client_message_name)
@@ -375,18 +425,21 @@ fn create_auto_message_handler(
 
 fn create_message_sender(
     message_name: &str,
-    message_body: Option<&str>,
     ctx: Context,
+    message_body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
     let tag = config
         .bolt_version
         .message_tag_from_response(message_name)
         .ok_or_else(|| {
-            ParseError::new(format!(
-                "Unknown message name {message_name:?} for BOLT version {}",
-                config.bolt_version
-            ))
+            ParseError::new_ctx(
+                ctx,
+                format!(
+                    "Unknown response message name {message_name:?} for BOLT version {}",
+                    config.bolt_version,
+                ),
+            )
         })?;
     let fields = transcode_body(message_body, config)?;
     let data = BoltMessage::new(tag, fields, config.bolt_version).into_data();
@@ -395,7 +448,7 @@ fn create_message_sender(
         data,
         SenderBytesLine::Ctx {
             message_name: message_name.into(),
-            message_body: message_body.map(Into::into),
+            message_body: message_body.map(|(_, s)| s.into()),
             ctx,
         },
     )))
@@ -461,16 +514,28 @@ impl ServerMessageSender for SenderBytes {
     }
 }
 
-fn transcode_body(msg: Option<&str>, config: &ActorConfig) -> Result<Vec<PackStreamValue>> {
-    let Some(msg) = msg else {
+fn transcode_body(
+    msg: Option<(Context, &str)>,
+    config: &ActorConfig,
+) -> Result<Vec<PackStreamValue>> {
+    let Some((ctx, msg)) = msg else {
         return Ok(vec![]);
     };
-    Deserializer::from_str(msg)
-        .into_iter()
-        .collect::<StdResult<Vec<JsonValue>, _>>()?
+    load_json_values(msg, ctx)?
         .into_iter()
         .map(|field| transcode_field(field, config))
         .collect()
+}
+
+fn load_json_values(body: &str, ctx: Context) -> Result<Vec<JsonValue>> {
+    Deserializer::from_str(body)
+        .into_iter()
+        .collect::<StdResult<Vec<JsonValue>, _>>()
+        .map_err(|err| {
+            let mut err = ParseError::from(err);
+            err.add_ctx_offset(ctx.start_line_number, ctx.start_byte);
+            err
+        })
 }
 
 pub(crate) fn transcode_field(field: JsonValue, config: &ActorConfig) -> Result<PackStreamValue> {
@@ -697,20 +762,23 @@ impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ClientMessageValid
 
 fn create_validator(
     message_name: &str,
-    expected_body_string: Option<&str>,
     ctx: Context,
+    body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
     let expected_tag = config
         .bolt_version
         .message_tag_from_request(message_name)
         .ok_or_else(|| {
-            ParseError::new(format!(
-                "Unknown message name {message_name:?} for BOLT version {}",
-                config.bolt_version
-            ))
+            ParseError::new_ctx(
+                ctx,
+                format!(
+                    "Unknown request message name {message_name:?} for BOLT version {}",
+                    config.bolt_version
+                ),
+            )
         })?;
-    let expected_body_behavior = build_fields_validator(expected_body_string, config)?;
+    let expected_body_behavior = build_fields_validator(body, config)?;
     Ok(Box::new(ValidatorImpl {
         func: move |client_message| {
             if client_message.tag != expected_tag {
@@ -718,7 +786,7 @@ fn create_validator(
             }
             expected_body_behavior(&client_message.fields)
         },
-        ctx,
+        ctx: ctx,
     }))
 }
 
@@ -1492,16 +1560,14 @@ fn validate_str_field_eq(expected: &str, received: &str) -> anyhow::Result<()> {
 }
 
 fn build_fields_validator(
-    msg_body: Option<&str>,
+    msg_body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<ValidateValuesFn> {
-    let Some(line) = msg_body else {
+    let Some((ctx, line)) = msg_body else {
         return Ok(Box::new(build_no_fields_validator));
     };
     // RUN "RETURN $n AS n" {"n": 1}
-    let field_validators: Vec<_> = Deserializer::from_str(line)
-        .into_iter()
-        .collect::<StdResult<Vec<JsonValue>, _>>()?
+    let field_validators: Vec<_> = load_json_values(line, ctx)?
         .into_iter()
         .map(|field| build_field_validator(field, config))
         .collect::<Result<_>>()?;
@@ -1653,7 +1719,7 @@ mod test {
             handshake: None,
             handshake_delay: None,
         };
-        let validator = create_validator(tag, Some(body), ctx, &cfg).unwrap();
+        let validator = create_validator(tag, ctx, Some((ctx, body)), &cfg).unwrap();
 
         let cm = BoltMessage::new(
             0x01,

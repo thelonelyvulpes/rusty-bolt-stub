@@ -242,7 +242,7 @@ fn keyword(input: Input) -> IResult<()> {
 // ############
 fn multi_message<'a, 'b>(
     message_tag: Option<&'static str>,
-    mut block: impl FnMut(Context, String, Option<String>) -> ScanBlock + 'b,
+    mut block: impl FnMut(Context, String, Option<(Context, String)>) -> ScanBlock + 'b,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> + 'b {
     move |input| {
         let (input, (ctx, blocks)) = consumed(multi_message_vec(message_tag, &mut block))(input)?;
@@ -252,7 +252,7 @@ fn multi_message<'a, 'b>(
 
 fn multi_message_vec<'a>(
     message_tag: Option<&'static str>,
-    mut block: impl FnMut(Context, String, Option<String>) -> ScanBlock,
+    mut block: impl FnMut(Context, String, Option<(Context, String)>) -> ScanBlock,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, Vec<ScanBlock>> {
     move |input| {
         let (input, head) =
@@ -273,7 +273,7 @@ fn multi_message_vec<'a>(
 
 fn message<'a>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(Context, String, Option<String>) -> ScanBlock,
+    mut block: impl FnMut(Context, String, Option<(Context, String)>) -> ScanBlock,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
     map(
         terminated(
@@ -284,7 +284,7 @@ fn message<'a>(
             block(
                 ctx.into(),
                 String::from(message.trim()),
-                arg.map(|arg| String::from(arg.trim())),
+                arg.map(|arg| (arg.into(), String::from(arg.trim()))),
             )
         },
     )
@@ -408,7 +408,7 @@ fn auto_repeat_0(input: Input) -> IResult<ScanBlock> {
             Box::new(ScanBlock::AutoMessage(
                 message.into(),
                 String::from(message.trim()),
-                args.map(|s| String::from(s.trim())),
+                args.map(|s| (s.into(), String::from(s.trim()))),
             )),
         ),
     ))
@@ -424,7 +424,7 @@ fn auto_repeat_1(input: Input) -> IResult<ScanBlock> {
             Box::new(ScanBlock::AutoMessage(
                 message.into(),
                 String::from(message.trim()),
-                args.map(|s| String::from(s.trim())),
+                args.map(|s| (s.into(), String::from(s.trim()))),
             )),
         ),
     ))
@@ -440,7 +440,7 @@ fn auto_optional(input: Input) -> IResult<ScanBlock> {
             Box::new(ScanBlock::AutoMessage(
                 message.into(),
                 String::from(message.trim()),
-                args.map(|s| String::from(s.trim())),
+                args.map(|s| (s.into(), String::from(s.trim()))),
             )),
         ),
     ))
@@ -709,16 +709,18 @@ mod tests {
     // Simple Lines
     // ############
     #[rstest]
-    #[case::implicit("C: Foo a b\n   Bar lel lol", 10, 14, 25)]
-    #[case::explicit("C: Foo a b\nC: Bar lel lol", 10, 11, 25)]
-    #[case::implicit_space_post("C: Foo a b \n   Bar lel lol ", 11, 15, 27)]
-    #[case::explicit_space_post("C: Foo a b \nC: Bar lel lol ", 11, 12, 27)]
-    #[case::implicit_space_pre("C:  Foo a b \n    Bar lel lol", 12, 17, 28)]
-    #[case::explicit_space_pre("C:  Foo a b \nC:  Bar lel lol", 12, 13, 28)]
+    #[case::implicit("C: Foo a b\n   Bar lel lol", 7, 10, 14, 18, 25)]
+    #[case::explicit("C: Foo a b\nC: Bar lel lol", 7, 10, 11, 18, 25)]
+    #[case::implicit_space_post("C: Foo a b \n   Bar lel lol ", 7, 11, 15, 19, 27)]
+    #[case::explicit_space_post("C: Foo a b \nC: Bar lel lol ", 7, 11, 12, 19, 27)]
+    #[case::implicit_space_pre("C:  Foo a b \n    Bar lel lol", 8, 12, 17, 21, 28)]
+    #[case::explicit_space_pre("C:  Foo a b \nC:  Bar lel lol", 8, 12, 13, 21, 28)]
     fn test_multi_message(
         #[case] input: &'static str,
+        #[case] b_body_start_1: usize,
         #[case] b_end_1: usize,
         #[case] b_start_2: usize,
+        #[case] b_body_start_2: usize,
         #[case] b_end_2: usize,
         #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n", "\n?}", "\n?}")] ending: &'static str,
     ) {
@@ -736,12 +738,12 @@ mod tests {
                     ScanBlock::ClientMessage(
                         new_ctx(1, 1, 0, b_end_1),
                         "Foo".into(),
-                        Some("a b".into())
+                        Some((new_ctx(1, 1, b_body_start_1, b_end_1), "a b".into()))
                     ),
                     ScanBlock::ClientMessage(
                         new_ctx(2, 2, b_start_2, b_end_2),
                         "Bar".into(),
-                        Some("lel lol".into())
+                        Some((new_ctx(2, 2, b_body_start_2, b_end_2), "lel lol".into()))
                     )
                 ]
             )
@@ -766,12 +768,12 @@ mod tests {
                     ScanBlock::ClientMessage(
                         new_ctx(1, 1, 0, 10),
                         "Foo".into(),
-                        Some("a b".into())
+                        Some((new_ctx(1, 1, 7, 10), "a b".into()))
                     ),
                     ScanBlock::ClientMessage(
                         new_ctx(2, 2, 11, 25),
                         "Bar".into(),
-                        Some("lel lol".into())
+                        Some((new_ctx(2, 2, 18, 25), "lel lol".into()))
                     )
                 ]
             )
@@ -794,11 +796,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_space("C:RUN foo bar", 13)]
-    #[case::no_space("C: RUN foo bar", 14)]
-    #[case::trailing("C: RUN foo bar  ", 16)]
-    #[case::messy("C:  RUN   foo bar  ", 19)]
-    fn test_client_message_con_args(#[case] input: &str, #[case] bytes: usize) {
+    #[case::no_space("C:RUN foo bar", 6, 13)]
+    #[case::no_space("C: RUN foo bar", 7, 14)]
+    #[case::trailing("C: RUN foo bar  ", 7, 16)]
+    #[case::messy("C:  RUN   foo bar  ", 10, 19)]
+    fn test_client_message_con_args(
+        #[case] input: &str,
+        #[case] body_start: usize,
+        #[case] bytes: usize,
+    ) {
         let result = message(Some("C:"), ScanBlock::ClientMessage)(wrap_input(input));
         let (rem, block) = result.unwrap();
         assert_eq!(*rem, "");
@@ -807,7 +813,7 @@ mod tests {
             ScanBlock::ClientMessage(
                 new_ctx(1, 1, 0, bytes),
                 "RUN".into(),
-                Some("foo bar".into())
+                Some((new_ctx(1, 1, body_start, bytes), "foo bar".into()))
             )
         );
     }

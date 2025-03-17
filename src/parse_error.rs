@@ -1,25 +1,34 @@
-use std::error::Error;
-
 use crate::context::Context;
 
+use std::error::Error;
+
 #[derive(Debug)]
-pub struct ParseError {
-    pub message: String,
-    pub ctx: Option<Context>,
+pub(crate) struct ParseError {
+    pub(crate) message: String,
+    pub(crate) ctx: Option<Context>,
 }
 
 impl ParseError {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             ctx: None,
         }
     }
 
-    pub fn new_ctx(ctx: Context, message: impl Into<String>) -> Self {
+    pub(crate) fn new_ctx(ctx: Context, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             ctx: Some(ctx),
+        }
+    }
+
+    pub(crate) fn add_ctx_offset(&mut self, line: usize, offset: usize) {
+        if let Some(ctx) = &mut self.ctx {
+            ctx.start_line_number += line;
+            ctx.end_line_number += line;
+            ctx.start_byte += offset;
+            ctx.end_byte += offset;
         }
     }
 }
@@ -38,7 +47,20 @@ impl Error for ParseError {}
 
 impl From<serde_json::Error> for ParseError {
     fn from(err: serde_json::Error) -> Self {
-        Self::new(err.to_string())
+        let line = err.line();
+        match line {
+            0 => Self::new(err.to_string()),
+            _ => {
+                let col = err.column();
+                let ctx = Context {
+                    start_line_number: line - 1,
+                    end_line_number: line - 1,
+                    start_byte: col.saturating_sub(1),
+                    end_byte: col.saturating_sub(1),
+                };
+                Self::new_ctx(ctx, err.to_string())
+            }
+        }
     }
 }
 
