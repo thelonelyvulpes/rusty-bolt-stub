@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context as AnyhowContext, Result};
 use log::{debug, info};
+use std::collections::HashSet;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -42,10 +43,8 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 break;
             }
             if !self.try_consume(&mut block).await? {
-                // TODO: enhance script mismatch error:
-                //  * Which lines were expected?
-                //  * What was received?
-                return Err(anyhow!("Script mismatch"));
+                let msg = self.format_script_missmatch(&block);
+                return Err(anyhow::Error::msg(msg));
             }
         }
         Ok(())
@@ -333,6 +332,105 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             BlockWithState::AutoMessage(..)
             | BlockWithState::ClientMessageValidate(..)
             | BlockWithState::NoOp(..) => Ok(()),
+        }
+    }
+
+    fn format_script_missmatch(&self, current_block: &BlockWithState<'_>) -> String {
+        let received = match self.peeked_message.as_ref() {
+            None => String::from("Nothing? Huh... This shouldn't have happened!"),
+            Some(msg) => msg.repr(),
+        };
+        let script_name = &self.script.script.name;
+        let possible_verifiers = &mut Vec::new();
+        Self::current_verifiers(current_block, possible_verifiers);
+        let possible_verifiers = possible_verifiers
+            .iter()
+            .map(|v| {
+                let line = v.line_repr(self.script.script.input);
+                match v.line_number() {
+                    None => format!("(   ?) C: {line}"),
+                    Some(line_number) => format!("({line_number:4}) C: {line}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "Script mismatch in {script_name:?}:\n\
+            Expected on of:\n\
+            {possible_verifiers}\n\n\
+            Received:\n\
+            {received}"
+        )
+    }
+
+    fn current_verifiers<'b>(
+        block: &BlockWithState<'b>,
+        res: &mut Vec<&'b dyn ClientMessageValidator>,
+    ) {
+        match block {
+            BlockWithState::BlockList(state, _, blocks) => {
+                for block in blocks.iter().skip(state.current_block) {
+                    Self::current_verifiers(block, res);
+                    if !block.can_skip() {
+                        break;
+                    }
+                }
+            }
+            BlockWithState::ClientMessageValidate(state, _, validator) => {
+                if !state.done {
+                    res.push(*validator);
+                }
+            }
+            BlockWithState::Alt(state, _, blocks) => match state {
+                BranchState::Init => {
+                    for block in blocks {
+                        Self::current_verifiers(block, res);
+                    }
+                }
+                BranchState::InBlock(i) => {
+                    Self::current_verifiers(&blocks[*i], res);
+                }
+                BranchState::Done => {}
+            },
+            BlockWithState::Parallel(state, _, blocks) => {
+                if state.done {
+                    return;
+                }
+                for block in blocks {
+                    Self::current_verifiers(block, res);
+                }
+            }
+            BlockWithState::Optional(state, _, block) => match state {
+                OptionalState::Init | OptionalState::Started => Self::current_verifiers(block, res),
+                OptionalState::Done => {}
+            },
+            BlockWithState::Repeat(state, _, block, _) => {
+                if !state.in_block {
+                    return Self::current_verifiers(block, res);
+                }
+                let mut sub_res = Vec::new();
+                Self::current_verifiers(block, &mut sub_res);
+                if !block.can_skip() {
+                    res.extend(sub_res);
+                    return;
+                }
+                Self::current_verifiers(&state.initial_state, &mut sub_res);
+                let mut reported_verifiers = HashSet::with_capacity(sub_res.len());
+                for verifier in sub_res {
+                    if reported_verifiers.insert(verifier as *const _) {
+                        res.push(verifier);
+                    }
+                }
+            }
+            BlockWithState::AutoMessage(state, _, auto_handler) => {
+                if !state.done {
+                    res.push(&*auto_handler.client_validator);
+                }
+            }
+            BlockWithState::ServerMessageSend(..)
+            | BlockWithState::Python(..)
+            | BlockWithState::NoOp(..) => {}
         }
     }
 

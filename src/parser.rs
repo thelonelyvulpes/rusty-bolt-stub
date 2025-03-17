@@ -786,7 +786,7 @@ fn create_validator(
             }
             expected_body_behavior(&client_message.fields)
         },
-        ctx: ctx,
+        ctx,
     }))
 }
 
