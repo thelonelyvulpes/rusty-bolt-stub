@@ -380,10 +380,16 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         };
         let script_name = &self.script.script.name;
         let possible_verifiers = self.format_possible_verifiers(current_block);
+        let one_of = match possible_verifiers.len() {
+            0 => "... nothing? Huh. This shouldn't have happened!",
+            1 => "\n",
+            _ => " one of:\n",
+        };
+        let possible_verifiers = possible_verifiers.join("\n");
 
         format!(
             "Script mismatch in {script_name:?}:\n\
-            Expected on of:\n\
+            Expected{one_of}\
             {possible_verifiers}\n\n\
             Received:\n\
             {received}"
@@ -397,15 +403,21 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     ) -> String {
         let script_name = &self.script.script.name;
         let possible_verifiers = self.format_possible_verifiers(current_block);
+        let one_of = match possible_verifiers.len() {
+            0 => "... nothing? Huh. This shouldn't have happened!",
+            1 => "\n",
+            _ => " one of:\n",
+        };
+        let possible_verifiers = possible_verifiers.join("\n");
 
         format!(
             "Read failure in {script_name:?}: {err:#}\n\
-            Expected on of:\n\
-            {possible_verifiers}"
+            Expected{one_of}\
+            {possible_verifiers}",
         )
     }
 
-    fn format_possible_verifiers(&self, current_block: &BlockWithState<'_>) -> String {
+    fn format_possible_verifiers(&self, current_block: &BlockWithState<'_>) -> Vec<String> {
         let possible_verifiers = &mut Vec::new();
         Self::current_verifiers(current_block, possible_verifiers);
         possible_verifiers
@@ -417,8 +429,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                     Some(line_number) => format!("({line_number:4}) C: {line}"),
                 }
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
     }
 
     fn current_verifiers<'b>(
