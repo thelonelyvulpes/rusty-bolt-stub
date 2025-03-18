@@ -27,13 +27,16 @@ use log::{debug, LevelFilter};
 use crate::logging::init_logging;
 use crate::parser::ActorScript;
 
+const TIMEOUT_HELP: &str = "The number of seconds for which the stub server will run \
+before automatically terminating. If unspecified, the server will wait for 30 seconds.";
 const LISTEN_ADDR_HELP: &str = "The base address on which to listen for incoming \
 connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localhost'. Each script \
 (which doesn't specify an explicit port number) will use subsequent ports. If completely omitted, \
 this defaults to ':17687'.";
-const TIMEOUT_HELP: &str = "The number of seconds for which the stub server will run \
-before automatically terminating. If unspecified, the server will wait for 30 seconds.";
-const GRACE_PERIOD_HELP: &str = "Grace period to stop server after sigterm or equivalent";
+const VERBOSE_HELP: &str = "Show more detail about the client-server exchange. \
+Supply the flag up to 3 times to increase verbosity with each.";
+const GRACE_PERIOD_HELP: &str =
+    "Grace period in seconds to stop the server after receiving SIGTERM or equivalent.";
 
 #[derive(Parser)]
 struct StubArgs {
@@ -41,12 +44,7 @@ struct StubArgs {
     timeout: f32,
     #[arg(long="listen-addr", short, default_value=":17687", help=LISTEN_ADDR_HELP)]
     listen_addr: String,
-    #[arg(
-        short,
-        long,
-        action=clap::ArgAction::Count,
-        help = "Show more detail about the client-server exchange."
-    )]
+    #[arg(short, long, action=clap::ArgAction::Count, help=VERBOSE_HELP)]
     verbose: u8,
     script: String,
     #[arg(short, long, default_value_t=5.0, help=GRACE_PERIOD_HELP)]
