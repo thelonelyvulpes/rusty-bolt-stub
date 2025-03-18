@@ -52,6 +52,7 @@ impl Server {
 
     async fn run(&mut self) -> Result<()> {
         let listener = TcpListener::bind(&self.address).await?;
+        println!("Listening");
         let mut set: JoinSet<Result<()>> = JoinSet::new();
 
         let ct = CancellationToken::new();

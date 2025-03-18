@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use itertools::Itertools;
+use log::trace;
 use regex::Regex;
 use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 
@@ -171,6 +172,14 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
 pub fn parse(script: Script) -> Result<ActorScript> {
     let config = parse_config(&script.bang_lines)?;
     let tree = parse_block(&script.body, &config)?;
+
+    trace!(
+        "Parser output\n\
+        ================================================================\n\
+        config: {config:#?}\n\
+        tree: {tree:#?}\n\
+        ================================================================",
+    );
 
     Ok(ActorScript {
         config,

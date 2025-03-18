@@ -2,6 +2,7 @@ use crate::bang_line::BangLine;
 use crate::context::Context;
 use crate::types::{ScanBlock, Script};
 use anyhow::anyhow;
+use log::trace;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{line_ending, multispace0, not_line_ending, space0, space1, u8};
@@ -55,11 +56,20 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
             anyhow!("Trailing input"),
         )));
     }
+    let body = body.unwrap_or(ScanBlock::List(span.into(), vec![]));
+
+    trace!(
+        "Scan output\n\
+        ================================================================\n\
+        bang_lines: {bangs:#?}\n\
+        body: {body:#?}\n\
+        ================================================================",
+    );
 
     Ok(Script {
         name,
         bang_lines: bangs,
-        body: body.unwrap_or(ScanBlock::List(span.into(), vec![])),
+        body,
         input,
     })
 }

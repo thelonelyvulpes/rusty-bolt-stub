@@ -5,6 +5,7 @@ mod bang_line;
 mod bolt_version;
 mod context;
 mod jolt;
+mod logging;
 mod net;
 mod net_actor;
 mod parse_error;
@@ -19,10 +20,12 @@ mod values;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::parser::ActorScript;
 use anyhow::Context;
 use clap::Parser;
-use log::LevelFilter;
+use log::{debug, LevelFilter};
+
+use crate::logging::init_logging;
+use crate::parser::ActorScript;
 
 const LISTEN_ADDR_HELP: &str = "The base address on which to listen for incoming \
 connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localhost'. Each script \
@@ -61,19 +64,24 @@ fn main() -> anyhow::Result<()> {
         2 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     };
-    env_logger::builder()
-        .filter_level(log_level)
-        .format_timestamp_millis()
-        .init();
+    init_logging(log_level);
     if args.verbose > 3 {
         log::warn!("Verbose level capped at 3");
     }
     let script_text = std::fs::read_to_string(&args.script)
         .with_context(|| format!("Failed to read script file: {}", &args.script))?;
+    debug!(
+        "Read script file: {}\n\
+        ================================================================\n\
+        {script_text}\n\
+        ================================================================",
+        &args.script
+    );
     SCRIPT.get_or_init(move || script_text);
 
     let output = scanner::scan_script(SCRIPT.get().unwrap(), args.script)?;
     let engine = parser::contextualize_res(parser::parse(output), SCRIPT.get().unwrap())?;
+
     PARSED.get_or_init(move || engine);
 
     let shutdown_grace_period = Duration::from_secs_f32(args.grace_period);
