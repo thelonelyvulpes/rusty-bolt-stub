@@ -1,12 +1,13 @@
+use std::future::Future;
 use std::ops::Add;
+use std::sync::{atomic, Arc};
 use std::time::Duration;
 
 use anyhow::{anyhow, Error, Result};
 use itertools::Itertools;
-use log::info;
+use log::{debug, info};
 use tokio::net::TcpListener;
 use tokio::select;
-use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +18,8 @@ pub struct Server {
     address: String,
     server_script_cfg: &'static ActorScript<'static>,
     grace_period: Duration,
+    ever_acted: bool,
+    shutting_down: Arc<atomic::AtomicBool>,
 }
 
 impl Server {
@@ -34,6 +37,8 @@ impl Server {
             address,
             server_script_cfg,
             grace_period,
+            ever_acted: Default::default(),
+            shutting_down: Default::default(),
         }
     }
 
@@ -53,39 +58,75 @@ impl Server {
     async fn run(&mut self) -> Result<()> {
         let listener = TcpListener::bind(&self.address).await?;
         println!("Listening");
-        let mut set: JoinSet<Result<()>> = JoinSet::new();
+        let mut set: JoinSet<Result<()>> = Default::default();
 
         let ct = CancellationToken::new();
-        #[cfg(unix)]
+
+        let signal_handler = async {
+            {
+                let ct = ct.clone();
+                let mut i = 0;
+                loop {
+                    Self::exit_signal()?.await;
+                    self.shutting_down.store(true, atomic::Ordering::Release);
+                    match i {
+                        0 => {
+                            info!("1st interrupt signal received. Cancelling all actors.");
+                            ct.cancel();
+                        }
+                        _ => {
+                            info!("2nd interrupt signal received. Hard exit.");
+                            panic!("Hard exit after cancellation didn't succeed.");
+                        }
+                    }
+                    i += 1;
+                }
+                #[allow(unreachable_code)] // needed to disambiguate the return type
+                Ok::<(), Error>(())
+            }
+        };
         {
-            let mut sigterm = signal(SignalKind::terminate())?;
-            let mut sigint = signal(SignalKind::interrupt())?;
             select! {
-                _ = sigint.recv() => {
-                    info!("received SIGINT");
-                    ct.cancel();
-                    tokio::time::sleep(self.grace_period).await;
-                    Ok::<(), Error>(())
-                },
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM");
-                    // aggressively interrupt
+                _ = signal_handler => {
+                    debug!("signal_handler exit");
                     Ok::<(), Error>(())
                 },
                 _ = self.run_server(ct.child_token(), listener, &mut set) => {
                     // successfully completed script!
+                    debug!("self.run_server exit");
                     Ok::<(), Error>(())
                 }
             }
         }?;
-        #[cfg(not(unix))]
-        {
-            // TODO: Windows signals
-            compile_error!("Only Unix signals are supported for now");
-        }
 
+        self.ever_acted = !set.is_empty();
         let r = set.join_all().await;
         validate_results(&r)
+    }
+
+    pub(crate) fn ever_acted(&self) -> bool {
+        self.ever_acted
+    }
+
+    fn exit_signal() -> Result<impl Future<Output = Option<()>>> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut signal = signal(SignalKind::interrupt())?;
+            Ok(async move { signal.recv().await })
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::ctrl_break;
+
+            let mut signal = ctrl_break()?;
+            Ok(async move { signal.recv().await })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            compile_error!("Only Unix and Windows signals are supported for now");
+        }
     }
 
     async fn run_server(
@@ -97,7 +138,7 @@ impl Server {
         let restarts = self.server_script_cfg.config.allow_restart;
         let concurrent = self.server_script_cfg.config.allow_concurrent;
         loop {
-            let connection_cancellation_token = ct.clone();
+            let ct_connection = ct.clone();
             select! {
                 res = listener.accept() => {
                     match res {
@@ -105,8 +146,10 @@ impl Server {
                             conn.set_nodelay(true)?;
                             let script = self.server_script_cfg;
                             let name = addr.to_string();
+                            let shutting_down = Arc::clone(&self.shutting_down);
                             let mut actor = NetActor::new(
-                                connection_cancellation_token.child_token(),
+                                ct_connection.child_token(),
+                                shutting_down,
                                 conn,
                                 name,
                                 script,
@@ -114,12 +157,12 @@ impl Server {
                             handles.spawn(async move {
                                 let res = actor.run_client_connection().await;
                                 if res.is_err() {
-                                    connection_cancellation_token.cancel();
+                                    ct_connection.cancel();
                                 }
                                 res
                             });
 
-                            if !concurrent || !restarts {
+                            if !(concurrent || restarts) {
                                 return Ok(())
                             }
                         },

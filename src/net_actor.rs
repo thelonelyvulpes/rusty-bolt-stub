@@ -1,6 +1,11 @@
-use anyhow::{anyhow, Context as AnyhowContext, Result};
-use log::{debug, info};
 use std::collections::HashSet;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::future::Future;
+use std::sync::{atomic, Arc};
+
+use anyhow::{anyhow, Context as AnyhowContext};
+use log::{debug, info};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -15,8 +20,44 @@ use crate::values;
 use crate::values::bolt_message::BoltMessage;
 use crate::values::pack_stream_value::PackStreamStruct;
 
+type NetActorResult<T> = Result<T, NetActorError>;
+
+#[derive(Debug)]
+enum NetActorError {
+    Anyhow(anyhow::Error),
+    Cancellation(String),
+}
+
+impl Display for NetActorError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetActorError::Anyhow(err) => err.fmt(f),
+            NetActorError::Cancellation(reason) => reason.fmt(f),
+        }
+    }
+}
+
+impl Error for NetActorError {}
+
+impl NetActorError {
+    fn from_anyhow(err: anyhow::Error) -> Self {
+        Self::Anyhow(err)
+    }
+
+    fn from_cancellation(reason: String) -> Self {
+        Self::Cancellation(reason)
+    }
+}
+
+impl From<anyhow::Error> for NetActorError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Anyhow(err)
+    }
+}
+
 pub struct NetActor<'a, T> {
     ct: CancellationToken,
+    shutting_down: Arc<atomic::AtomicBool>,
     conn: T,
     name: String,
     script: &'a ActorScript<'a>,
@@ -24,9 +65,16 @@ pub struct NetActor<'a, T> {
 }
 
 impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
-    pub fn new(ct: CancellationToken, conn: T, name: String, script: &'a ActorScript) -> Self {
+    pub fn new(
+        ct: CancellationToken,
+        shutting_down: Arc<atomic::AtomicBool>,
+        conn: T,
+        name: String,
+        script: &'a ActorScript,
+    ) -> Self {
         NetActor {
             ct,
+            shutting_down,
             conn,
             name,
             script,
@@ -34,19 +82,35 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         }
     }
 
-    pub async fn run_client_connection(&mut self) -> Result<()> {
-        self.handshake().await?;
+    pub async fn run_client_connection(&mut self) -> anyhow::Result<()> {
+        match self.handshake().await {
+            Err(NetActorError::Cancellation(reason))
+                if !self.shutting_down.load(atomic::Ordering::Acquire) =>
+            {
+                debug!("Ignoring NetActor error because another connection failed: {reason}");
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+            Ok(res) => res,
+        }
         let mut block = BlockWithState::new(&self.script.tree);
         match self.run_block(&mut block).await {
             Err(err) if block.can_skip() => {
-                debug!("Ignoring server action error because script reached the end: {err:#}");
+                debug!("Ignoring NetActor error because script reached the end: {err:#}");
                 Ok(())
             }
-            res => res,
+            Err(NetActorError::Cancellation(reason))
+                if !self.shutting_down.load(atomic::Ordering::Acquire) =>
+            {
+                debug!("Ignoring NetActor error because another connection failed: {reason}");
+                Ok(())
+            }
+            Ok(res) => Ok(res),
+            Err(err) => Err(err.into()),
         }
     }
 
-    async fn run_block(&mut self, block: &mut BlockWithState<'_>) -> Result<()> {
+    async fn run_block(&mut self, block: &mut BlockWithState<'_>) -> NetActorResult<()> {
         loop {
             self.server_action(block).await?;
             if block.done() {
@@ -56,11 +120,11 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 Ok(true) => {}
                 Ok(false) => {
                     let msg = self.format_script_missmatch(block);
-                    return Err(anyhow::Error::msg(msg));
+                    return Err(NetActorError::Anyhow(anyhow::Error::msg(msg)));
                 }
                 Err(err) => {
                     let msg = self.format_scrip_read_failure(block, &err);
-                    return Err(anyhow::Error::msg(msg));
+                    return Err(NetActorError::Anyhow(anyhow::Error::msg(msg)));
                 }
             }
         }
@@ -71,7 +135,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     ///
     /// # Returns
     /// bool indicates if a message could be consumed `true` or there was a script mismatch `false`
-    async fn try_consume(&mut self, block: &mut BlockWithState<'_>) -> Result<bool> {
+    async fn try_consume(&mut self, block: &mut BlockWithState<'_>) -> anyhow::Result<bool> {
         match block {
             BlockWithState::BlockList(state, ctx, blocks) => {
                 if state.current_block >= blocks.len() {
@@ -107,6 +171,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 true => Ok(false),
                 false => {
                     let peeked_message = Self::peek_message(
+                        &self.ct,
                         &mut self.conn,
                         &mut self.peeked_message,
                         self.script.config.bolt_version,
@@ -200,6 +265,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 if state.in_block && block.can_skip() {
                     // try form the top
                     let peeked_message = Self::peek_message(
+                        &self.ct,
                         &mut self.conn,
                         &mut self.peeked_message,
                         self.script.config.bolt_version,
@@ -225,6 +291,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             }
             BlockWithState::AutoMessage(state, ctx, auto_handler) => {
                 let peeked_message = Self::peek_message(
+                    &self.ct,
                     &mut self.conn,
                     &mut self.peeked_message,
                     self.script.config.bolt_version,
@@ -254,7 +321,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     }
 
     /// Progresses the state even if the call fails.
-    async fn server_action(&mut self, block: &mut BlockWithState<'_>) -> Result<()> {
+    async fn server_action(&mut self, block: &mut BlockWithState<'_>) -> NetActorResult<()> {
         match block {
             BlockWithState::BlockList(state, ctx, blocks) => {
                 let blocks_len = blocks.len();
@@ -292,7 +359,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         .inspect_err(|err| info!("Error sending message: {err}"));
                     state.done = true;
                     debug!("server line ({ctx}): done");
-                    res
+                    res.map_err(NetActorError::from_anyhow)
                 }
             },
             BlockWithState::Python(state, _, _command) => match state.done {
@@ -502,28 +569,27 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         }
     }
 
-    async fn handshake(&mut self) -> Result<()> {
+    async fn handshake(&mut self) -> NetActorResult<()> {
         // TODO: Log handshake
         let mut buffer = [0u8; 20];
-        select! {
-            res = self.conn.read_exact(&mut buffer) => {
-                res.context("Reading handshake and magic preamble.")?;
-            },
-            _ = self.ct.cancelled() => {
-                return Err(anyhow!("no good"));
-            }
-        }
-        // TODO: Make cancellable
+        cancelable_io(
+            "reading handshake and magic preamble",
+            &self.ct,
+            self.conn.read_exact(&mut buffer),
+        )
+        .await?;
 
         if buffer[0..4] != [0x60, 0x60, 0xB0, 0x17] {
-            return Err(anyhow::anyhow!("Invalid magic preamble."));
+            return Err(NetActorError::from_anyhow(anyhow!(
+                "Invalid magic preamble."
+            )));
         }
 
         // TODO: Tidy up
         let valid_handshake = self.negotiate_bolt_version(&mut buffer);
         if !valid_handshake {
             self.send_no_negotiated_bolt_version().await?;
-            return Err(anyhow::anyhow!("Invalid Bolt version"));
+            return Err(NetActorError::from_anyhow(anyhow!("Invalid Bolt version")));
         }
 
         // TODO: handle equivalent versions (e.g. a bolt 4.2 script is allowed to run on bolt 4.1)
@@ -531,9 +597,14 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         // TODO: handshake manifest v1
 
         let to_negotiate = &self.script.config.bolt_version;
-        self.conn
-            .write_all(&[0x00, 0x00, to_negotiate.minor(), to_negotiate.major()])
-            .await?;
+        cancelable_io(
+            "sending negotiated bolt version",
+            &self.ct,
+            self.conn
+                .write_all(&[0x00, 0x00, to_negotiate.minor(), to_negotiate.major()]),
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -555,8 +626,13 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         false
     }
 
-    async fn send_no_negotiated_bolt_version(&mut self) -> Result<()> {
-        self.conn.write_all(&[0x00, 0x00, 0x00, 0x00]).await?;
+    async fn send_no_negotiated_bolt_version(&mut self) -> NetActorResult<()> {
+        cancelable_io(
+            "sending no negotiated bolt version",
+            &self.ct.clone(),
+            self.conn.write_all(&[0x00, 0x00, 0x00, 0x00]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -607,13 +683,20 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         }
     }
 
-    async fn read_message(&mut self, line: &dyn ClientMessageValidator) -> Result<BoltMessage> {
+    async fn read_message(
+        &mut self,
+        line: &dyn ClientMessageValidator,
+    ) -> anyhow::Result<BoltMessage> {
         if let Some(peeked) = self.peeked_message.take() {
             info!("{}", self.fmt_reader_message(&peeked, line));
             return Ok(peeked);
         }
-        let res =
-            Self::read_unbuffered_message(&mut self.conn, self.script.config.bolt_version).await?;
+        let res = Self::read_unbuffered_message(
+            &self.ct,
+            &mut self.conn,
+            self.script.config.bolt_version,
+        )
+        .await?;
         info!("{}", self.fmt_reader_message(&res, line));
         Ok(res)
     }
@@ -627,43 +710,63 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     }
 
     async fn read_unbuffered_message(
+        ct: &'_ CancellationToken,
         data_stream: &'_ mut T,
         bolt_version: BoltVersion,
-    ) -> Result<BoltMessage> {
+    ) -> NetActorResult<BoltMessage> {
         let mut nibble_buffer = [0u8; 2];
         let mut message_buffer = Vec::with_capacity(32);
         let mut curr_idx = 0usize;
         loop {
-            data_stream.read_exact(&mut nibble_buffer).await?;
+            cancelable_io(
+                "reading chunk header",
+                ct,
+                data_stream.read_exact(&mut nibble_buffer),
+            )
+            .await?;
             let chunk_length = u16::from_be_bytes(nibble_buffer) as usize;
             if chunk_length == 0usize {
                 break;
             }
             message_buffer.extend((0..chunk_length).map(|_| 0));
-            data_stream
-                .read_exact(&mut message_buffer[curr_idx..curr_idx + chunk_length])
-                .await?;
+            cancelable_io(
+                "reading chunk content",
+                ct,
+                data_stream.read_exact(&mut message_buffer[curr_idx..curr_idx + chunk_length]),
+            )
+            .await?;
             curr_idx += chunk_length;
         }
 
         parse_message(message_buffer, bolt_version)
     }
 
-    async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> Result<()> {
+    async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> NetActorResult<()> {
         let mut data = sender.send()?;
         info!("{}", self.fmt_sender_message(sender));
         while !data.is_empty() {
             let chunk_size = data.len().min(0xFFFF);
-            // chunk header
-            self.conn
-                .write_all(&(chunk_size as u16).to_be_bytes())
-                .await?;
-            // chunk body
-            self.conn.write_all(&data[..chunk_size]).await?;
+            cancelable_io(
+                "writing chunk header",
+                &self.ct,
+                self.conn.write_all(&(chunk_size as u16).to_be_bytes()),
+            )
+            .await?;
+            cancelable_io(
+                "writing chunk body",
+                &self.ct,
+                self.conn.write_all(&data[..chunk_size]),
+            )
+            .await?;
             data = &data[chunk_size..];
         }
-        // message end
-        self.conn.write_all(&[0, 0]).await?;
+
+        cancelable_io(
+            "writing message end",
+            &self.ct,
+            self.conn.write_all(&[0, 0]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -676,12 +779,13 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     }
 
     async fn peek_message<'buf>(
+        ct: &CancellationToken,
         conn: &'_ mut T,
         message_buffer: &'buf mut Option<BoltMessage>,
         bolt_version: BoltVersion,
-    ) -> Result<&'buf BoltMessage> {
+    ) -> NetActorResult<&'buf BoltMessage> {
         if message_buffer.is_none() {
-            let a: BoltMessage = Self::read_unbuffered_message(conn, bolt_version).await?;
+            let a: BoltMessage = Self::read_unbuffered_message(ct, conn, bolt_version).await?;
             message_buffer.replace(a);
         }
         Ok(message_buffer.as_ref().unwrap())
@@ -852,11 +956,11 @@ impl<'a> BlockWithState<'a> {
     }
 }
 
-fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> Result<BoltMessage> {
+fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> NetActorResult<BoltMessage> {
     if data.len() <= 1 {
-        return Err(anyhow!(
+        return Err(NetActorError::Anyhow(anyhow!(
             "Message too short, less than or one byte was received."
-        ));
+        )));
     }
 
     let value = values::pack_stream_value::PackStreamValue::from_data_consume_all(&data)
@@ -864,10 +968,43 @@ fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> Result<BoltMessage
     let values::pack_stream_value::PackStreamValue::Struct(PackStreamStruct { tag, fields }) =
         value
     else {
-        return Err(anyhow!("Expected a bolt message but got: {:?}.", value));
+        return Err(NetActorError::Anyhow(anyhow!(
+            "Expected a bolt message but got: {:?}.",
+            value
+        )));
     };
     let msg = BoltMessage::new(tag, fields, bolt_version);
     Ok(msg)
+}
+
+async fn cancelable_io<
+    'a,
+    T,
+    E: Error + Send + Sync + 'static,
+    F: Future<Output = Result<T, E>> + 'a,
+>(
+    ctx: &'static str,
+    ct: &'a CancellationToken,
+    future: F,
+) -> NetActorResult<T> {
+    select! {
+        res = future => {
+            match res {
+                Ok(res) => Ok(res),
+                Err(err) => {
+                    let msg = format!("IO failed {ctx}");
+                    debug!("{msg}");
+                    let err: anyhow::Error = err.into();
+                    Err(NetActorError::from_anyhow(err.context(msg)))
+                }
+            }
+        },
+        _ = ct.cancelled() => {
+            let msg = format!("IO cancelled {ctx}");
+            debug!("{msg}");
+            Err(NetActorError::from_cancellation(msg))
+        }
+    }
 }
 
 #[cfg(test)]

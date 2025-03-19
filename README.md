@@ -1,5 +1,4 @@
 Todos:
-- Fix interrupts not cancelling properly
 - Complete bang line support
 - Bolt handshake manifest style
 - Special server lines (`<EXIT>`, `<SLEEP>`, raw bytes, etc.)

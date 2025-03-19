@@ -17,10 +17,14 @@ mod types;
 mod util;
 mod values;
 
+use std::fmt::Display;
+use std::io::Write;
+use std::process::{ExitCode, Termination};
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::{fmt, io};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use log::{debug, LevelFilter};
 
@@ -54,7 +58,11 @@ struct StubArgs {
 static SCRIPT: OnceLock<String> = OnceLock::new();
 static PARSED: OnceLock<ActorScript> = OnceLock::new();
 
-fn main() -> anyhow::Result<()> {
+fn main() -> MainResult {
+    MainResult(main_raw_error())
+}
+
+fn main_raw_error() -> Result<(), MainError> {
     let args = StubArgs::parse();
     let log_level = match args.verbose {
         0 => LevelFilter::Off,
@@ -66,8 +74,10 @@ fn main() -> anyhow::Result<()> {
     if args.verbose > 3 {
         log::warn!("Verbose level capped at 3");
     }
-    let script_text = std::fs::read_to_string(&args.script)
-        .with_context(|| format!("Failed to read script file: {}", &args.script))?;
+    let script_text = with_exit_code(99, || {
+        std::fs::read_to_string(&args.script)
+            .with_context(|| format!("Failed to read script file: {}", &args.script))
+    })?;
     debug!(
         "Read script file: {}\n\
         ================================================================\n\
@@ -77,16 +87,77 @@ fn main() -> anyhow::Result<()> {
     );
     SCRIPT.get_or_init(move || script_text);
 
-    let output = scanner::scan_script(SCRIPT.get().unwrap(), args.script)?;
-    let engine = parser::contextualize_res(parser::parse(output), SCRIPT.get().unwrap())?;
+    let output = with_exit_code(99, || {
+        scanner::scan_script(SCRIPT.get().unwrap(), args.script)
+    })?;
+    let engine = with_exit_code(99, || {
+        parser::contextualize_res(parser::parse(output), SCRIPT.get().unwrap())
+    })?;
 
     PARSED.get_or_init(move || engine);
 
     let shutdown_grace_period = Duration::from_secs_f32(args.grace_period);
-    net::Server::new(
+    let mut server = net::Server::new(
         &args.listen_addr,
         PARSED.get().unwrap(),
         shutdown_grace_period,
-    )
-    .start()
+    );
+    with_exit_code(99, || server.start())?;
+    if !server.ever_acted() {
+        return Err(MainError {
+            err: anyhow!("Script never started."),
+            code: 3.into(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MainResult(Result<(), MainError>);
+
+#[derive(Debug)]
+struct MainError {
+    err: anyhow::Error,
+    code: ExitCode,
+}
+
+impl Display for MainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.err.fmt(f)
+    }
+}
+
+impl Termination for MainResult {
+    fn report(self) -> ExitCode {
+        match self.0 {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(MainError { err, code }) => {
+                let _ = io::stderr().write_fmt(format_args!("Error: {err:?}\n"));
+                code
+            }
+        }
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for MainError {
+    fn from(err: E) -> Self {
+        MainError {
+            err: err.into(),
+            code: ExitCode::FAILURE,
+        }
+    }
+}
+
+fn with_exit_code<T, E: Into<anyhow::Error>>(
+    code: u8,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, MainError> {
+    match f() {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            let code = code.into();
+            let err = err.into();
+            Err(MainError { err, code })
+        }
+    }
 }
