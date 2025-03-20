@@ -1,6 +1,5 @@
-use crate::bang_line::BangLine;
-use crate::context::Context;
-use crate::types::{ScanBlock, Script};
+use std::cmp::max;
+
 use anyhow::anyhow;
 use log::trace;
 use nom::branch::alt;
@@ -13,7 +12,10 @@ use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
 use nom::{AsChar, InputLength, InputTakeAtPosition, Parser};
 use nom_span::Spanned;
 use nom_supreme::error::ErrorTree;
-use std::cmp::max;
+
+use crate::bang_line::BangLine;
+use crate::context::Context;
+use crate::types::{ScanBlock, Script};
 
 type PError<I> = ErrorTree<I>;
 type Input<'a> = Spanned<&'a str>;
@@ -79,18 +81,35 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
 // #################
 fn scan_bang_lines(input: Input) -> IResult<Vec<BangLine>> {
     many1(alt((
-        context("auto bang", auto_bang_line),
         context("bolt version bang", bolt_version_bang_line),
+        context(
+            "handshake manifest bang",
+            string_arg_bang_line("HANDSHAKE_MANIFEST", BangLine::HandshakeManifest),
+        ),
+        context(
+            "handshake bang",
+            string_arg_bang_line("HANDSHAKE", BangLine::Handshake),
+        ),
+        context(
+            "handshake response bang",
+            string_arg_bang_line("HANDSHAKE_RESPONSE", BangLine::HandshakeResponse),
+        ),
+        context(
+            "handshake delay bang",
+            string_arg_bang_line("HANDSHAKE_DELAY", BangLine::HandshakeDelay),
+        ),
+        context("auto bang", auto_bang_line),
         context(
             "allow restart",
             simple_bang_line("ALLOW RESTART", BangLine::AllowRestart),
         ),
         context(
             "allow concurrent",
-            simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent),
-            // TODO: add delay handshake
-            //       handshake bytes
-            //       python line
+            simple_bang_line("ALLOW CONCURRENT", BangLine::AllowConcurrent),
+        ),
+        context(
+            "python response bang",
+            string_arg_bang_line("PY", BangLine::Python),
         ),
     )))(input)
 }
@@ -126,8 +145,24 @@ fn auto_bang_line(input: Input) -> IResult<BangLine> {
                 preceded(space1, terminated(message_name, peek(end_of_line))),
             )),
         ),
-        |(ctx, message)| BangLine::Auto(ctx.into(), String::from(message.trim())),
+        |(ctx, message)| BangLine::Auto(ctx.into(), (message.into(), String::from(*message))),
     )(input)
+}
+
+fn string_arg_bang_line<'a>(
+    expect: &'static str,
+    mut res: impl FnMut(Context, (Context, String)) -> BangLine + 'static,
+) -> impl FnMut(Input<'a>) -> IResult<'a, BangLine> {
+    map(
+        preceded(
+            multispace0,
+            consumed(preceded(
+                bang_line(expect),
+                preceded(space1, terminated(rest_of_line, peek(end_of_line))),
+            )),
+        ),
+        move |(ctx, message)| res(ctx.into(), (message.into(), String::from(message.trim()))),
+    )
 }
 
 fn simple_bang_line<'a>(
@@ -608,24 +643,57 @@ mod tests {
         assert_eq!(bl, BangLine::Version(new_ctx(1, 1, 0, 12), 16, Some(5)));
     }
 
+    fn str_bang_line(
+        bang: impl FnOnce(Context, (Context, String)) -> BangLine,
+        total_len: usize,
+        s: &'static str,
+    ) -> BangLine {
+        str_bang_line_offset(bang, 1, 0, total_len, s)
+    }
+
+    fn str_bang_line_offset(
+        bang: impl FnOnce(Context, (Context, String)) -> BangLine,
+        line: usize,
+        offset: usize,
+        total_len: usize,
+        s: &'static str,
+    ) -> BangLine {
+        let start = offset;
+        let end = offset + total_len;
+        bang(
+            new_ctx(line, line, start, end),
+            (new_ctx(line, line, end - s.len(), end), s.into()),
+        )
+    }
+
     #[rstest]
     #[case::bolt_5_4("!: BOLT 5.4\n", BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(4)))]
     #[case::bolt_5_0("!: BOLT 5.0\n", BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(0)))]
     #[case::bolt_5("!: BOLT 5\n", BangLine::Version(new_ctx(1, 1, 0, 9), 5, None))]
+    #[case::hanshake_manifest(
+        "!: HANDSHAKE_MANIFEST 5\n",
+        str_bang_line(BangLine::HandshakeManifest, 23, "5")
+    )]
+    #[case::handshake(
+        "!: HANDSHAKE 00 00 FF 05\n",
+        str_bang_line(BangLine::Handshake, 24, "00 00 FF 05")
+    )]
+    #[case::handshake_response(
+        "!: HANDSHAKE_RESPONSE 00 00 00 00\n",
+        str_bang_line(BangLine::HandshakeResponse, 33, "00 00 00 00")
+    )]
+    #[case::handshake_delay(
+        "!: HANDSHAKE_DELAY 1.2345678901234567890123456789\n",
+        str_bang_line(BangLine::HandshakeDelay, 49, "1.2345678901234567890123456789")
+    )]
+    #[case::auto_reset("!: AUTO RESET\n", str_bang_line(BangLine::Auto, 13, "RESET"))]
+    #[case::auto_foo("!: AUTO foo\n", str_bang_line(BangLine::Auto, 11, "foo"))]
     #[case::restart("!: ALLOW RESTART\n", BangLine::AllowRestart(new_ctx(1, 1, 0, 16)))]
-    #[case::auto_reset("!: AUTO RESET\n", BangLine::Auto(new_ctx(1, 1, 0, 13),"RESET".into()))]
-    #[case::auto_foo("!: AUTO foo\n", BangLine::Auto(new_ctx(1, 1, 0, 11),"foo".into()))]
-    #[case::concurrent("!: ALLOW CONCURRENT\n", BangLine::Concurrent(new_ctx(1, 1, 0, 19)))]
-    // #[case::handshake("!: HANDSHAKE FF 00\n", BangLine::Handshake(vec![0xFF, 0x00]))]
-    // #[case::handshake_empty("!: HANDSHAKE\n", BangLine::Handshake(vec![]))]
-    // #[case::handshake_delay_zero("!: HANDSHAKE DELAY 0\n", BangLine::HandshakeDelay(0.))]
-    // #[case::handshake_delay_negative("!: HANDSHAKE DELAY -1\n", BangLine::HandshakeDelay(-1.))]
-    // #[case::handshake_delay_neg_f("!: HANDSHAKE DELAY -1.5\n", BangLine::HandshakeDelay(-1.5))]
-    // #[case::handshake_delay_pos_f(
-    //     "!: HANDSHAKE DELAY 12345.6789\n",
-    //     BangLine::HandshakeDelay(12345.6789)
-    // )]
-    // #[case::handshake_delay_pos_f("!: PY FOO bar\tBaz\n", BangLine::Python("FOO bar\tBaz".into()))]
+    #[case::concurrent(
+        "!: ALLOW CONCURRENT\n",
+        BangLine::AllowConcurrent(new_ctx(1, 1, 0, 19))
+    )]
+    #[case::py("!: PY a = 1\n", str_bang_line(BangLine::Python, 11, "a = 1"))]
     fn test_scan_bang_line(
         #[case] input: &'static str,
         #[case] mut expected: BangLine,
@@ -639,13 +707,9 @@ mod tests {
         let bytes_count = end_bytes - start_bytes;
         assert_eq!(result.bang_lines.len(), repetition);
         for (bl, line) in result.bang_lines.iter().zip(1..repetition + 1) {
-            let byte_offset = (bytes_count + 1) * (line - 1);
-            *(expected.ctx_mut()) = new_ctx(
-                line,
-                line,
-                start_bytes + byte_offset,
-                end_bytes + byte_offset,
-            );
+            if line > 1 {
+                expected.add_offset(1, bytes_count + 1);
+            }
             assert_eq!(bl, &expected);
         }
     }
@@ -662,7 +726,7 @@ mod tests {
         );
         assert_eq!(
             result.bang_lines.get(1),
-            Some(&BangLine::Auto(new_ctx(2, 2, 12, 28), "Nonsense".into()))
+            Some(&str_bang_line_offset(BangLine::Auto, 2, 12, 16, "Nonsense"))
         );
         assert_eq!(
             result.bang_lines.get(2),
@@ -677,10 +741,7 @@ mod tests {
         let bytes = base.len() + ending.find(char::is_whitespace).unwrap_or(ending.len());
         let (input, bl) = scanner::auto_bang_line(wrap_input(&input)).unwrap();
         assert_eq!(*input, ending);
-        assert_eq!(
-            bl,
-            BangLine::Auto(new_ctx(1, 1, 0, bytes), "Nonsense".into())
-        );
+        assert_eq!(bl, str_bang_line(BangLine::Auto, bytes, "Nonsense"));
     }
 
     #[rstest]
@@ -694,7 +755,7 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(
             result.bang_lines.first(),
-            Some(&BangLine::Auto(new_ctx(1, 1, 0, bytes), "Nonsense".into()))
+            Some(&str_bang_line(BangLine::Auto, bytes, "Nonsense"))
         );
     }
 
@@ -704,11 +765,11 @@ mod tests {
         let input = format!("{base}{ending}");
         let bytes = base.len() + ending.find(char::is_whitespace).unwrap_or(ending.len());
         let input = wrap_input(&input);
-        let mut f = scanner::simple_bang_line("ALLOW CONCURRENT", BangLine::Concurrent);
+        let mut f = scanner::simple_bang_line("ALLOW CONCURRENT", BangLine::AllowConcurrent);
         let result = f(input);
         let (rem, bang) = result.unwrap();
         assert_eq!(*rem, ending);
-        assert_eq!(bang, BangLine::Concurrent(new_ctx(1, 1, 0, bytes)));
+        assert_eq!(bang, BangLine::AllowConcurrent(new_ctx(1, 1, 0, bytes)));
     }
 
     // ##########

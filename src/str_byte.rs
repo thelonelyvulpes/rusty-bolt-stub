@@ -3,7 +3,7 @@ use anyhow::anyhow;
 pub(crate) fn str_to_data(byte_str: &str) -> anyhow::Result<Vec<u8>> {
     let clean = byte_str.replace(' ', "");
     if clean.len() % 2 != 0 {
-        return Err(anyhow!("not right"));
+        return Err(anyhow!("invalid hex string"));
     }
     let mut res = Vec::with_capacity(byte_str.len() / 2);
     for i in (0..clean.len()).step_by(2) {

@@ -40,10 +40,12 @@ pub struct ActorScript<'a> {
 #[derive(Debug)]
 pub struct ActorConfig {
     pub bolt_version: BoltVersion,
+    pub handshake_manifest_version: Option<u8>,
+    pub handshake: Option<Vec<u8>>,
+    pub handshake_response: Option<Vec<u8>>,
+    pub handshake_delay: Option<Duration>,
     pub allow_restart: bool,
     pub allow_concurrent: bool,
-    pub handshake_delay: Option<Duration>,
-    pub handshake: Option<Vec<u8>>,
 }
 
 type Result<T> = StdResult<T, ParseError>;
@@ -190,10 +192,12 @@ pub fn parse(script: Script) -> Result<ActorScript> {
 
 fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     let mut bolt_version: Option<BoltVersion> = None;
+    let mut handshake_manifest_version: Option<(Context, u8)> = None;
+    let mut handshake: Option<Vec<u8>> = None;
+    let mut handshake_response: Option<(Context, Vec<u8>)> = None;
+    let mut handshake_delay: Option<Duration> = None;
     let mut allow_restart: Option<bool> = None;
     let mut allow_concurrent: Option<bool> = None;
-    let mut handshake: Option<Vec<u8>> = None;
-    let handshake_delay: Option<Duration> = None;
 
     for bang_line in bang_lines {
         match bang_line {
@@ -208,6 +212,63 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                     .ok_or(ParseError::new_ctx(*ctx, "Invalid BOLT version"))?;
                 bolt_version = Some(bolt);
             }
+            BangLine::HandshakeManifest(ctx, (ctx_arg, arg)) => {
+                if handshake_manifest_version.is_some() {
+                    return Err(ParseError::new_ctx(
+                        *ctx,
+                        "Multiple handshake manifest bang lines found",
+                    ));
+                }
+                let version = u8::from_str(arg).map_err(|e| {
+                    ParseError::new_ctx(
+                        *ctx_arg,
+                        format!("Invalid handshake manifest version (expecting u8): {}", e),
+                    )
+                })?;
+                handshake_manifest_version = Some((*ctx, version));
+            }
+            BangLine::Handshake(ctx, (ctx_byte, byte_str)) => {
+                if handshake.is_some() {
+                    return Err(ParseError::new_ctx(
+                        *ctx,
+                        "Multiple handshake bang lines found",
+                    ));
+                }
+
+                let data = str_byte::str_to_data(byte_str)
+                    .map_err(|e| ParseError::new_ctx(*ctx_byte, e.to_string()))?;
+                handshake = Some(data);
+            }
+            BangLine::HandshakeResponse(ctx, (ctx_byte, byte_str)) => {
+                if handshake_response.is_some() {
+                    return Err(ParseError::new_ctx(
+                        *ctx,
+                        "Multiple handshake response bang lines found",
+                    ));
+                }
+
+                let data = str_byte::str_to_data(byte_str)
+                    .map_err(|e| ParseError::new_ctx(*ctx_byte, e.to_string()))?;
+                handshake_response = Some((*ctx, data));
+            }
+            BangLine::HandshakeDelay(ctx, (ctx_delay, delay)) => {
+                if handshake_delay.is_some() {
+                    return Err(ParseError::new_ctx(
+                        *ctx,
+                        "Multiple handshake delay bang lines found",
+                    ));
+                }
+
+                let delay = f64::from_str(delay)
+                    .map_err(|e| ParseError::new_ctx(*ctx_delay, e.to_string()))?;
+                let delay = Duration::try_from_secs_f64(delay).map_err(|e| {
+                    ParseError::new_ctx(*ctx_delay, format!("Failed to parse handshake delay: {e}"))
+                })?;
+                handshake_delay = Some(delay);
+            }
+            BangLine::Auto(_, _) => {
+                todo!("Auto bang lines are not yet supported in the actor")
+            }
             BangLine::AllowRestart(ctx) => {
                 if allow_restart.is_some() {
                     return Err(ParseError::new_ctx(
@@ -217,10 +278,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 }
                 allow_restart = Some(true);
             }
-            BangLine::Auto(_, _) => {
-                todo!("Auto bang lines are not yet supported in the actor")
-            }
-            BangLine::Concurrent(ctx) => {
+            BangLine::AllowConcurrent(ctx) => {
                 if allow_concurrent.is_some() {
                     return Err(ParseError::new_ctx(
                         *ctx,
@@ -229,34 +287,10 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 }
                 allow_concurrent = Some(true);
             }
-            BangLine::Handshake(ctx, byte_str) => {
-                if handshake.is_some() {
-                    return Err(ParseError::new_ctx(
-                        *ctx,
-                        "Multiple handshake bang lines found",
-                    ));
-                }
-
-                match str_byte::str_to_data(byte_str) {
-                    Ok(data) => {
-                        handshake = Some(data);
-                    }
-                    Err(e) => {
-                        return Err(ParseError::new(e.to_string()));
-                    }
-                }
-            }
-            BangLine::HandshakeDelay(_, _) => {
-                todo!("Parse handshake delay")
-            }
             BangLine::Python(_, _) => {
                 todo!("Python blocks are not yet supported in the actor")
             }
         }
-    }
-
-    if handshake.is_some() && bolt_version.is_some() {
-        todo!("Report err")
     }
 
     let bolt_version = bolt_version.ok_or(ParseError::new("Bolt version bang line missing"))?;
@@ -266,12 +300,40 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     } else {
         allow_restart.unwrap_or(false)
     };
+    let handshake_response = match handshake_response {
+        None => None,
+        Some((ctx, handshake_response)) => {
+            if handshake.is_none() {
+                return Err(ParseError::new_ctx(
+                    ctx,
+                    "Handshake response bang line requires handshake bang line to be present",
+                ));
+            }
+            Some(handshake_response)
+        }
+    };
+    let handshake_manifest_version = match handshake_manifest_version {
+        None => None,
+        Some((ctx, handshake_manifest_version)) => {
+            if handshake.is_some() || handshake_response.is_some() {
+                return Err(ParseError::new_ctx(
+                    ctx,
+                    "Handshake manifest version bang line cannot be used with handshake or \
+                    handshake response bang lines",
+                ));
+            }
+            Some(handshake_manifest_version)
+        }
+    };
+
     Ok(ActorConfig {
         bolt_version,
+        handshake_manifest_version,
+        handshake,
+        handshake_response,
+        handshake_delay,
         allow_restart,
         allow_concurrent,
-        handshake,
-        handshake_delay,
     })
 }
 
@@ -1723,10 +1785,12 @@ mod test {
         };
         let cfg = ActorConfig {
             bolt_version: BoltVersion::V5_0,
+            handshake_manifest_version: None,
+            handshake: None,
+            handshake_response: None,
+            handshake_delay: None,
             allow_restart: false,
             allow_concurrent: false,
-            handshake: None,
-            handshake_delay: None,
         };
         let validator = create_validator(tag, ctx, Some((ctx, body)), &cfg).unwrap();
 

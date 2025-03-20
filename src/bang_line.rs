@@ -3,36 +3,58 @@ use crate::context::Context;
 #[derive(Debug, PartialEq, Clone)]
 pub enum BangLine {
     Version(Context, u8, Option<u8>),
+    HandshakeManifest(Context, (Context, String)),
+    Handshake(Context, (Context, String)),
+    HandshakeResponse(Context, (Context, String)),
+    HandshakeDelay(Context, (Context, String)),
+    Auto(Context, (Context, String)),
     AllowRestart(Context),
-    Auto(Context, String),
-    Concurrent(Context),
-    Handshake(Context, String),
-    HandshakeDelay(Context, f64),
-    Python(Context, String),
+    AllowConcurrent(Context),
+    Python(Context, (Context, String)),
 }
 
+#[cfg(test)]
 impl BangLine {
     pub fn ctx(&self) -> &Context {
         match self {
-            BangLine::Version(ctx, _, _) => ctx,
-            BangLine::AllowRestart(ctx) => ctx,
-            BangLine::Auto(ctx, _) => ctx,
-            BangLine::Concurrent(ctx) => ctx,
-            BangLine::Handshake(ctx, _) => ctx,
-            BangLine::HandshakeDelay(ctx, _) => ctx,
-            BangLine::Python(ctx, _) => ctx,
+            Self::Version(ctx, ..) => ctx,
+            Self::HandshakeManifest(ctx, ..) => ctx,
+            Self::Handshake(ctx, ..) => ctx,
+            Self::HandshakeResponse(ctx, ..) => ctx,
+            Self::HandshakeDelay(ctx, ..) => ctx,
+            Self::Auto(ctx, ..) => ctx,
+            Self::AllowRestart(ctx, ..) => ctx,
+            Self::AllowConcurrent(ctx, ..) => ctx,
+            Self::Python(ctx, ..) => ctx,
         }
     }
 
-    pub fn ctx_mut(&mut self) -> &mut Context {
+    pub fn add_offset(&mut self, lines: usize, bytes: usize) {
+        fn add_offset_ctx<const N: usize>(contexts: [&mut Context; N], lines: usize, bytes: usize) {
+            for context in contexts {
+                context.start_line_number += lines;
+                context.end_line_number += lines;
+                context.start_byte += bytes;
+                context.end_byte += bytes;
+            }
+        }
+
         match self {
-            BangLine::Version(ctx, _, _) => ctx,
-            BangLine::AllowRestart(ctx) => ctx,
-            BangLine::Auto(ctx, _) => ctx,
-            BangLine::Concurrent(ctx) => ctx,
-            BangLine::Handshake(ctx, _) => ctx,
-            BangLine::HandshakeDelay(ctx, _) => ctx,
-            BangLine::Python(ctx, _) => ctx,
+            BangLine::Version(ctx, _, _) => add_offset_ctx([ctx], lines, bytes),
+            BangLine::HandshakeManifest(ctx, (ctx_arg, _)) => {
+                add_offset_ctx([ctx, ctx_arg], lines, bytes)
+            }
+            BangLine::Handshake(ctx, (ctx_arg, _)) => add_offset_ctx([ctx, ctx_arg], lines, bytes),
+            BangLine::HandshakeResponse(ctx, (ctx_arg, _)) => {
+                add_offset_ctx([ctx, ctx_arg], lines, bytes)
+            }
+            BangLine::HandshakeDelay(ctx, (ctx_arg, _)) => {
+                add_offset_ctx([ctx, ctx_arg], lines, bytes)
+            }
+            BangLine::Auto(ctx, (ctx_arg, _)) => add_offset_ctx([ctx, ctx_arg], lines, bytes),
+            BangLine::AllowRestart(ctx) => add_offset_ctx([ctx], lines, bytes),
+            BangLine::AllowConcurrent(ctx) => add_offset_ctx([ctx], lines, bytes),
+            BangLine::Python(ctx, (ctx_arg, _)) => add_offset_ctx([ctx, ctx_arg], lines, bytes),
         }
     }
 }
