@@ -14,6 +14,7 @@ use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 use crate::bang_line::BangLine;
 use crate::bolt_version::{BoltCapabilities, BoltVersion, JoltVersion};
 use crate::context::Context;
+use crate::error::script_excerpt;
 use crate::ext::serde_json as serde_json_ext;
 use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
@@ -55,121 +56,30 @@ type ValidateValueFn = Box<dyn Fn(&PackStreamValue) -> anyhow::Result<()> + 'sta
 type ValidateValuesFn =
     Box<dyn Fn(&[PackStreamValue]) -> anyhow::Result<()> + 'static + Send + Sync>;
 
-pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
-    fn script_excerpt(script: &str, start: usize, end: usize, column: Option<usize>) -> String {
-        const CONTEXT_LINES: usize = 3;
-
-        let line_num_max = script.lines().count();
-        let line_num_width = line_num_max.to_string().len();
-        let lines = script.lines().enumerate();
-        let mut excerpt_lines = Vec::<String>::with_capacity(end - start + 4 + 2 + CONTEXT_LINES);
-        if start.saturating_sub(CONTEXT_LINES) > 1 {
-            excerpt_lines.push(format!("  {: >width$} ...", "", width = line_num_width));
-        }
-        for (mut line_num, line) in lines {
-            line_num += 1;
-            if line_num < start.saturating_sub(CONTEXT_LINES) {
-                // pre context
-                continue;
-            }
-            if line_num < start {
-                // context before the excerpt
-                excerpt_lines.push(format!(
-                    "  {line_num: >width$} {line}",
-                    width = line_num_width
-                ));
-                continue;
-            }
-            if line_num <= end {
-                // the excerpt
-                excerpt_lines.push(format!(
-                    "> {line_num: >width$} {line}",
-                    width = line_num_width
-                ));
-            }
-            if let Some(column) = column {
-                if line_num == start {
-                    let spaces = line[..column].chars().count();
-                    excerpt_lines.push(
-                        std::iter::repeat(" ")
-                            .take(spaces + 3 + line_num_width)
-                            .chain(["^"].into_iter())
-                            .collect::<String>(),
-                    );
-                }
-            }
-            if line_num <= end {
-                continue;
-            }
-            // context after the excerpt
-            excerpt_lines.push(format!(
-                "  {line_num: >width$} {line}",
-                width = line_num_width
-            ));
-            if line_num >= end.saturating_add(CONTEXT_LINES) {
-                // past context
-                break;
-            }
-        }
-        if end.saturating_add(CONTEXT_LINES) < line_num_max {
-            excerpt_lines.push(format!("  {: >width$} ...", "", width = line_num_width));
-        }
-        excerpt_lines.join("\n")
-    }
-
-    fn get_line_offset(s: &str, line_nr: usize) -> usize {
-        let mut offset = 0;
-        for (i, line) in s.lines().enumerate() {
-            if i + 1 == line_nr {
-                return offset;
-            }
-            offset += line.len() + 1;
-        }
-        offset
-    }
-
+pub fn contextualize_res<T>(res: Result<T>, script_name: &str, script: &str) -> anyhow::Result<T> {
     match res {
         Ok(t) => Ok(t),
-        Err(mut e) => {
-            let ctx = e.ctx.take();
-            Err(match ctx {
-                None => anyhow::anyhow!("Error parsing script: {}", e.message),
-                Some(ctx) => {
-                    let start_line_offset = get_line_offset(script, ctx.start_line_number);
-                    let column = Some(ctx.start_byte - start_line_offset);
-                    // dbg!(&script[277..313]);
-                    // dbg!(&script[260..313]);
-                    // dbg!(&script[311..313]);
-                    // dbg!(&script[start_line_offset + column.unwrap()..313]);
-                    if ctx.start_line_number == ctx.end_line_number {
-                        anyhow::anyhow!(
-                            "Error parsing script on line ({}): {}\n{}",
-                            ctx.start_line_number,
-                            e.message,
-                            script_excerpt(
-                                script,
-                                ctx.start_line_number,
-                                ctx.end_line_number,
-                                column
-                            )
-                        )
-                    } else {
-                        anyhow::anyhow!(
-                            "Error parsing script on lines ({}-{}): {:?}\n{}",
-                            ctx.start_line_number,
-                            ctx.end_line_number,
-                            e.message,
-                            script_excerpt(
-                                script,
-                                ctx.start_line_number,
-                                ctx.end_line_number,
-                                column
-                            )
-                        )
-                    }
+        Err(e) => Err(match e.ctx {
+            None => anyhow::anyhow!("Error parsing script: {}", e.message),
+            Some(ctx) => {
+                if ctx.start_line_number == ctx.end_line_number {
+                    anyhow::anyhow!(
+                        "Error parsing script on line ({}): {}\n{}",
+                        ctx.start_line_number,
+                        e.message,
+                        script_excerpt(script_name, script, ctx)
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "Error parsing script on lines ({}-{}): {:?}\n{}",
+                        ctx.start_line_number,
+                        ctx.end_line_number,
+                        e.message,
+                        script_excerpt(script_name, script, ctx)
+                    )
                 }
-            })
-        }
+            }
+        }),
     }
 }
 

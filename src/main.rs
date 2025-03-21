@@ -4,6 +4,7 @@
 mod bang_line;
 mod bolt_version;
 mod context;
+mod error;
 mod ext;
 mod jolt;
 mod logging;
@@ -56,6 +57,7 @@ struct StubArgs {
 }
 
 static SCRIPT: OnceLock<String> = OnceLock::new();
+static SCRIPT_NAME: OnceLock<String> = OnceLock::new();
 static PARSED: OnceLock<ActorScript> = OnceLock::new();
 
 fn main() -> MainResult {
@@ -74,24 +76,32 @@ fn main_raw_error() -> Result<(), MainError> {
     if args.verbose > 3 {
         log::warn!("Verbose level capped at 3");
     }
+
+    SCRIPT_NAME.get_or_init(move || args.script);
+    let script_name = SCRIPT_NAME.get().unwrap();
     let script_text = with_exit_code(99, || {
-        std::fs::read_to_string(&args.script)
-            .with_context(|| format!("Failed to read script file: {}", &args.script))
+        std::fs::read_to_string(script_name)
+            .with_context(|| format!("Failed to read script file: {}", script_name))
     })?;
     debug!(
         "Read script file: {}\n\
         ================================================================\n\
         {script_text}\n\
         ================================================================",
-        &args.script
+        script_name
     );
     SCRIPT.get_or_init(move || script_text);
+    let script = SCRIPT.get().unwrap();
 
     let output = with_exit_code(99, || {
-        scanner::scan_script(SCRIPT.get().unwrap(), args.script)
+        scanner::contextualize_res(
+            scanner::scan_script(script, script_name),
+            script_name,
+            script,
+        )
     })?;
     let engine = with_exit_code(99, || {
-        parser::contextualize_res(parser::parse(output), SCRIPT.get().unwrap())
+        parser::contextualize_res(parser::parse(output), script_name, script)
     })?;
 
     PARSED.get_or_init(move || engine);

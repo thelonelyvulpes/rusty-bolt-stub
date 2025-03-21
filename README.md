@@ -1,5 +1,4 @@
 Todos:
-- Contextualize Scanner errors
 - Info logs: include remote and local port in
 - Complete bang line support
 - Bolt handshake manifest style

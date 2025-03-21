@@ -3,7 +3,7 @@ use crate::context::Context;
 
 #[derive(Debug)]
 pub struct Script<'a> {
-    pub(crate) name: String,
+    pub(crate) name: &'a str,
     pub(crate) bang_lines: Vec<BangLine>,
     pub(crate) body: ScanBlock,
     pub(crate) input: &'a str,

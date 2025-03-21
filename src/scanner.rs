@@ -5,19 +5,19 @@ use log::trace;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{line_ending, multispace0, not_line_ending, space0, space1};
-use nom::combinator::{cond, consumed, eof, map, opt, peek, recognize, value};
+use nom::combinator::{complete, cond, consumed, eof, map, opt, peek, recognize, value};
 use nom::error::{context, ErrorKind, FromExternalError, ParseError};
 use nom::multi::{many1, many_till};
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::{AsChar, InputLength, InputTakeAtPosition, Parser, Slice};
 use nom_span::Spanned;
-use nom_supreme::error::ErrorTree;
 
 use crate::bang_line::BangLine;
 use crate::context::Context;
+use crate::error::script_excerpt;
 use crate::types::{ScanBlock, Script};
 
-type PError<I> = ErrorTree<I>;
+type PError<I> = nom::error::Error<I>;
 type Input<'a> = Spanned<&'a str>;
 type IResult<'a, O> = nom::IResult<Input<'a>, O, PError<Input<'a>>>;
 
@@ -33,11 +33,21 @@ impl From<Input<'_>> for Context {
     }
 }
 
-pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<Input>>> {
+pub fn scan_script<'a>(
+    input: &'a str,
+    name: &'a str,
+) -> Result<Script<'a>, nom::Err<PError<Input<'a>>>> {
     let span = Spanned::new(input, true);
-    let (span, bangs) = preceded(multispace0, context("Bang line headers", scan_bang_lines))(span)?;
-
-    let (span, body) = delimited(multispace0, opt(scan_body), multispace0)(span)?;
+    let (span, (bangs, body)) = complete(terminated(
+        pair(
+            preceded(multispace0, context("Bang line headers", scan_bang_lines)),
+            delimited(multispace0, opt(scan_body), multispace0),
+        ),
+        eof,
+    ))(span)?;
+    // let (span, bangs) = preceded(multispace0, context("Bang line headers", scan_bang_lines))(span)?;
+    //
+    // let (span, body) = delimited(multispace0, opt(scan_body), multispace0)(span)?;
     if !span.is_empty() {
         return Err(nom::Err::Failure(PError::from_external_error(
             span,
@@ -61,6 +71,32 @@ pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<
         body,
         input,
     })
+}
+
+pub fn contextualize_res<T>(
+    res: Result<T, nom::Err<PError<Input>>>,
+    script_name: &str,
+    script: &str,
+) -> anyhow::Result<T> {
+    match res {
+        Ok(t) => Ok(t),
+        Err(e) => Err({
+            match e {
+                nom::Err::Incomplete(_) => {
+                    panic!("Working only with complete data")
+                }
+                nom::Err::Error(e) | nom::Err::Failure(e) => {
+                    let mut ctx: Context = e.input.into();
+                    ctx.end_byte = ctx.start_byte + 1;
+                    ctx.end_line_number = ctx.start_line_number;
+                    anyhow!(
+                        "Syntax error near\n{}",
+                        script_excerpt(script_name, script, ctx)
+                    )
+                }
+            }
+        }),
+    }
 }
 
 // #################
