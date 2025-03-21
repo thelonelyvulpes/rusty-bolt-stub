@@ -1,5 +1,6 @@
-use anyhow::anyhow;
 use std::fmt::{Display, Formatter};
+
+use anyhow::anyhow;
 
 pub(crate) fn str_to_bytes(byte_str: &str) -> anyhow::Result<Vec<u8>> {
     let clean = byte_str.replace(' ', "");

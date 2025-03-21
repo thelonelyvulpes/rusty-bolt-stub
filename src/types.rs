@@ -39,9 +39,10 @@ pub struct ConditionBranch {
 }
 
 pub mod actor_types {
+    use std::fmt::Debug;
+
     use crate::context::Context;
     use crate::values::bolt_message::BoltMessage;
-    use std::fmt::Debug;
 
     pub trait ScriptLine: Debug + Send + Sync {
         fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str;

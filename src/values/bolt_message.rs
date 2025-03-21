@@ -1,7 +1,9 @@
+use std::borrow::Cow;
+
+use itertools::Itertools;
+
 use crate::bolt_version::BoltVersion;
 use crate::values::pack_stream_value::{value_jolt_fmt, PackStreamStruct, PackStreamValue};
-use itertools::Itertools;
-use std::borrow::Cow;
 
 #[derive(Debug, Clone)]
 pub struct BoltMessage {

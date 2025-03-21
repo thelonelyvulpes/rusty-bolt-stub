@@ -2,12 +2,13 @@ use std::cell::LazyCell;
 use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
+use regex::Regex;
+
 use crate::bolt_version::JoltVersion;
 use crate::parse_error::ParseError;
 use crate::values::bolt_struct::_parsing::{check_last_pack_stream_field, next_pack_stream_field};
 use crate::values::bolt_struct::{TAG_POINT_2D, TAG_POINT_3D};
 use crate::values::pack_stream_value::{PackStreamStruct, PackStreamValue};
-use regex::Regex;
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct JoltPoint {

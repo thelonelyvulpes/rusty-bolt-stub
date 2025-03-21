@@ -1844,10 +1844,10 @@ fn validate_parallel_child(b: &ActorBlock) -> Result<()> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     use indexmap::indexmap;
     use serde_json::Number;
+
+    use super::*;
 
     #[test]
     fn should_validate_any_hello() {

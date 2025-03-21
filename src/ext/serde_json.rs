@@ -1,7 +1,8 @@
+use std::io::{Result as IoResult, Write};
+
 use serde::Serialize;
 use serde_json::ser::Formatter as JsonFormatter;
 use serde_json::Result as JsonResult;
-use std::io::{Result as IoResult, Write};
 
 struct PrettyCompactFormatter {}
 

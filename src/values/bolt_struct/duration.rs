@@ -2,6 +2,8 @@ use std::cell::LazyCell;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 
+use regex::{Captures, Regex};
+
 use crate::bolt_version::JoltVersion;
 use crate::parse_error::ParseError;
 use crate::util::opt_res_ret;
@@ -9,7 +11,6 @@ use crate::values::bolt_struct::_common::normalize_seconds_nanos;
 use crate::values::bolt_struct::_parsing::{check_last_pack_stream_field, next_pack_stream_field};
 use crate::values::bolt_struct::TAG_DURATION;
 use crate::values::pack_stream_value::{PackStreamStruct, PackStreamValue};
-use regex::{Captures, Regex};
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct JoltDuration {

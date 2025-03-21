@@ -9,8 +9,8 @@ mod point;
 mod relationship;
 mod time;
 
-use crate::bolt_version::JoltVersion;
-use crate::values::pack_stream_value::PackStreamStruct;
+use std::fmt::{Debug, Display, Formatter};
+
 use date::BoltDate;
 pub(crate) use date::JoltDate;
 use date_time::BoltDateTime;
@@ -25,9 +25,11 @@ use point::BoltPoint;
 pub(crate) use point::JoltPoint;
 use relationship::BoltRelationship;
 pub(crate) use relationship::JoltRelationship;
-use std::fmt::{Debug, Display, Formatter};
 use time::BoltTime;
 pub(crate) use time::JoltTime;
+
+use crate::bolt_version::JoltVersion;
+use crate::values::pack_stream_value::PackStreamStruct;
 
 pub(crate) const TAG_DATE: u8 = 0x44;
 pub(crate) const TAG_DATE_TIME_V1: u8 = 0x46;

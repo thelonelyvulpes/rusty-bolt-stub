@@ -2,13 +2,14 @@ use std::cell::LazyCell;
 use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
+use chrono::{NaiveTime, Timelike};
+use regex::Regex;
+
 use crate::bolt_version::JoltVersion;
 use crate::parse_error::ParseError;
 use crate::values::bolt_struct::_parsing::{check_last_pack_stream_field, next_pack_stream_field};
 use crate::values::bolt_struct::{TAG_LOCAL_TIME, TAG_TIME};
 use crate::values::pack_stream_value::{PackStreamStruct, PackStreamValue};
-use chrono::{NaiveTime, Timelike};
-use regex::Regex;
 
 #[derive(Debug)]
 pub(crate) struct JoltTime<'a> {

@@ -1,6 +1,6 @@
-use crate::context::Context;
-
 use std::error::Error;
+
+use crate::context::Context;
 
 #[derive(Debug)]
 pub(crate) struct ParseError {

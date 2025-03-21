@@ -947,8 +947,9 @@ mod tests {
     use super::*;
 
     mod simulate {
-        use anyhow::anyhow;
         use std::fmt::{Debug, Formatter};
+
+        use anyhow::anyhow;
         use tokio::net::TcpStream;
 
         use super::*;
