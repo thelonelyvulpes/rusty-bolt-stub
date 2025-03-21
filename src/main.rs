@@ -4,6 +4,7 @@
 mod bang_line;
 mod bolt_version;
 mod context;
+mod ext;
 mod jolt;
 mod logging;
 mod net;
@@ -11,8 +12,7 @@ mod net_actor;
 mod parse_error;
 mod parser;
 mod scanner;
-mod serde_json_ext;
-mod str_byte;
+mod str_bytes;
 mod types;
 mod util;
 mod values;

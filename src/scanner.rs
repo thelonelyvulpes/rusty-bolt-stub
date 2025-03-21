@@ -4,12 +4,12 @@ use anyhow::anyhow;
 use log::trace;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
-use nom::character::complete::{line_ending, multispace0, not_line_ending, space0, space1, u8};
+use nom::character::complete::{line_ending, multispace0, not_line_ending, space0, space1};
 use nom::combinator::{cond, consumed, eof, map, opt, peek, recognize, value};
 use nom::error::{context, ErrorKind, FromExternalError, ParseError};
 use nom::multi::{many1, many_till};
-use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
-use nom::{AsChar, InputLength, InputTakeAtPosition, Parser};
+use nom::sequence::{delimited, pair, preceded, terminated};
+use nom::{AsChar, InputLength, InputTakeAtPosition, Parser, Slice};
 use nom_span::Spanned;
 use nom_supreme::error::ErrorTree;
 
@@ -36,19 +36,6 @@ impl From<Input<'_>> for Context {
 pub fn scan_script(input: &str, name: String) -> Result<Script, nom::Err<PError<Input>>> {
     let span = Spanned::new(input, true);
     let (span, bangs) = preceded(multispace0, context("Bang line headers", scan_bang_lines))(span)?;
-
-    if input.is_empty()
-        && bangs
-            .iter()
-            .any(|x| matches!(x, BangLine::Version(_, _, _)))
-    {
-        return Ok(Script {
-            name,
-            bang_lines: bangs,
-            body: ScanBlock::List(span.into(), vec![]),
-            input,
-        });
-    };
 
     let (span, body) = delimited(multispace0, opt(scan_body), multispace0)(span)?;
     if !span.is_empty() {
@@ -115,25 +102,34 @@ fn scan_bang_lines(input: Input) -> IResult<Vec<BangLine>> {
 }
 
 fn bolt_version_bang_line(input: Input) -> IResult<BangLine> {
-    let (input, (ctx, (major, minor))) = preceded(
-        multispace0,
-        consumed(preceded(
-            bang_line("BOLT"),
-            preceded(
-                space1,
-                terminated(
-                    alt((
-                        map(separated_pair(u8, tag("."), u8), |(major, minor)| {
-                            (major, Some(minor))
-                        }),
-                        map(u8, |major| (major, None)),
-                    )),
-                    peek(end_of_line),
+    map(
+        preceded(
+            multispace0,
+            consumed(preceded(
+                bang_line("BOLT"),
+                preceded(
+                    space1,
+                    terminated(
+                        alt((
+                            map(
+                                pair(non_space, preceded(space1, rest_of_line)),
+                                |(arg1, arg2)| (arg1, Some(arg2)),
+                            ),
+                            map(rest_of_line, |arg1| (arg1, None)),
+                        )),
+                        peek(end_of_line),
+                    ),
                 ),
-            ),
-        )),
-    )(input)?;
-    Ok((input, BangLine::Version(ctx.into(), major, minor)))
+            )),
+        ),
+        |(ctx, (arg1, arg2))| {
+            BangLine::Version(
+                ctx.into(),
+                (arg1.into(), String::from(*arg1)),
+                arg2.map(|arg| (arg.into(), String::from(*arg))),
+            )
+        },
+    )(input)
 }
 
 fn auto_bang_line(input: Input) -> IResult<BangLine> {
@@ -161,7 +157,7 @@ fn string_arg_bang_line<'a>(
                 preceded(space1, terminated(rest_of_line, peek(end_of_line))),
             )),
         ),
-        move |(ctx, message)| res(ctx.into(), (message.into(), String::from(message.trim()))),
+        move |(ctx, message)| res(ctx.into(), (message.into(), String::from(*message))),
     )
 }
 
@@ -328,8 +324,8 @@ fn message<'a>(
         move |(ctx, (message, arg))| {
             block(
                 ctx.into(),
-                String::from(message.trim()),
-                arg.map(|arg| (arg.into(), String::from(arg.trim()))),
+                String::from(*message),
+                arg.map(|arg| (arg.into(), String::from(*arg))),
             )
         },
     )
@@ -371,7 +367,7 @@ fn message_simple_content<'a>(
                 peek(end_of_line),
             ),
         ),
-        move |(ctx, content)| block(ctx.into(), String::from(content.trim())),
+        move |(ctx, content)| block(ctx.into(), String::from(*content)),
     )
 }
 
@@ -452,8 +448,8 @@ fn auto_repeat_0(input: Input) -> IResult<ScanBlock> {
             message.into(),
             Box::new(ScanBlock::AutoMessage(
                 message.into(),
-                String::from(message.trim()),
-                args.map(|s| (s.into(), String::from(s.trim()))),
+                String::from(*message),
+                args.map(|s| (s.into(), String::from(*s))),
             )),
         ),
     ))
@@ -468,8 +464,8 @@ fn auto_repeat_1(input: Input) -> IResult<ScanBlock> {
             message.into(),
             Box::new(ScanBlock::AutoMessage(
                 message.into(),
-                String::from(message.trim()),
-                args.map(|s| (s.into(), String::from(s.trim()))),
+                String::from(*message),
+                args.map(|s| (s.into(), String::from(*s))),
             )),
         ),
     ))
@@ -484,8 +480,8 @@ fn auto_optional(input: Input) -> IResult<ScanBlock> {
             message.into(),
             Box::new(ScanBlock::AutoMessage(
                 message.into(),
-                String::from(message.trim()),
-                args.map(|s| (s.into(), String::from(s.trim()))),
+                String::from(*message),
+                args.map(|s| (s.into(), String::from(*s))),
             )),
         ),
     ))
@@ -505,6 +501,14 @@ where
     )
 }
 
+fn non_space<T, E: ParseError<T>>(input: T) -> nom::IResult<T, T, E>
+where
+    T: InputTakeAtPosition,
+    <T as InputTakeAtPosition>::Item: AsChar + Clone,
+{
+    input.split_at_position1_complete(|item| item.as_char().is_whitespace(), ErrorKind::Alpha)
+}
+
 fn rest_of_line<'a, E: ParseError<Input<'a>>>(
     input: Input<'a>,
 ) -> nom::IResult<Input<'a>, Input<'a>, E> {
@@ -512,10 +516,20 @@ fn rest_of_line<'a, E: ParseError<Input<'a>>>(
     if line.is_empty() {
         return Err(nom::Err::Error(E::from_error_kind(
             input,
-            nom::error::ErrorKind::Complete,
+            ErrorKind::Complete,
         )));
     }
-    Ok((input, line))
+    match line.rfind(|c: char| !c.is_whitespace()) {
+        None => Ok((input, line)),
+        Some(i) => {
+            let rest = line.slice(i..);
+            let (_, c) = rest
+                .char_indices()
+                .next()
+                .expect("not at of string, because i points to non-whitespace char");
+            Ok((input, line.slice(..i + c.len_utf8())))
+        }
+    }
 }
 
 fn end_of_line<'a, E: ParseError<Input<'a>>>(input: Input<'a>) -> nom::IResult<Input<'a>, (), E> {
@@ -633,16 +647,6 @@ mod tests {
     // #################
     // Header/Bang Lines
     // #################
-    #[test]
-    fn should_scan_u8() {
-        let input = wrap_input("!: BOLT 16.5\n");
-        let result = dbg!(scanner::bolt_version_bang_line(input));
-        assert!(result.is_ok());
-        let (rem, bl) = result.unwrap();
-        assert_eq!(*rem, "\n");
-        assert_eq!(bl, BangLine::Version(new_ctx(1, 1, 0, 12), 16, Some(5)));
-    }
-
     fn str_bang_line(
         bang: impl FnOnce(Context, (Context, String)) -> BangLine,
         total_len: usize,
@@ -666,10 +670,50 @@ mod tests {
         )
     }
 
+    fn bolt_bang_line(
+        total_len: usize,
+        version_offset: usize,
+        version: &'static str,
+        capabilities: Option<(usize, &'static str)>,
+    ) -> BangLine {
+        bolt_bang_line_offset(1, 0, total_len, version_offset, version, capabilities)
+    }
+
+    fn bolt_bang_line_offset(
+        line: usize,
+        offset: usize,
+        total_len: usize,
+        version_offset: usize,
+        version: &'static str,
+        capabilities: Option<(usize, &'static str)>,
+    ) -> BangLine {
+        let start = offset;
+        let end = offset + total_len;
+        let version_start = start + version_offset;
+        let version_end = version_start + version.len();
+        let capabilities = capabilities.map(|(offset, s)| {
+            let cap_start = start + offset;
+            let cap_end = cap_start + s.len();
+            (new_ctx(line, line, cap_start, cap_end), s.into())
+        });
+        BangLine::Version(
+            new_ctx(line, line, start, end),
+            (
+                new_ctx(line, line, version_start, version_end),
+                version.into(),
+            ),
+            capabilities,
+        )
+    }
+
     #[rstest]
-    #[case::bolt_5_4("!: BOLT 5.4\n", BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(4)))]
-    #[case::bolt_5_0("!: BOLT 5.0\n", BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(0)))]
-    #[case::bolt_5("!: BOLT 5\n", BangLine::Version(new_ctx(1, 1, 0, 9), 5, None))]
+    #[case::bolt_5_4("!: BOLT 5.4\n", bolt_bang_line(11, 8, "5.4", None))]
+    #[case::bolt_5_4_spaces("!:  BOLT   5.4  \n", bolt_bang_line(16, 11, "5.4", None))]
+    #[case::bolt_foobar("!: BOLT foobar\n", bolt_bang_line(14, 8, "foobar", None))]
+    #[case::bolt_capabilities(
+        "!:  BOLT \t foobar  \t cap \t- abilities  \n",
+        bolt_bang_line(39, 11, "foobar", Some((21, "cap \t- abilities")))
+    )]
     #[case::hanshake_manifest(
         "!: HANDSHAKE_MANIFEST 5\n",
         str_bang_line(BangLine::HandshakeManifest, 23, "5")
@@ -722,7 +766,11 @@ mod tests {
         assert_eq!(result.bang_lines.len(), 3);
         assert_eq!(
             result.bang_lines.first(),
-            Some(&BangLine::Version(new_ctx(1, 1, 0, 11), 5, Some(4)))
+            Some(&BangLine::Version(
+                new_ctx(1, 1, 0, 11),
+                (new_ctx(1, 1, 8, 11), "5.4".into()),
+                None
+            ))
         );
         assert_eq!(
             result.bang_lines.get(1),
@@ -793,13 +841,17 @@ mod tests {
         #[case] b_start_2: usize,
         #[case] b_body_start_2: usize,
         #[case] b_end_2: usize,
-        #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n", "\n?}", "\n?}")] ending: &'static str,
+        #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n", "\n?}")] ending: &'static str,
     ) {
         let input = format!("{input}{ending}");
         let (rem, block) = dbg!(multi_message(Some("C:"), ScanBlock::ClientMessage)(
             wrap_input(&input)
         ))
         .unwrap();
+        let body_1 = "a b";
+        let b_body_end_1 = b_body_start_1 + body_1.len();
+        let body_2 = "lel lol";
+        let b_body_end_2 = b_body_start_2 + body_2.len();
         assert_eq!(*rem, ending);
         assert_eq!(
             block,
@@ -809,12 +861,12 @@ mod tests {
                     ScanBlock::ClientMessage(
                         new_ctx(1, 1, 0, b_end_1),
                         "Foo".into(),
-                        Some((new_ctx(1, 1, b_body_start_1, b_end_1), "a b".into()))
+                        Some((new_ctx(1, 1, b_body_start_1, b_body_end_1), body_1.into()))
                     ),
                     ScanBlock::ClientMessage(
                         new_ctx(2, 2, b_start_2, b_end_2),
                         "Bar".into(),
-                        Some((new_ctx(2, 2, b_body_start_2, b_end_2), "lel lol".into()))
+                        Some((new_ctx(2, 2, b_body_start_2, b_body_end_2), body_2.into()))
                     )
                 ]
             )
@@ -878,13 +930,15 @@ mod tests {
     ) {
         let result = message(Some("C:"), ScanBlock::ClientMessage)(wrap_input(input));
         let (rem, block) = result.unwrap();
+        let body = "foo bar";
+        let body_end = body_start + body.len();
         assert_eq!(*rem, "");
         assert_eq!(
             block,
             ScanBlock::ClientMessage(
                 new_ctx(1, 1, 0, bytes),
                 "RUN".into(),
-                Some((new_ctx(1, 1, body_start, bytes), "foo bar".into()))
+                Some((new_ctx(1, 1, body_start, body_end), body.into()))
             )
         );
     }
@@ -1025,7 +1079,7 @@ mod tests {
         let input = format!("{content}{eol}");
         let result = call_rest_of_line(input.as_str());
         let (rem, taken) = result.unwrap();
-        assert_eq!(*taken, content);
+        assert_eq!(*taken, content.trim_end());
         assert_eq!(*rem, eol);
     }
 

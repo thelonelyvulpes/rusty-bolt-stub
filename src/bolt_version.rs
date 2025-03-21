@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::atomic::AtomicI64;
 
 use indexmap::{indexmap, IndexMap};
+use itertools::{EitherOrBoth, Itertools};
 
 use crate::values::pack_stream_value::PackStreamValue;
 
@@ -37,7 +39,7 @@ impl Display for BoltVersion {
 }
 
 impl BoltVersion {
-    pub fn match_valid_version(major: u8, minor: &Option<u8>) -> Option<Self> {
+    pub fn match_valid_version(major: u8, minor: Option<u8>) -> Option<Self> {
         Some(match (major, minor) {
             (1, None) | (1, Some(0)) => BoltVersion::V1,
             (2, None) | (2, Some(0)) => BoltVersion::V2,
@@ -129,6 +131,61 @@ impl BoltVersion {
             BoltVersion::V5_6 => JoltVersion::V2,
             BoltVersion::V5_7 => JoltVersion::V2,
             BoltVersion::V5_8 => JoltVersion::V2,
+        }
+    }
+
+    pub fn supports_minor(&self) -> bool {
+        self >= &BoltVersion::V4_0
+    }
+
+    pub fn supports_range(&self) -> bool {
+        self >= &BoltVersion::V4_2
+    }
+
+    pub fn max_handshake_manifest_version(&self) -> u8 {
+        match self {
+            BoltVersion::V1 => 0,
+            BoltVersion::V2 => 0,
+            BoltVersion::V3 => 0,
+            BoltVersion::V4_0 => 0,
+            BoltVersion::V4_1 => 0,
+            BoltVersion::V4_2 => 0,
+            BoltVersion::V4_3 => 0,
+            BoltVersion::V4_4 => 0,
+            BoltVersion::V5_0 => 0,
+            BoltVersion::V5_1 => 0,
+            BoltVersion::V5_2 => 0,
+            BoltVersion::V5_3 => 0,
+            BoltVersion::V5_4 => 0,
+            BoltVersion::V5_5 => 0,
+            BoltVersion::V5_6 => 1,
+            BoltVersion::V5_7 => 1,
+            BoltVersion::V5_8 => 1,
+        }
+    }
+
+    pub fn backwards_equivalent_versions(&self) -> &'static [(u8, u8)] {
+        static NONE: [(u8, u8); 0] = [];
+        static ALIASES_V4_2: [(u8, u8); 1] = [(4, 1)];
+
+        match self {
+            BoltVersion::V1 => &NONE,
+            BoltVersion::V2 => &NONE,
+            BoltVersion::V3 => &NONE,
+            BoltVersion::V4_0 => &NONE,
+            BoltVersion::V4_1 => &NONE,
+            BoltVersion::V4_2 => &ALIASES_V4_2,
+            BoltVersion::V4_3 => &NONE,
+            BoltVersion::V4_4 => &NONE,
+            BoltVersion::V5_0 => &NONE,
+            BoltVersion::V5_1 => &NONE,
+            BoltVersion::V5_2 => &NONE,
+            BoltVersion::V5_3 => &NONE,
+            BoltVersion::V5_4 => &NONE,
+            BoltVersion::V5_5 => &NONE,
+            BoltVersion::V5_6 => &NONE,
+            BoltVersion::V5_7 => &NONE,
+            BoltVersion::V5_8 => &NONE,
         }
     }
 
@@ -253,6 +310,78 @@ impl BoltVersion {
             BoltVersion::V5_7 => "Neo4j/5.26.0",
             BoltVersion::V5_8 => "Neo4j/5.26.0",
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BoltCapabilities(Vec<u8>);
+
+impl PartialEq for BoltCapabilities {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().zip_longest(other.0.iter()).all(|e| match e {
+            EitherOrBoth::Both(a, b) => a & 0x7F == b & 0x7F,
+            EitherOrBoth::Left(byte) | EitherOrBoth::Right(byte) => *byte & 0x7F == 0,
+        })
+    }
+}
+
+impl Eq for BoltCapabilities {}
+
+impl Default for BoltCapabilities {
+    fn default() -> Self {
+        Self(vec![0x00])
+    }
+}
+
+const CAPABILITIES_MAX_BITS: usize = 63;
+
+impl BoltCapabilities {
+    pub(crate) fn from_bytes(mut bytes: Vec<u8>) -> Result<Self, Cow<'static, str>> {
+        if bytes.is_empty() {
+            bytes.push(0);
+        }
+        let is_var_int = bytes.iter().rev().skip(1).all(|b| b & 0x80 != 0)
+            && bytes.iter().last().unwrap() & 0x80 == 0;
+        if !is_var_int {
+            return Err("Bolt capabilities are not base128 VarInt encoded".into());
+        }
+        if Self::msb(&bytes).unwrap_or(usize::MAX) >= CAPABILITIES_MAX_BITS {
+            return Err("Bolt capabilities are too long (max 63 bits)".into());
+        }
+        Ok(Self(bytes))
+    }
+
+    pub(crate) fn raw(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn has_flag(&self, i: usize) -> bool {
+        let in_byte = i / 7;
+        if in_byte >= self.0.len() {
+            return false;
+        }
+        let at_bit = i % 7;
+        1 << at_bit & self.0[in_byte] != 0
+    }
+
+    /// index of the most significant (non-zero) bit
+    fn msb(bytes: &[u8]) -> Result<usize, &'static str> {
+        let mut msb: usize = 0;
+        for (i, mut byte) in bytes.iter().copied().enumerate() {
+            byte &= 0x7F;
+            if byte == 0 {
+                continue;
+            }
+            let leading_zeros: u8 = byte
+                .leading_zeros()
+                .try_into()
+                .expect("max of 8 fits into u8");
+            msb = i
+                .checked_mul(7)
+                .and_then(|i| i.checked_add((8 - leading_zeros).into()))
+                .ok_or("Bolt capabilities are too long to count bits")?;
+        }
+        Ok(msb)
     }
 }
 

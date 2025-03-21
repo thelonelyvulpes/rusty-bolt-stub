@@ -1,3 +1,5 @@
+mod handshake;
+
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -567,73 +569,6 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {}
         }
-    }
-
-    async fn handshake(&mut self) -> NetActorResult<()> {
-        // TODO: Log handshake
-        let mut buffer = [0u8; 20];
-        cancelable_io(
-            "reading handshake and magic preamble",
-            &self.ct,
-            self.conn.read_exact(&mut buffer),
-        )
-        .await?;
-
-        if buffer[0..4] != [0x60, 0x60, 0xB0, 0x17] {
-            return Err(NetActorError::from_anyhow(anyhow!(
-                "Invalid magic preamble."
-            )));
-        }
-
-        // TODO: Tidy up
-        let valid_handshake = self.negotiate_bolt_version(&mut buffer);
-        if !valid_handshake {
-            self.send_no_negotiated_bolt_version().await?;
-            return Err(NetActorError::from_anyhow(anyhow!("Invalid Bolt version")));
-        }
-
-        // TODO: handle equivalent versions (e.g. a bolt 4.2 script is allowed to run on bolt 4.1)
-
-        // TODO: handshake manifest v1
-
-        let to_negotiate = &self.script.config.bolt_version;
-        cancelable_io(
-            "sending negotiated bolt version",
-            &self.ct,
-            self.conn
-                .write_all(&[0x00, 0x00, to_negotiate.minor(), to_negotiate.major()]),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    fn negotiate_bolt_version(&self, buffer: &mut [u8; 20]) -> bool {
-        let to_negotiate = &self.script.config.bolt_version;
-
-        for entry in 1..=4 {
-            let slice = &buffer[entry * 4..entry * 4 + 4];
-            let range = slice[1];
-            let max_minor = slice[2];
-
-            if slice[3] == to_negotiate.major()
-                && to_negotiate.minor() >= max_minor - range
-                && to_negotiate.minor() <= max_minor
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    async fn send_no_negotiated_bolt_version(&mut self) -> NetActorResult<()> {
-        cancelable_io(
-            "sending no negotiated bolt version",
-            &self.ct.clone(),
-            self.conn.write_all(&[0x00, 0x00, 0x00, 0x00]),
-        )
-        .await?;
-        Ok(())
     }
 
     /// # Returns

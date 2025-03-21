@@ -12,12 +12,12 @@ use regex::Regex;
 use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 
 use crate::bang_line::BangLine;
-use crate::bolt_version::{BoltVersion, JoltVersion};
+use crate::bolt_version::{BoltCapabilities, BoltVersion, JoltVersion};
 use crate::context::Context;
+use crate::ext::serde_json as serde_json_ext;
 use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
-use crate::serde_json_ext;
-use crate::str_byte;
+use crate::str_bytes;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
 };
@@ -40,6 +40,8 @@ pub struct ActorScript<'a> {
 #[derive(Debug)]
 pub struct ActorConfig {
     pub bolt_version: BoltVersion,
+    pub bolt_version_raw: (u8, u8),
+    pub bolt_capabilities: BoltCapabilities,
     pub handshake_manifest_version: Option<u8>,
     pub handshake: Option<Vec<u8>>,
     pub handshake_response: Option<Vec<u8>>,
@@ -153,7 +155,7 @@ pub fn contextualize_res<T>(res: Result<T>, script: &str) -> anyhow::Result<T> {
                         )
                     } else {
                         anyhow::anyhow!(
-                            "Error parsing script on lines ({}-{}): {}\n{}",
+                            "Error parsing script on lines ({}-{}): {:?}\n{}",
                             ctx.start_line_number,
                             ctx.end_line_number,
                             e.message,
@@ -191,7 +193,7 @@ pub fn parse(script: Script) -> Result<ActorScript> {
 }
 
 fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
-    let mut bolt_version: Option<BoltVersion> = None;
+    let mut bolt_version: Option<((u8, u8), BoltVersion, BoltCapabilities)> = None;
     let mut handshake_manifest_version: Option<(Context, u8)> = None;
     let mut handshake: Option<Vec<u8>> = None;
     let mut handshake_response: Option<(Context, Vec<u8>)> = None;
@@ -201,16 +203,24 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
 
     for bang_line in bang_lines {
         match bang_line {
-            BangLine::Version(ctx, major, minor) => {
+            BangLine::Version(ctx, (ctx_bolt, bolt), capabilities) => {
                 if bolt_version.is_some() {
                     return Err(ParseError::new_ctx(
                         *ctx,
                         "Multiple BOLT version bang lines found",
                     ));
                 }
-                let bolt = BoltVersion::match_valid_version(*major, minor)
-                    .ok_or(ParseError::new_ctx(*ctx, "Invalid BOLT version"))?;
-                bolt_version = Some(bolt);
+                let (raw_version, version) = parse_bolt_version(*ctx_bolt, bolt)?;
+                let capabilities = match capabilities {
+                    None => BoltCapabilities::default(),
+                    Some((ctx_cap, cap)) => {
+                        let cap_bytes = str_bytes::str_to_bytes(cap)
+                            .map_err(|e| ParseError::new_ctx(*ctx_cap, e.to_string()))?;
+                        BoltCapabilities::from_bytes(cap_bytes)
+                            .map_err(|e| ParseError::new_ctx(*ctx_cap, e.to_string()))?
+                    }
+                };
+                bolt_version = Some((raw_version, version, capabilities));
             }
             BangLine::HandshakeManifest(ctx, (ctx_arg, arg)) => {
                 if handshake_manifest_version.is_some() {
@@ -235,7 +245,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                     ));
                 }
 
-                let data = str_byte::str_to_data(byte_str)
+                let data = str_bytes::str_to_bytes(byte_str)
                     .map_err(|e| ParseError::new_ctx(*ctx_byte, e.to_string()))?;
                 handshake = Some(data);
             }
@@ -247,7 +257,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                     ));
                 }
 
-                let data = str_byte::str_to_data(byte_str)
+                let data = str_bytes::str_to_bytes(byte_str)
                     .map_err(|e| ParseError::new_ctx(*ctx_byte, e.to_string()))?;
                 handshake_response = Some((*ctx, data));
             }
@@ -293,7 +303,8 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
         }
     }
 
-    let bolt_version = bolt_version.ok_or(ParseError::new("Bolt version bang line missing"))?;
+    let (bolt_version_raw, bolt_version, bolt_capabilities) =
+        bolt_version.ok_or(ParseError::new("Bolt version bang line missing"))?;
     let allow_concurrent = allow_concurrent.unwrap_or(false);
     let allow_restart = if allow_concurrent {
         true // allow concurrent implies allow restart
@@ -328,6 +339,8 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
 
     Ok(ActorConfig {
         bolt_version,
+        bolt_version_raw,
+        bolt_capabilities,
         handshake_manifest_version,
         handshake,
         handshake_response,
@@ -335,6 +348,69 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
         allow_restart,
         allow_concurrent,
     })
+}
+
+fn parse_bolt_version(ctx: Context, s: &str) -> Result<((u8, u8), BoltVersion)> {
+    // let mut current_ctx = ctx;
+    // current_ctx.end_byte = current_ctx.start_byte;
+    let mut current_start = 0;
+    let mut segments = Vec::with_capacity(2);
+    for (offset, char) in s.char_indices() {
+        let component = if char == '.' {
+            &s[current_start..offset]
+        } else if offset + char.len_utf8() == s.len() {
+            // last char
+            &s[current_start..]
+        } else {
+            continue;
+        };
+
+        segments.push(u8::from_str(component).map_err(|e| {
+            let ctx = Context {
+                start_line_number: ctx.start_line_number,
+                end_line_number: ctx.end_line_number,
+                start_byte: ctx.start_byte + current_start,
+                end_byte: ctx.start_byte + offset,
+            };
+            ParseError::new_ctx(
+                ctx,
+                format!("Invalid BOLT component {component:?} (must be u8): {e}"),
+            )
+        })?);
+        current_start = offset + char.len_utf8();
+    }
+
+    fn convert_bolt_version(
+        ctx: Context,
+        major: u8,
+        minor: Option<u8>,
+    ) -> Result<((u8, u8), BoltVersion)> {
+        let version = BoltVersion::match_valid_version(major, minor).ok_or_else(|| {
+            let version = match minor {
+                None => {
+                    format!("{major}")
+                }
+                Some(minor) => {
+                    format!("{major}.{minor}")
+                }
+            };
+            ParseError::new_ctx(ctx, format!("Unknown BOLT version {version}"))
+        })?;
+        Ok(((major, minor.unwrap_or_default()), version))
+    }
+
+    match segments.len() {
+        0 => Err(ParseError::new_ctx(
+            ctx,
+            "BOLT version must have at least one version component",
+        )),
+        1 => convert_bolt_version(ctx, segments[0], None),
+        2 => convert_bolt_version(ctx, segments[0], Some(segments[1])),
+        n => Err(ParseError::new_ctx(
+            ctx,
+            format!("BOLT version has too many components (expecting 1 or 2, got {n})"),
+        )),
+    }
 }
 
 fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
@@ -1785,6 +1861,8 @@ mod test {
         };
         let cfg = ActorConfig {
             bolt_version: BoltVersion::V5_0,
+            bolt_version_raw: (5, 0),
+            bolt_capabilities: BoltCapabilities::from_bytes(vec![0x00]).unwrap(),
             handshake_manifest_version: None,
             handshake: None,
             handshake_response: None,

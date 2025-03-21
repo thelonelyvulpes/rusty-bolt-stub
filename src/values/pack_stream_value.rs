@@ -23,6 +23,7 @@ use usize_cast::FromUsize;
 
 use crate::bolt_version::JoltVersion;
 use crate::jolt::JoltSigil;
+use crate::str_bytes;
 use crate::values::bolt_struct::BoltStruct;
 
 #[allow(unused)]
@@ -832,16 +833,7 @@ pub(crate) fn value_jolt_fmt(
                 PackStreamValue::Float(v) => Display::fmt(&v, f),
                 PackStreamValue::Bytes(b) => {
                     f.write_str(r##"{{"#": "##)?;
-                    let mut bytes = b.iter();
-                    match bytes.next() {
-                        None => {}
-                        Some(first) => {
-                            write!(f, "{first:02X}")?;
-                            for u in bytes {
-                                write!(f, " {u:02X}")?;
-                            }
-                        }
-                    }
+                    str_bytes::fmt_bytes(b).fmt(f)?;
                     f.write_str("}")
                 }
                 PackStreamValue::String(s) => std::fmt::Debug::fmt(&s, f),
