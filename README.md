@@ -1,5 +1,6 @@
 Todos:
 - Info logs: include remote and local port in
+- Allow comments in bang header
 - Complete bang line support
 - Bolt handshake manifest style
 - Special server lines (`<EXIT>`, `<SLEEP>`, raw bytes, etc.)

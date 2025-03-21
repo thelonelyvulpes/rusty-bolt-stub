@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io;
 
 use anyhow::anyhow;
@@ -13,6 +14,9 @@ use crate::str_bytes;
 impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
     pub(super) async fn handshake(&mut self) -> NetActorResult<()> {
         self.preamble().await?;
+        if self.script.config.handshake.is_some() {
+            return self.forced_handshake().await;
+        }
         let res = match self.negotiate_client_version_request().await? {
             None => {
                 swallow_anyhow_error(self.send_no_negotiated_bolt_version().await)?;
@@ -34,9 +38,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
                     debug!("{msg}");
                     swallow_anyhow_error(self.send_no_negotiated_bolt_version().await)?;
                     Err(NetActorError::from_anyhow(anyhow!("{msg}")))
+                } else if self.script.config.handshake_response.is_some() {
+                    let msg = "Script contains hard-coded handshake response, \
+                        but non-manifest style negotiation is used.";
+                    debug!("{msg}");
+                    swallow_anyhow_error(self.send_no_negotiated_bolt_version().await)?;
+                    Err(NetActorError::from_anyhow(anyhow!("{msg}")))
                 } else {
                     self.handshake_delay().await;
-                    self.send_non_manifest_bolt_version(major, minor).await
+                    self.perform_non_manifest_negotiation(major, minor).await
                 }
             }
         };
@@ -64,6 +74,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
     }
 
     async fn negotiate_client_version_request(&mut self) -> NetActorResult<Option<(u8, u8)>> {
+        let request = self.read_client_handshake_request().await?;
+
+        for entry in request.chunks(4) {
+            let entry = entry.try_into().unwrap();
+            debug!("Decoding client handshake request: {entry:?}");
+            let agreement = ClientVersionRequest::from_bytes(entry)?.negotiate(&self.script.config);
+            if let Some(agreement) = agreement {
+                return Ok(Some(agreement));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn read_client_handshake_request(&mut self) -> Result<[u8; 16], NetActorError> {
         let mut buffer = [0u8; 16];
         cancelable_io(
             "reading client handshake request",
@@ -79,16 +103,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
                 .map(str_bytes::fmt_bytes_compact)
                 .join_display(" ")
         );
-
-        for entry in buffer.chunks(4) {
-            let entry = entry.try_into().unwrap();
-            debug!("Decoding client handshake request: {entry:?}");
-            let agreement = ClientVersionRequest::from_bytes(entry)?.negotiate(&self.script.config);
-            if let Some(agreement) = agreement {
-                return Ok(Some(agreement));
-            }
-        }
-        Ok(None)
+        Ok(buffer)
     }
 
     async fn send_no_negotiated_bolt_version(&mut self) -> NetActorResult<()> {
@@ -104,8 +119,61 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
         .await
     }
 
-    async fn send_non_manifest_bolt_version(&mut self, major: u8, minor: u8) -> NetActorResult<()> {
-        let response = [0x00, 0x00, minor, major];
+    async fn forced_handshake(&mut self) -> NetActorResult<()> {
+        let handshake = self
+            .script
+            .config
+            .handshake
+            .as_ref()
+            .expect("don't call forced_handshake without handshake");
+        self.read_client_handshake_request().await?;
+
+        info!("S: <HANDSHAKE> {}", str_bytes::fmt_bytes(handshake));
+
+        cancelable_io("sending forced handshake", &self.ct, async {
+            self.conn.write_all(handshake).await?;
+            self.conn.flush().await
+        })
+        .await?;
+
+        let Some(expected_response) = &self.script.config.handshake_response else {
+            return Ok(());
+        };
+
+        let mut received_response = vec![0; expected_response.len()];
+        cancelable_io(
+            "reading forced handshake response",
+            &self.ct,
+            self.conn.read_exact(&mut received_response),
+        )
+        .await?;
+
+        info!(
+            "C: <HANDSHAKE> {}",
+            str_bytes::fmt_bytes(&received_response)
+        );
+
+        if expected_response != &received_response {
+            let msg = format!(
+                "Received handshake response ({}) doesn't match expected response ({})",
+                str_bytes::fmt_bytes(&received_response),
+                str_bytes::fmt_bytes(expected_response)
+            );
+            debug!("{msg}");
+            return Err(NetActorError::from_anyhow(anyhow!("{msg}")));
+        }
+        Ok(())
+    }
+
+    async fn perform_non_manifest_negotiation(
+        &mut self,
+        major: u8,
+        minor: u8,
+    ) -> NetActorResult<()> {
+        let response: Cow<[u8]> = match &self.script.config.handshake {
+            None => Cow::Owned(vec![0x00, 0x00, minor, major]),
+            Some(response) => Cow::Borrowed(response),
+        };
         info!("S: <HANDSHAKE> {}", str_bytes::fmt_bytes_compact(&response));
         cancelable_io(
             "sending non-manifest negotiated bolt version",
@@ -324,8 +392,8 @@ impl ClientVersionRequest {
                 debug!(
                     "Non-manifest style request doesn't match server version {:?} \
                     or aliases {:?} => reject",
+                    actor_config.bolt_version_raw,
                     actor_config.bolt_version.backwards_equivalent_versions(),
-                    actor_config.bolt_version_raw
                 );
                 None
             }
@@ -381,8 +449,7 @@ impl ClientVersionRequest {
     }
 
     fn matches(&self, major: u8, minor: u8) -> bool {
-        self.major == major && self.minor == minor
-            || (self.major.saturating_sub(self.range)..self.major).contains(&minor)
+        self.major == major && (self.minor.saturating_sub(self.range)..self.minor).contains(&minor)
     }
 }
 
