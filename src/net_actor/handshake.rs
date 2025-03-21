@@ -20,7 +20,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
                     "No comon bolt version found"
                 )))
             }
-            Some((MANIFEST_MAJOR, 1)) => self.perform_manifest_v1_negotiation().await,
+            Some((MANIFEST_MAJOR, 1)) => {
+                self.handshake_delay().await;
+                self.perform_manifest_v1_negotiation().await
+            }
             Some((MANIFEST_MAJOR, manifest)) => Err(NetActorError::from_anyhow(anyhow!(
                 "Unimplemented manifest version {manifest}"
             ))),
@@ -32,6 +35,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
                     swallow_anyhow_error(self.send_no_negotiated_bolt_version().await)?;
                     Err(NetActorError::from_anyhow(anyhow!("{msg}")))
                 } else {
+                    self.handshake_delay().await;
                     self.send_non_manifest_bolt_version(major, minor).await
                 }
             }
@@ -218,6 +222,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
             }
         }
         Ok(bytes)
+    }
+
+    async fn handshake_delay(&self) {
+        let Some(delay) = self.script.config.handshake_delay else {
+            return;
+        };
+        info!("S: <HANDSHAKE DELAY> {}s", delay.as_secs_f64());
+        tokio::time::sleep(delay).await;
     }
 }
 
