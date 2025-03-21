@@ -506,7 +506,9 @@ dependencies = [
 
 [[package]]
 name = "nom-span"
-version = "0.1.1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddd6267b7510ca5169043ca65862e7efad0247dcfbb04c8db17d7e5650c41009"
 dependencies = [
  "bytecount",
  "memchr",
