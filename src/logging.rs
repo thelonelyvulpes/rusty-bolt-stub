@@ -6,7 +6,8 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, StandardStreamLock, WriteColor};
 
 pub(super) fn init_logging(min_level: LevelFilter) {
-    let color_log: Box<dyn Log> = Box::new(ColoredLogger::new());
+    let force_verbose = min_level >= LevelFilter::Info;
+    let color_log: Box<dyn Log> = Box::new(ColoredLogger::new(force_verbose));
 
     Dispatch::new()
         .chain(Dispatch::new().level(min_level).chain(color_log))
@@ -16,6 +17,7 @@ pub(super) fn init_logging(min_level: LevelFilter) {
 
 struct ColoredLogger {
     stream: StandardStream,
+    force_verbose: bool,
     color_rich_wrap: ColorSpec,
     color_time: ColorSpec,
     color_module: ColorSpec,
@@ -27,7 +29,7 @@ struct ColoredLogger {
 }
 
 impl ColoredLogger {
-    fn new() -> Self {
+    fn new(force_verbose: bool) -> Self {
         fn new_color_spec(color: Color) -> ColorSpec {
             let mut color_spec = ColorSpec::new();
             color_spec.set_fg(Some(color));
@@ -36,6 +38,7 @@ impl ColoredLogger {
 
         Self {
             stream: StandardStream::stdout(ColorChoice::Auto),
+            force_verbose,
             color_rich_wrap: new_color_spec(Color::White),
             color_time: new_color_spec(Color::Black),
             color_module: new_color_spec(Color::White),
@@ -111,7 +114,7 @@ impl ColoredLoggerGuard<'_> {
             Level::Debug => self.stream.set_color(self.color_debug)?,
             Level::Trace => self.stream.set_color(self.color_trace)?,
         }
-        write!(self.stream, "{level:7}")?;
+        write!(self.stream, "{level:5}")?;
         self.stream.reset()
     }
 
@@ -130,7 +133,7 @@ impl Log for ColoredLogger {
 
     fn log(&self, record: &Record) {
         fallback_on_error(record, |record| match record.level() {
-            Level::Info => {
+            Level::Info if !self.force_verbose => {
                 let mut lock = self.lock();
                 lock.write_time()?;
                 writeln!(lock.stream, "  {message}", message = record.args())
@@ -140,9 +143,9 @@ impl Log for ColoredLogger {
                 lock.write_rich_log_start()?;
                 lock.write_time()?;
                 lock.write_str(" ")?;
-                lock.write_level(level)?;
-                lock.write_str(" ")?;
                 lock.write_module(record.module_path())?;
+                lock.write_str(" ")?;
+                lock.write_level(level)?;
                 lock.write_rich_log_end()?;
                 lock.write_str(" ")?;
                 writeln!(lock.stream, "{}", record.args())

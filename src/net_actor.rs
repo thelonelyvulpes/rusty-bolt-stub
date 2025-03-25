@@ -1,19 +1,23 @@
 mod handshake;
+mod logging;
 
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::io;
 use std::sync::{atomic, Arc};
 
 use anyhow::{anyhow, Context as AnyhowContext};
-use log::{debug, info};
+use logging::{debug, info};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 use crate::bolt_version::BoltVersion;
 use crate::context::Context;
+use crate::net_actor::logging::{trace, HasLoggingCtx, LoggingCtx};
 use crate::parser::ActorScript;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
@@ -57,27 +61,48 @@ impl From<anyhow::Error> for NetActorError {
     }
 }
 
-pub struct NetActor<'a, T> {
+mod private {
+    pub(super) trait Sealed {}
+    impl Sealed for tokio::net::TcpStream {}
+}
+
+#[allow(private_bounds)]
+pub trait Connection: AsyncRead + AsyncWrite + Unpin + private::Sealed {
+    fn ports(&self) -> io::Result<(u16, u16)>;
+}
+
+impl Connection for TcpStream {
+    fn ports(&self) -> io::Result<(u16, u16)> {
+        Ok((self.peer_addr()?.port(), self.local_addr()?.port()))
+    }
+}
+
+pub struct NetActor<'a, C> {
     ct: CancellationToken,
     shutting_down: Arc<atomic::AtomicBool>,
-    conn: T,
+    conn: C,
+    peer_port: u16,
+    local_port: u16,
     name: String,
     script: &'a ActorScript<'a>,
     peeked_message: Option<BoltMessage>,
 }
 
-impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
+impl<'a, C: Connection> NetActor<'a, C> {
     pub fn new(
         ct: CancellationToken,
         shutting_down: Arc<atomic::AtomicBool>,
-        conn: T,
+        conn: C,
         name: String,
         script: &'a ActorScript,
     ) -> Self {
+        let (peer_port, local_port) = conn.ports().unwrap_or((0, 0));
         NetActor {
             ct,
             shutting_down,
             conn,
+            peer_port,
+            local_port,
             name,
             script,
             peeked_message: None,
@@ -89,7 +114,10 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             Err(NetActorError::Cancellation(reason))
                 if !self.shutting_down.load(atomic::Ordering::Acquire) =>
             {
-                debug!("Ignoring NetActor error because another connection failed: {reason}");
+                debug!(
+                    self,
+                    "Ignoring NetActor error because another connection failed: {reason}",
+                );
                 return Ok(());
             }
             Err(err) => return Err(err.into()),
@@ -98,13 +126,19 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         let mut block = BlockWithState::new(&self.script.tree);
         match self.run_block(&mut block).await {
             Err(err) if block.can_skip() => {
-                debug!("Ignoring NetActor error because script reached the end: {err:#}");
+                debug!(
+                    self,
+                    "Ignoring NetActor error because script reached the end: {err:#}"
+                );
                 Ok(())
             }
             Err(NetActorError::Cancellation(reason))
                 if !self.shutting_down.load(atomic::Ordering::Acquire) =>
             {
-                debug!("Ignoring NetActor error because another connection failed: {reason}");
+                debug!(
+                    self,
+                    "Ignoring NetActor error because another connection failed: {reason}"
+                );
                 Ok(())
             }
             Ok(res) => Ok(res),
@@ -149,6 +183,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         if block.done() {
                             state.current_block += 1;
                             debug!(
+                                self,
                                 "list child block done: moving block list ({}) to {}/{blocks_len}",
                                 ctx,
                                 state.current_block + 1
@@ -161,6 +196,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                     }
                     state.current_block += 1;
                     debug!(
+                        self,
                         "list child block didn't match, but is skippable: \
                         moving block list ({}) to {}/{blocks_len}",
                         ctx,
@@ -173,6 +209,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 true => Ok(false),
                 false => {
                     let peeked_message = Self::peek_message(
+                        self.logging_ctx(),
                         &self.ct,
                         &mut self.conn,
                         &mut self.peeked_message,
@@ -183,7 +220,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         return Ok(false);
                     }
                     _ = self.read_message(*validator).await?; // consume the message
-                    debug!("client line ({ctx}) matched: done");
+                    debug!(self, "client line ({ctx}) matched: done");
                     state.done = true;
                     Ok(true)
                 }
@@ -194,12 +231,14 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         if Box::pin(self.try_consume(block)).await? {
                             if block.done() {
                                 debug!(
+                                    self,
                                     "alt block ({ctx}) child {} started and done: moving to Done",
                                     i + 1
                                 );
                                 *state = BranchState::Done;
                             } else {
                                 debug!(
+                                    self,
                                     "alt block ({ctx}) child {} started: moving to InBlock",
                                     i + 1
                                 );
@@ -213,7 +252,11 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 BranchState::InBlock(i) => {
                     let res = Box::pin(self.try_consume(&mut blocks[*i])).await;
                     if blocks[*i].done() {
-                        debug!("alt block ({ctx}) child {} done: moving to Done", *i + 1);
+                        debug!(
+                            self,
+                            "alt block ({ctx}) child {} done: moving to Done",
+                            *i + 1
+                        );
                         *state = BranchState::Done;
                     }
                     res
@@ -235,7 +278,10 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                     }
                 }
                 if blocks.iter().all(BlockWithState::done) {
-                    debug!("parallel block ({ctx}) all children done: moving to Done");
+                    debug!(
+                        self,
+                        "parallel block ({ctx}) all children done: moving to Done"
+                    );
                     state.done = true;
                 }
                 Ok(matched)
@@ -244,11 +290,14 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 OptionalState::Init | OptionalState::Started => {
                     let res = Box::pin(self.try_consume(block)).await?;
                     if res {
-                        debug!("optional block ({ctx}) child stared: moving to Started");
+                        debug!(
+                            self,
+                            "optional block ({ctx}) child stared: moving to Started"
+                        );
                         *state = OptionalState::Started;
                     }
                     if block.done() {
-                        debug!("optional block ({ctx}) child done: moving to Done");
+                        debug!(self, "optional block ({ctx}) child done: moving to Done");
                         *state = OptionalState::Done;
                     }
                     Ok(res)
@@ -258,6 +307,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             BlockWithState::Repeat(state, ctx, block, count) => {
                 if Box::pin(self.try_consume(block)).await? {
                     debug!(
+                        self,
                         "repeat{count} block ({ctx}) child consumed message: InBlock count {}",
                         state.count
                     );
@@ -267,6 +317,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 if state.in_block && block.can_skip() {
                     // try form the top
                     let peeked_message = Self::peek_message(
+                        self.logging_ctx(),
                         &self.ct,
                         &mut self.conn,
                         &mut self.peeked_message,
@@ -279,6 +330,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                             state.count += 1;
                             assert!(Box::pin(self.try_consume(block)).await?);
                             debug!(
+                                self,
                                 "repeat{count} block ({ctx}) looping around: InBlock count {}",
                                 state.count
                             );
@@ -293,6 +345,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             }
             BlockWithState::AutoMessage(state, ctx, auto_handler) => {
                 let peeked_message = Self::peek_message(
+                    self.logging_ctx(),
                     &self.ct,
                     &mut self.conn,
                     &mut self.peeked_message,
@@ -310,7 +363,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 self.write_message(&*auto_handler.server_sender)
                     .await
                     .with_context(|| format!("Reading on {ctx}"))?;
-                debug!("auto message ({ctx}) matched: done");
+                debug!(self, "auto message ({ctx}) matched: done");
                 state.done = true;
                 Ok(true)
             }
@@ -341,6 +394,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                     }
                     state.current_block += 1;
                     debug!(
+                        self,
                         "list child block done: moving block list ({}) to {}/{blocks_len}",
                         ctx,
                         state.current_block + 1
@@ -358,9 +412,9 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         .write_message(*sender)
                         .await
                         .with_context(|| format!("Sending on {ctx}"))
-                        .inspect_err(|err| info!("Error sending message: {err}"));
+                        .inspect_err(|err| info!(self, "Error sending message: {err}"));
                     state.done = true;
-                    debug!("server line ({ctx}): done");
+                    debug!(self, "server line ({ctx}): done");
                     res.map_err(NetActorError::from_anyhow)
                 }
             },
@@ -377,7 +431,11 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 BranchState::InBlock(i) => {
                     let res = Box::pin(self.server_action(&mut blocks[*i])).await;
                     if blocks[*i].done() {
-                        debug!("alt block ({ctx}) child {} done: moving to Done", *i + 1);
+                        debug!(
+                            self,
+                            "alt block ({ctx}) child {} done: moving to Done",
+                            *i + 1
+                        );
                         *state = BranchState::Done
                     }
                     res
@@ -398,7 +456,10 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         }
                     }
                     if blocks.iter().all(BlockWithState::done) {
-                        debug!("parallel block ({ctx}) all children done: moving to Done");
+                        debug!(
+                            self,
+                            "parallel block ({ctx}) all children done: moving to Done"
+                        );
                         state.done = true;
                     }
                     match error {
@@ -413,7 +474,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                 OptionalState::Started => {
                     let res = Box::pin(self.server_action(block)).await;
                     if block.done() {
-                        debug!("optional block ({ctx}) child done: moving to Done");
+                        debug!(self, "optional block ({ctx}) child done: moving to Done");
                         *state = OptionalState::Done;
                     }
                     res
@@ -427,8 +488,8 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
                         state.in_block = false;
                         state.count += 1;
                         debug!(
-                            "repeat{count} block ({ctx}) reached end: count {}",
-                            state.count
+                            self,
+                            "repeat{count} block ({ctx}) reached end: count {}", state.count
                         );
                     }
                     res
@@ -623,16 +684,17 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         line: &dyn ClientMessageValidator,
     ) -> anyhow::Result<BoltMessage> {
         if let Some(peeked) = self.peeked_message.take() {
-            info!("{}", self.fmt_reader_message(&peeked, line));
+            info!(self, "{}", self.fmt_reader_message(&peeked, line));
             return Ok(peeked);
         }
         let res = Self::read_unbuffered_message(
+            self.logging_ctx(),
             &self.ct,
             &mut self.conn,
             self.script.config.bolt_version,
         )
         .await?;
-        info!("{}", self.fmt_reader_message(&res, line));
+        info!(self, "{}", self.fmt_reader_message(&res, line));
         Ok(res)
     }
 
@@ -645,8 +707,9 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     }
 
     async fn read_unbuffered_message(
+        logging_ctx: LoggingCtx,
         ct: &'_ CancellationToken,
-        data_stream: &'_ mut T,
+        data_stream: &'_ mut C,
         bolt_version: BoltVersion,
     ) -> NetActorResult<BoltMessage> {
         let mut nibble_buffer = [0u8; 2];
@@ -655,6 +718,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
         loop {
             cancelable_io(
                 "reading chunk header",
+                logging_ctx,
                 ct,
                 data_stream.read_exact(&mut nibble_buffer),
             )
@@ -666,6 +730,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
             message_buffer.extend((0..chunk_length).map(|_| 0));
             cancelable_io(
                 "reading chunk content",
+                logging_ctx,
                 ct,
                 data_stream.read_exact(&mut message_buffer[curr_idx..curr_idx + chunk_length]),
             )
@@ -678,17 +743,19 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
 
     async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> NetActorResult<()> {
         let mut data = sender.send()?;
-        info!("{}", self.fmt_sender_message(sender));
+        info!(self, "{}", self.fmt_sender_message(sender));
         while !data.is_empty() {
             let chunk_size = data.len().min(0xFFFF);
             cancelable_io(
                 "writing chunk header",
+                self.logging_ctx(),
                 &self.ct,
                 self.conn.write_all(&(chunk_size as u16).to_be_bytes()),
             )
             .await?;
             cancelable_io(
                 "writing chunk body",
+                self.logging_ctx(),
                 &self.ct,
                 self.conn.write_all(&data[..chunk_size]),
             )
@@ -698,8 +765,17 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
 
         cancelable_io(
             "writing message end",
+            self.logging_ctx(),
             &self.ct,
             self.conn.write_all(&[0, 0]),
+        )
+        .await?;
+
+        cancelable_io(
+            "flushing message end",
+            self.logging_ctx(),
+            &self.ct,
+            self.conn.flush(),
         )
         .await?;
         Ok(())
@@ -714,14 +790,18 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> NetActor<'a, T> {
     }
 
     async fn peek_message<'buf>(
+        logging_ctx: LoggingCtx,
         ct: &CancellationToken,
-        conn: &'_ mut T,
+        conn: &'_ mut C,
         message_buffer: &'buf mut Option<BoltMessage>,
         bolt_version: BoltVersion,
     ) -> NetActorResult<&'buf BoltMessage> {
+        trace!(logging_ctx, "Peeking message");
         if message_buffer.is_none() {
-            let a: BoltMessage = Self::read_unbuffered_message(ct, conn, bolt_version).await?;
+            let a: BoltMessage =
+                Self::read_unbuffered_message(logging_ctx, ct, conn, bolt_version).await?;
             message_buffer.replace(a);
+            trace!(logging_ctx, "Buffered new message");
         }
         Ok(message_buffer.as_ref().unwrap())
     }
@@ -919,6 +999,7 @@ async fn cancelable_io<
     F: Future<Output = Result<T, E>> + 'a,
 >(
     ctx: &'static str,
+    logging_ctx: LoggingCtx,
     ct: &'a CancellationToken,
     future: F,
 ) -> NetActorResult<T> {
@@ -928,7 +1009,7 @@ async fn cancelable_io<
                 Ok(res) => Ok(res),
                 Err(err) => {
                     let msg = format!("IO failed {ctx}");
-                    debug!("{msg}");
+                    debug!(logging_ctx,"{msg}");
                     let err: anyhow::Error = err.into();
                     Err(NetActorError::from_anyhow(err.context(msg)))
                 }
@@ -936,7 +1017,7 @@ async fn cancelable_io<
         },
         _ = ct.cancelled() => {
             let msg = format!("IO cancelled {ctx}");
-            debug!("{msg}");
+            debug!(logging_ctx,"{msg}");
             Err(NetActorError::from_cancellation(msg))
         }
     }

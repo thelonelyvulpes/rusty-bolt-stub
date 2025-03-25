@@ -2,16 +2,16 @@ use std::borrow::Cow;
 use std::io;
 
 use anyhow::anyhow;
-use log::{debug, info};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::bolt_version::BoltCapabilities;
 use crate::ext::fmt::IterFmtExt;
-use crate::net_actor::{cancelable_io, NetActor, NetActorError, NetActorResult};
+use crate::net_actor::logging::{debug, info, HasLoggingCtx, LoggingCtx};
+use crate::net_actor::{cancelable_io, Connection, NetActor, NetActorError, NetActorResult};
 use crate::parser::ActorConfig;
 use crate::str_bytes;
 
-impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
+impl<C: Connection> NetActor<'_, C> {
     pub(super) async fn handshake(&mut self) -> NetActorResult<()> {
         self.preamble().await?;
         if self.script.config.handshake.is_some() {
@@ -19,7 +19,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
         }
         let res = match self.negotiate_client_version_request().await? {
             None => {
-                swallow_anyhow_error(self.send_no_negotiated_bolt_version().await)?;
+                swallow_anyhow_error(
+                    self.logging_ctx(),
+                    self.send_no_negotiated_bolt_version().await,
+                )?;
                 Err(NetActorError::from_anyhow(anyhow!(
                     "No comon bolt version found"
                 )))
@@ -35,14 +38,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
                 if self.script.config.bolt_capabilities != Default::default() {
                     let msg = "Script contains bolt capabilities, \
                         but non-manifest style negotiation is used.";
-                    debug!("{msg}");
-                    swallow_anyhow_error(self.send_no_negotiated_bolt_version().await)?;
+                    debug!(self, "{msg}");
+                    swallow_anyhow_error(
+                        self.logging_ctx(),
+                        self.send_no_negotiated_bolt_version().await,
+                    )?;
                     Err(NetActorError::from_anyhow(anyhow!("{msg}")))
                 } else if self.script.config.handshake_response.is_some() {
                     let msg = "Script contains hard-coded handshake response, \
                         but non-manifest style negotiation is used.";
-                    debug!("{msg}");
-                    swallow_anyhow_error(self.send_no_negotiated_bolt_version().await)?;
+                    debug!(self, "{msg}");
+                    swallow_anyhow_error(
+                        self.logging_ctx(),
+                        self.send_no_negotiated_bolt_version().await,
+                    )?;
                     Err(NetActorError::from_anyhow(anyhow!("{msg}")))
                 } else {
                     self.handshake_delay().await;
@@ -50,19 +59,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
                 }
             }
         };
-        res.inspect_err(|e| debug!("Handshake failed: {e}"))
+        res.inspect_err(|e| debug!(self, "Handshake failed: {e}"))
     }
 
     async fn preamble(&mut self) -> NetActorResult<()> {
         let mut buffer = [0u8; 4];
         cancelable_io(
             "reading magic preamble",
+            self.logging_ctx(),
             &self.ct,
             self.conn.read_exact(&mut buffer),
         )
         .await?;
 
-        info!("C: <MAGIC> {}", str_bytes::fmt_bytes_compact(&buffer));
+        info!(self, "C: <MAGIC> {}", str_bytes::fmt_bytes_compact(&buffer));
 
         if buffer != [0x60, 0x60, 0xB0, 0x17] {
             return Err(NetActorError::from_anyhow(anyhow!(
@@ -78,8 +88,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
 
         for entry in request.chunks(4) {
             let entry = entry.try_into().unwrap();
-            debug!("Decoding client handshake request: {entry:?}");
-            let agreement = ClientVersionRequest::from_bytes(entry)?.negotiate(&self.script.config);
+            debug!(self, "Decoding client handshake request: {entry:?}");
+            let agreement = ClientVersionRequest::from_bytes(entry)?
+                .negotiate(self.logging_ctx(), &self.script.config);
             if let Some(agreement) = agreement {
                 return Ok(Some(agreement));
             }
@@ -91,12 +102,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
         let mut buffer = [0u8; 16];
         cancelable_io(
             "reading client handshake request",
+            self.logging_ctx(),
             &self.ct,
             self.conn.read_exact(&mut buffer),
         )
         .await?;
 
         info!(
+            self,
             "C: <HANDSHAKE> {}",
             buffer
                 .chunks(4)
@@ -107,9 +120,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
     }
 
     async fn send_no_negotiated_bolt_version(&mut self) -> NetActorResult<()> {
-        info!("S: <HANDSHAKE> 0x00000000");
+        info!(self, "S: <HANDSHAKE> 0x00000000");
         cancelable_io(
             "sending no negotiated bolt version",
+            self.logging_ctx(),
             &self.ct.clone(),
             async {
                 self.conn.write_all(&[0x00, 0x00, 0x00, 0x00]).await?;
@@ -128,12 +142,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
             .expect("don't call forced_handshake without handshake");
         self.read_client_handshake_request().await?;
 
-        info!("S: <HANDSHAKE> {}", str_bytes::fmt_bytes(handshake));
+        info!(self, "S: <HANDSHAKE> {}", str_bytes::fmt_bytes(handshake));
 
-        cancelable_io("sending forced handshake", &self.ct, async {
-            self.conn.write_all(handshake).await?;
-            self.conn.flush().await
-        })
+        cancelable_io(
+            "sending forced handshake",
+            self.logging_ctx(),
+            &self.ct,
+            async {
+                self.conn.write_all(handshake).await?;
+                self.conn.flush().await
+            },
+        )
         .await?;
 
         let Some(expected_response) = &self.script.config.handshake_response else {
@@ -143,12 +162,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
         let mut received_response = vec![0; expected_response.len()];
         cancelable_io(
             "reading forced handshake response",
+            self.logging_ctx(),
             &self.ct,
             self.conn.read_exact(&mut received_response),
         )
         .await?;
 
         info!(
+            self,
             "C: <HANDSHAKE> {}",
             str_bytes::fmt_bytes(&received_response)
         );
@@ -159,7 +180,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
                 str_bytes::fmt_bytes(&received_response),
                 str_bytes::fmt_bytes(expected_response)
             );
-            debug!("{msg}");
+            debug!(self, "{msg}");
             return Err(NetActorError::from_anyhow(anyhow!("{msg}")));
         }
         Ok(())
@@ -174,9 +195,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
             None => Cow::Owned(vec![0x00, 0x00, minor, major]),
             Some(response) => Cow::Borrowed(response),
         };
-        info!("S: <HANDSHAKE> {}", str_bytes::fmt_bytes_compact(&response));
+        info!(
+            self,
+            "S: <HANDSHAKE> {}",
+            str_bytes::fmt_bytes_compact(&response)
+        );
         cancelable_io(
             "sending non-manifest negotiated bolt version",
+            self.logging_ctx(),
             &self.ct.clone(),
             async {
                 self.conn.write_all(&response).await?;
@@ -205,6 +231,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
             .collect();
         let capabilities = self.script.config.bolt_capabilities.raw();
         info!(
+            self,
             "S: <HANDSHAKE> 0x0000FF01 [{}] {} {}",
             versions.len(),
             versions
@@ -215,6 +242,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
         );
         cancelable_io(
             "sending manifest v1 style server offer",
+            self.logging_ctx(),
             &self.ct.clone(),
             async {
                 self.conn.write_all(&[0x00, 0x00, 0x01, 0xFF]).await?;
@@ -233,25 +261,28 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
         let mut version_choice = [0u8; 4];
         cancelable_io(
             "reading manifest v1 version choice",
+            self.logging_ctx(),
             &self.ct,
             self.conn.read_exact(&mut version_choice),
         )
         .await?;
         let raw_capabilities = cancelable_io(
             "reading manifest v1 capabilities",
+            self.logging_ctx(),
             &self.ct.clone(),
             self.read_capabilities(),
         )
         .await?;
 
         info!(
+            self,
             "C: <HANDSHAKE> {} {}",
             str_bytes::fmt_bytes_compact(&version_choice),
             str_bytes::fmt_bytes_compact(&raw_capabilities)
         );
 
         ClientVersionRequest::from_bytes(version_choice)?
-            .accept_exact_version(&self.script.config)?;
+            .accept_exact_version(self.logging_ctx(), &self.script.config)?;
         let capabilities = BoltCapabilities::from_bytes(raw_capabilities).map_err(|e| {
             NetActorError::from_anyhow(anyhow!("Failed to parse client capabilities: {e}"))
         })?;
@@ -296,7 +327,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetActor<'_, T> {
         let Some(delay) = self.script.config.handshake_delay else {
             return;
         };
-        info!("S: <HANDSHAKE DELAY> {}s", delay.as_secs_f64());
+        info!(self, "S: <HANDSHAKE DELAY> {}s", delay.as_secs_f64());
         tokio::time::sleep(delay).await;
     }
 }
@@ -329,13 +360,14 @@ impl ClientVersionRequest {
         Self::new(major, minor, range)
     }
 
-    fn negotiate(&self, actor_config: &ActorConfig) -> Option<(u8, u8)> {
+    fn negotiate(&self, logging_ctx: LoggingCtx, actor_config: &ActorConfig) -> Option<(u8, u8)> {
         match (actor_config.handshake_manifest_version, self.major) {
             (None, MANIFEST_MAJOR) => {
                 let requested_min = self.minor - self.range;
                 let requested_max = self.minor;
                 let max = actor_config.bolt_version.max_handshake_manifest_version();
                 debug!(
+                    logging_ctx,
                     "Manifest style request {}",
                     if requested_min == requested_max {
                         format!("v{requested_min}")
@@ -345,15 +377,22 @@ impl ClientVersionRequest {
                 );
                 match max {
                     0 => {
-                        debug!("Server manifest max v0 => no manifest support => reject");
+                        debug!(
+                            logging_ctx,
+                            "Server manifest max v0 => no manifest support => reject"
+                        );
                         None
                     }
                     _ if max < requested_min => {
-                        debug!("Server manifest max v{max} lower than requested minimum => reject");
+                        debug!(
+                            logging_ctx,
+                            "Server manifest max v{max} lower than requested minimum => reject"
+                        );
                         None
                     }
                     _ if max < requested_max => {
                         debug!(
+                            logging_ctx,
                             "Server manifest max v{max} is lower than requested maximum => \
                             accept server maximum"
                         );
@@ -361,21 +400,26 @@ impl ClientVersionRequest {
                     }
                     _ => {
                         debug!(
-                            "Server manifest max v{max} is higher than requested maximum => \
-                            accept requested maximum"
+                            logging_ctx,
+                            "Server manifest max v{max} is higher  than or equals requested \
+                            maximum => accept requested maximum"
                         );
                         Some((MANIFEST_MAJOR, requested_max))
                     }
                 }
             }
             (Some(0), MANIFEST_MAJOR) => {
-                debug!("Non-manifest style enforced => reject manifest style request");
+                debug!(
+                    logging_ctx,
+                    "Non-manifest style enforced => reject manifest style request"
+                );
                 None
             }
             (None, _) | (Some(0), _) => {
                 let (server_major, server_minor) = actor_config.bolt_version_raw;
                 if self.matches(server_major, server_minor) {
                     debug!(
+                        logging_ctx,
                         "Non-manifest style request matches server version {:?} => accept",
                         actor_config.bolt_version_raw
                     );
@@ -384,12 +428,14 @@ impl ClientVersionRequest {
                 for alias in actor_config.bolt_version.backwards_equivalent_versions() {
                     if self.matches(alias.0, alias.1) {
                         debug!(
+                            logging_ctx,
                             "Non-manifest style request matches server alias {alias:?} => accept",
                         );
                         return Some(*alias);
                     }
                 }
                 debug!(
+                    logging_ctx,
                     "Non-manifest style request doesn't match server version {:?} \
                     or aliases {:?} => reject",
                     actor_config.bolt_version_raw,
@@ -400,11 +446,15 @@ impl ClientVersionRequest {
             (Some(forced_manifest), MANIFEST_MAJOR) => {
                 match self.matches(MANIFEST_MAJOR, forced_manifest) {
                     true => {
-                        debug!("Enforced manifest style v{forced_manifest} matches => accept");
+                        debug!(
+                            logging_ctx,
+                            "Enforced manifest style v{forced_manifest} matches => accept"
+                        );
                         Some((MANIFEST_MAJOR, forced_manifest))
                     }
                     false => {
                         debug!(
+                            logging_ctx,
                             "Enforced manifest style v{forced_manifest} doesn't matches => reject"
                         );
                         None
@@ -413,6 +463,7 @@ impl ClientVersionRequest {
             }
             (Some(forced_manifest), _) => {
                 debug!(
+                    logging_ctx,
                     "Enforced manifest style v{forced_manifest} => \
                     reject non-manifest style request"
                 );
@@ -421,15 +472,25 @@ impl ClientVersionRequest {
         }
     }
 
-    fn accept_exact_version(&self, actor_config: &ActorConfig) -> NetActorResult<()> {
+    fn accept_exact_version(
+        &self,
+        logging_ctx: LoggingCtx,
+        actor_config: &ActorConfig,
+    ) -> NetActorResult<()> {
         if self.range != 0 {
-            debug!("Rejecting version as it contains a range: {self:?}");
+            debug!(
+                logging_ctx,
+                "Rejecting version as it contains a range: {self:?}"
+            );
             return Err(NetActorError::from_anyhow(anyhow!(
                 "Expected exact version, got range {self:?}",
             )));
         }
         if self.major == MANIFEST_MAJOR {
-            debug!("Rejecting version as it is a manifest marker: {self:?}");
+            debug!(
+                logging_ctx,
+                "Rejecting version as it is a manifest marker: {self:?}"
+            );
             return Err(NetActorError::from_anyhow(anyhow!(
                 "Expected exact version, got manifest version {self:?}",
             )));
@@ -437,6 +498,7 @@ impl ClientVersionRequest {
         let (major, minor) = actor_config.bolt_version_raw;
         if self.major != major || self.minor != minor {
             debug!(
+                logging_ctx,
                 "Rejecting version as it doesn't match server version {:?}: {self:?}",
                 actor_config.bolt_version_raw
             );
@@ -449,14 +511,14 @@ impl ClientVersionRequest {
     }
 
     fn matches(&self, major: u8, minor: u8) -> bool {
-        self.major == major && (self.minor.saturating_sub(self.range)..self.minor).contains(&minor)
+        self.major == major && (self.minor.saturating_sub(self.range)..=self.minor).contains(&minor)
     }
 }
 
-fn swallow_anyhow_error(res: NetActorResult<()>) -> NetActorResult<()> {
+fn swallow_anyhow_error(logging_ctx: LoggingCtx, res: NetActorResult<()>) -> NetActorResult<()> {
     match res {
         Err(NetActorError::Anyhow(e)) => {
-            debug!("Swallowed IO error: {e:#}");
+            debug!(logging_ctx, "Swallowed IO error: {e:#}");
             Ok(())
         }
         res => res,

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use itertools::Itertools;
-use log::trace;
+use log::{trace, warn};
 use regex::Regex;
 use serde_json::{Deserializer, Map as JsonMap, Value as JsonValue};
 
@@ -108,8 +108,8 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     let mut handshake: Option<Vec<u8>> = None;
     let mut handshake_response: Option<(Context, Vec<u8>)> = None;
     let mut handshake_delay: Option<Duration> = None;
-    let mut allow_restart: Option<bool> = None;
-    let mut allow_concurrent: Option<bool> = None;
+    let mut allow_restart: Option<()> = None;
+    let mut allow_concurrent: Option<()> = None;
 
     for bang_line in bang_lines {
         match bang_line {
@@ -196,7 +196,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                         "Multiple allow restart bang lines found",
                     ));
                 }
-                allow_restart = Some(true);
+                allow_restart = Some(());
             }
             BangLine::AllowConcurrent(ctx) => {
                 if allow_concurrent.is_some() {
@@ -205,7 +205,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                         "Multiple allow concurrent bang lines found",
                     ));
                 }
-                allow_concurrent = Some(true);
+                allow_concurrent = Some(());
             }
             BangLine::Python(_, _) => {
                 todo!("Python blocks are not yet supported in the actor")
@@ -215,13 +215,27 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
 
     let (bolt_version_raw, bolt_version, bolt_capabilities) =
         bolt_version.ok_or(ParseError::new("Bolt version bang line missing"))?;
-    let allow_concurrent = allow_concurrent.unwrap_or(false);
-    let allow_restart = if allow_concurrent {
-        true // allow concurrent implies allow restart
-    } else {
-        allow_restart.unwrap_or(false)
+    let allow_concurrent = allow_concurrent.is_some();
+    let allow_restart = allow_restart.is_some();
+    if allow_concurrent && allow_restart {
+        warn!(
+            "Both allow restart and allow concurrent bang lines were found. \
+            Allow concurrent already implies allow restart."
+        );
+    }
+    let handshake_manifest_version = match handshake_manifest_version {
+        None => None,
+        Some((ctx, handshake_manifest_version)) => {
+            if handshake.is_some() || handshake_response.is_some() {
+                return Err(ParseError::new_ctx(
+                    ctx,
+                    "Handshake manifest version bang line cannot be used with handshake or \
+                    handshake response bang lines",
+                ));
+            }
+            Some(handshake_manifest_version)
+        }
     };
-    let handshake_manifest_version = handshake_manifest_version.map(|x| x.1);
     let handshake_response = match handshake_response {
         None => None,
         Some((ctx, handshake_response)) => {
@@ -231,25 +245,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                     "Handshake response bang line requires handshake bang line to be present",
                 ));
             }
-            match handshake_manifest_version {
-                Some(0) => {
-                    return Err(ParseError::new_ctx(
-                        ctx,
-                        "Handshake response bang line cannot be combined with \
-                        forced non-manifest handshake",
-                    ));
-                }
-                None if bolt_version.max_handshake_manifest_version() == 0 => {
-                    return Err(ParseError::new_ctx(
-                        ctx,
-                        "The chosen bolt version does not support manifest-style handshakes. \
-                        Therefore a handshake response bang line cannot by supplied. \
-                        Consider changing the bolt version or enforcing a manifest-style \
-                        handshake.",
-                    ));
-                }
-                _ => Some(handshake_response),
-            }
+            Some(handshake_response)
         }
     };
 
