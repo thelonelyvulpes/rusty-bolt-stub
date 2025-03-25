@@ -1,6 +1,3 @@
-// TODO: remove when rapid PoC phase is over
-#![allow(dead_code)]
-
 mod bang_line;
 mod bolt_version;
 mod context;
@@ -22,7 +19,6 @@ use std::fmt::Display;
 use std::io::Write;
 use std::process::{ExitCode, Termination};
 use std::sync::OnceLock;
-use std::time::Duration;
 use std::{fmt, io};
 
 use anyhow::{anyhow, Context};
@@ -40,8 +36,6 @@ connections in INTERFACE:PORT format, where INTERFACE may be omitted for 'localh
 this defaults to ':17687'.";
 const VERBOSE_HELP: &str = "Show more detail about the client-server exchange. \
 Supply the flag up to 3 times to increase verbosity with each.";
-const GRACE_PERIOD_HELP: &str =
-    "Grace period in seconds to stop the server after receiving SIGTERM or equivalent.";
 
 #[derive(Parser)]
 struct StubArgs {
@@ -52,8 +46,6 @@ struct StubArgs {
     #[arg(short, long, action=clap::ArgAction::Count, help=VERBOSE_HELP)]
     verbose: u8,
     script: String,
-    #[arg(short, long, default_value_t=5.0, help=GRACE_PERIOD_HELP)]
-    grace_period: f32,
 }
 
 static SCRIPT: OnceLock<String> = OnceLock::new();
@@ -106,12 +98,7 @@ fn main_raw_error() -> Result<(), MainError> {
 
     PARSED.get_or_init(move || engine);
 
-    let shutdown_grace_period = Duration::from_secs_f32(args.grace_period);
-    let mut server = net::Server::new(
-        &args.listen_addr,
-        PARSED.get().unwrap(),
-        shutdown_grace_period,
-    );
+    let mut server = net::Server::new(&args.listen_addr, PARSED.get().unwrap());
     with_exit_code(99, || server.start())?;
     if !server.ever_acted() {
         return Err(MainError {

@@ -120,7 +120,7 @@ impl ColoredLoggerGuard<'_> {
 
     fn write_module(&mut self, module: Option<&str>) -> io::Result<()> {
         let Some(module) = module else { return Ok(()) };
-        self.stream.set_color(self.color_rich_wrap)?;
+        self.stream.set_color(self.color_module)?;
         self.stream.write_all(module.as_bytes())?;
         self.stream.reset()
     }

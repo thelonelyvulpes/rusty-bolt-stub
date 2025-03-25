@@ -359,7 +359,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 validate_parallel_child(&b)?;
                 actor_blocks.push(b);
             }
-            Ok(ActorBlock::Alt(*ctx, actor_blocks))
+            Ok(ActorBlock::Parallel(*ctx, actor_blocks))
         }
         ScanBlock::Optional(ctx, optional_scan_block) => {
             // TODO: Handle bad optional blocks

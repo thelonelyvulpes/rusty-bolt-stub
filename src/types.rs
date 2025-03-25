@@ -22,6 +22,8 @@ pub enum ScanBlock {
     AutoMessage(Context, String, Option<(Context, String)>),
     Comment(Context),
     Python(Context, String),
+    // TODO: bring Python in
+    #[allow(dead_code)]
     Condition(Context, CompositeConditionBlock),
 }
 
@@ -34,7 +36,7 @@ pub struct CompositeConditionBlock {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ConditionBranch {
-    condition: String,
+    condition: (Context, String),
     body: ScanBlock,
 }
 
@@ -104,6 +106,8 @@ pub mod actor_types {
         BlockList(Context, Vec<ActorBlock>),
         ClientMessageValidate(Context, Box<dyn ClientMessageValidator>),
         ServerMessageSend(Context, Box<dyn ServerMessageSender>),
+        // TODO: bring Python in
+        #[allow(dead_code)]
         Python(Context, String),
         Alt(Context, Vec<ActorBlock>),
         Parallel(Context, Vec<ActorBlock>),

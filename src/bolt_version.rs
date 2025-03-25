@@ -355,15 +355,6 @@ impl BoltCapabilities {
         &self.0
     }
 
-    pub(crate) fn has_flag(&self, i: usize) -> bool {
-        let in_byte = i / 7;
-        if in_byte >= self.0.len() {
-            return false;
-        }
-        let at_bit = i % 7;
-        1 << at_bit & self.0[in_byte] != 0
-    }
-
     /// index of the most significant (non-zero) bit
     fn msb(bytes: &[u8]) -> Result<usize, &'static str> {
         let mut msb: usize = 0;

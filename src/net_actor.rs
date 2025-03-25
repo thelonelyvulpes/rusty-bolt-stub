@@ -83,7 +83,6 @@ pub struct NetActor<'a, C> {
     conn: C,
     peer_port: u16,
     local_port: u16,
-    name: String,
     script: &'a ActorScript<'a>,
     peeked_message: Option<BoltMessage>,
 }
@@ -93,7 +92,6 @@ impl<'a, C: Connection> NetActor<'a, C> {
         ct: CancellationToken,
         shutting_down: Arc<atomic::AtomicBool>,
         conn: C,
-        name: String,
         script: &'a ActorScript,
     ) -> Self {
         let (peer_port, local_port) = conn.ports().unwrap_or((0, 0));
@@ -103,7 +101,6 @@ impl<'a, C: Connection> NetActor<'a, C> {
             conn,
             peer_port,
             local_port,
-            name,
             script,
             peeked_message: None,
         }
@@ -812,13 +809,15 @@ enum BlockWithState<'a> {
     BlockList(ListState, Context, Vec<BlockWithState<'a>>),
     ClientMessageValidate(OneShotState, Context, &'a dyn ClientMessageValidator),
     ServerMessageSend(OneShotState, Context, &'a dyn ServerMessageSender),
+    // TODO: bring Python in
+    #[allow(dead_code)]
     Python(OneShotState, Context, &'a str),
     Alt(BranchState, Context, Vec<BlockWithState<'a>>),
     Parallel(OneShotState, Context, Vec<BlockWithState<'a>>),
     Optional(OptionalState, Context, Box<BlockWithState<'a>>),
     Repeat(RepeatState<'a>, Context, Box<BlockWithState<'a>>, usize),
     AutoMessage(OneShotState, Context, &'a AutoMessageHandler),
-    NoOp(Context),
+    NoOp(#[allow(dead_code)] Context),
 }
 
 /*

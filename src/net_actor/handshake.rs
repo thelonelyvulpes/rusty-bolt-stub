@@ -90,6 +90,7 @@ impl<C: Connection> NetActor<'_, C> {
             let entry = entry.try_into().unwrap();
             debug!(self, "Decoding client handshake request: {entry:?}");
             let agreement = ClientVersionRequest::from_bytes(entry)?
+                .mask_reserved_bytes(&self.script.config)
                 .negotiate(self.logging_ctx(), &self.script.config);
             if let Some(agreement) = agreement {
                 return Ok(Some(agreement));
@@ -358,6 +359,22 @@ impl ClientVersionRequest {
     fn from_bytes(bytes: [u8; 4]) -> NetActorResult<Self> {
         let [_, range, minor, major] = bytes;
         Self::new(major, minor, range)
+    }
+
+    fn mask_reserved_bytes(&self, actor_config: &ActorConfig) -> Self {
+        let mut request = *self;
+        if actor_config.handshake_manifest_version.unwrap_or_default() != 0 {
+            // forced handshake-manifest style negotiation => use reserved bytes
+            return request;
+        }
+
+        if !actor_config.bolt_version.supports_range() {
+            request.range = 0;
+        }
+        if !actor_config.bolt_version.supports_minor() {
+            request.minor = 0;
+        }
+        request
     }
 
     fn negotiate(&self, logging_ctx: LoggingCtx, actor_config: &ActorConfig) -> Option<(u8, u8)> {

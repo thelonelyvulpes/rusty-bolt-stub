@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::ops::Add;
 use std::sync::{atomic, Arc};
-use std::time::Duration;
 
 use anyhow::{anyhow, Error, Result};
 use itertools::Itertools;
@@ -17,17 +16,12 @@ use crate::parser::ActorScript;
 pub struct Server {
     address: String,
     server_script_cfg: &'static ActorScript<'static>,
-    grace_period: Duration,
     ever_acted: bool,
     shutting_down: Arc<atomic::AtomicBool>,
 }
 
 impl Server {
-    pub fn new(
-        address: &str,
-        server_script_cfg: &'static ActorScript<'static>,
-        grace_period: Duration,
-    ) -> Self {
+    pub fn new(address: &str, server_script_cfg: &'static ActorScript<'static>) -> Self {
         let address = if address.starts_with(":") {
             format!("localhost{}", address)
         } else {
@@ -36,7 +30,6 @@ impl Server {
         Server {
             address,
             server_script_cfg,
-            grace_period,
             ever_acted: Default::default(),
             shutting_down: Default::default(),
         }
@@ -142,16 +135,14 @@ impl Server {
             select! {
                 res = listener.accept() => {
                     match res {
-                        Ok((conn, addr)) => {
+                        Ok((conn, _)) => {
                             conn.set_nodelay(true)?;
                             let script = self.server_script_cfg;
-                            let name = addr.to_string();
                             let shutting_down = Arc::clone(&self.shutting_down);
                             let mut actor = NetActor::new(
                                 ct_connection.child_token(),
                                 shutting_down,
                                 conn,
-                                name,
                                 script,
                             );
                             handles.spawn(async move {
