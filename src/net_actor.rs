@@ -843,16 +843,16 @@ enum BlockWithState<'a> {
 
 /*
 match block {
-    BlockWithState::BlockList(state, ctx, blocks) => todo!(),
-    BlockWithState::ClientMessageValidate(state, ctx, validator) => todo!(),
-    BlockWithState::ServerMessageSend(state, ctx, sender) => todo!(),
-    BlockWithState::Python(state, ctx, command) => todo!(),
-    BlockWithState::Alt(state, ctx, blocks) => todo!(),
-    BlockWithState::Parallel(state, ctx, blocks) => todo!(),
-    BlockWithState::Optional(state, ctx, block) => todo!(),
-    BlockWithState::Repeat(state, ctx, block, rep) => todo!(),
-    BlockWithState::AutoMessage(state, ctx, auto_handler) => todo!(),
-    BlockWithState::NoOp(ctx) => todo!(),
+    BlockWithState::BlockList(state, ctx, blocks) => {},
+    BlockWithState::ClientMessageValidate(state, ctx, validator) => {},
+    BlockWithState::ServerMessageSend(state, ctx, sender) => {},
+    BlockWithState::Python(state, ctx, command) => {},
+    BlockWithState::Alt(state, ctx, blocks) => {},
+    BlockWithState::Parallel(state, ctx, blocks) => {},
+    BlockWithState::Optional(state, ctx, block) => {},
+    BlockWithState::Repeat(state, ctx, block, rep) => {},
+    BlockWithState::AutoMessage(state, ctx, auto_handler) => {},
+    BlockWithState::NoOp(ctx) => {},
 }
 */
 

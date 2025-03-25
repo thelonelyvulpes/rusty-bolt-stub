@@ -362,7 +362,6 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::Parallel(*ctx, actor_blocks))
         }
         ScanBlock::Optional(ctx, optional_scan_block) => {
-            // TODO: Handle bad optional blocks
             let b = parse_block(optional_scan_block, config)?;
             validate_non_action(&b, Some("inside an optional block"))?;
             validate_non_empty(&b, Some("inside an optional block"))?;
