@@ -210,6 +210,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
             BangLine::Python(_, _) => {
                 todo!("Python blocks are not yet supported in the actor")
             }
+            BangLine::Comment(_) => {}
         }
     }
 

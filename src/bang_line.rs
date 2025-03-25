@@ -11,6 +11,7 @@ pub enum BangLine {
     AllowRestart(Context),
     AllowConcurrent(Context),
     Python(Context, (Context, String)),
+    Comment(Context),
 }
 
 #[cfg(test)]
@@ -26,6 +27,7 @@ impl BangLine {
             Self::AllowRestart(ctx, ..) => ctx,
             Self::AllowConcurrent(ctx, ..) => ctx,
             Self::Python(ctx, ..) => ctx,
+            Self::Comment(ctx, ..) => ctx,
         }
     }
 
@@ -60,6 +62,7 @@ impl BangLine {
             BangLine::AllowRestart(ctx) => add_offset_ctx([ctx], lines, bytes),
             BangLine::AllowConcurrent(ctx) => add_offset_ctx([ctx], lines, bytes),
             BangLine::Python(ctx, (ctx_arg, _)) => add_offset_ctx([ctx, ctx_arg], lines, bytes),
+            BangLine::Comment(ctx) => add_offset_ctx([ctx], lines, bytes),
         }
     }
 }

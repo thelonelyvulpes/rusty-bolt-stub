@@ -45,9 +45,6 @@ pub fn scan_script<'a>(
         ),
         eof,
     ))(span)?;
-    // let (span, bangs) = preceded(multispace0, context("Bang line headers", scan_bang_lines))(span)?;
-    //
-    // let (span, body) = delimited(multispace0, opt(scan_body), multispace0)(span)?;
     if !span.is_empty() {
         return Err(nom::Err::Failure(PError::from_external_error(
             span,
@@ -134,6 +131,7 @@ fn scan_bang_lines(input: Input) -> IResult<Vec<BangLine>> {
             "python response bang",
             string_arg_bang_line("PY", BangLine::Python),
         ),
+        context("comment bang line", comment(BangLine::Comment)),
     )))(input)
 }
 
@@ -273,7 +271,7 @@ fn scan_block(input: Input) -> IResult<ScanBlock> {
             context("auto repeat 0 line", auto_repeat_0),
             context("auto repeat 1 line", auto_repeat_1),
             context("auto optional", auto_optional),
-            context("comment line", comment),
+            context("comment line", comment(ScanBlock::Comment)),
             context(
                 "python lines",
                 message_simple_content(Some("PY:"), ScanBlock::Python),
@@ -419,7 +417,9 @@ fn prefixed_line_simple_content<'a>(
     )
 }
 
-fn comment(input: Input) -> IResult<ScanBlock> {
+fn comment<'a, T>(
+    mut block: impl FnMut(Context) -> T + 'static,
+) -> impl FnMut(Input<'a>) -> IResult<'a, T> {
     map(
         preceded(
             multispace0,
@@ -428,8 +428,8 @@ fn comment(input: Input) -> IResult<ScanBlock> {
                 peek(end_of_line),
             ),
         ),
-        |ctx| ScanBlock::Comment(ctx.into()),
-    )(input)
+        move |ctx| block(ctx.into()),
+    )
 }
 
 // #################
@@ -985,7 +985,7 @@ mod tests {
     #[case::trailing("#C: RUN foo bar  ", 17)]
     #[case::messy("#C:  RUN   foo bar  ", 20)]
     fn test_comment(#[case] input: &str, #[case] bytes: usize) {
-        let result = scanner::comment(wrap_input(input));
+        let result = scanner::comment(ScanBlock::Comment)(wrap_input(input));
         let (rem, block) = result.unwrap();
         assert_eq!(*rem, "");
         assert_eq!(block, ScanBlock::Comment(new_ctx(1, 1, 0, bytes)));
@@ -1122,9 +1122,13 @@ mod tests {
     #[test]
     fn test_full_script() {
         let input = indoc! {r#"
+            # Comment 1
             !: BOLT 5.6
+            # Comment 2
 
+            # COMMENT 3
             C: HELLO {"{}": "*"}
+            # COMMENT 4
             S: SUCCESS {"server": "Neo4j/5.23.0, "connection_id": "bolt-123456789"}
             A: LOGON {"{}": "*"}
             *: RESET
