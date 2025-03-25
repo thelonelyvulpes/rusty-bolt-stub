@@ -2,34 +2,6 @@ use std::fmt::Display;
 
 use crate::net_actor::NetActor;
 
-// pub(super) trait FmtPorts {
-//     fn fmt_ports(&self) -> impl Display;
-// }
-//
-// impl<T> FmtPorts for NetActor<'_, T> {
-//     fn fmt_ports(&self) -> impl Display {
-//         PortsDisplay {
-//             peer_port: self.peer_port,
-//             local_port: self.local_port,
-//         }
-//     }
-// }
-//
-// impl<T> NetActor<'_, T> {
-//     pub(super) fn ports(&self) -> (u16, u16) {
-//         (self.peer_port, self.local_port)
-//     }
-// }
-//
-// impl FmtPorts for (u16, u16) {
-//     fn fmt_ports(&self) -> impl Display {
-//         PortsDisplay {
-//             peer_port: self.0,
-//             local_port: self.1,
-//         }
-//     }
-// }
-
 pub(super) trait HasLoggingCtx {
     fn logging_ctx(&self) -> LoggingCtx;
 }
@@ -37,7 +9,7 @@ pub(super) trait HasLoggingCtx {
 impl<T> HasLoggingCtx for NetActor<'_, T> {
     fn logging_ctx(&self) -> LoggingCtx {
         LoggingCtx {
-            ports: (self.peer_port, self.local_port),
+            ports: (self.peer_addr.port(), self.local_addr.port()),
         }
     }
 }

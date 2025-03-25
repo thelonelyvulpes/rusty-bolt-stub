@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::{atomic, Arc};
 
 use anyhow::{anyhow, Context as AnyhowContext};
@@ -19,6 +20,7 @@ use crate::bolt_version::BoltVersion;
 use crate::context::Context;
 use crate::net_actor::logging::{trace, HasLoggingCtx, LoggingCtx};
 use crate::parser::ActorScript;
+use crate::str_bytes::fmt_bytes;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
 };
@@ -68,12 +70,12 @@ mod private {
 
 #[allow(private_bounds)]
 pub trait Connection: AsyncRead + AsyncWrite + Unpin + private::Sealed {
-    fn ports(&self) -> io::Result<(u16, u16)>;
+    fn addresses(&self) -> io::Result<(SocketAddr, SocketAddr)>;
 }
 
 impl Connection for TcpStream {
-    fn ports(&self) -> io::Result<(u16, u16)> {
-        Ok((self.peer_addr()?.port(), self.local_addr()?.port()))
+    fn addresses(&self) -> io::Result<(SocketAddr, SocketAddr)> {
+        Ok((self.peer_addr()?, self.local_addr()?))
     }
 }
 
@@ -81,8 +83,8 @@ pub struct NetActor<'a, C> {
     ct: CancellationToken,
     shutting_down: Arc<atomic::AtomicBool>,
     conn: C,
-    peer_port: u16,
-    local_port: u16,
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
     script: &'a ActorScript<'a>,
     peeked_message: Option<BoltMessage>,
 }
@@ -94,19 +96,31 @@ impl<'a, C: Connection> NetActor<'a, C> {
         conn: C,
         script: &'a ActorScript,
     ) -> Self {
-        let (peer_port, local_port) = conn.ports().unwrap_or((0, 0));
+        let (peer_addr, local_addr) = conn
+            .addresses()
+            .unwrap_or((([0, 0, 0, 0], 0).into(), ([0, 0, 0, 0], 0).into()));
         NetActor {
             ct,
             shutting_down,
             conn,
-            peer_port,
-            local_port,
+            peer_addr,
+            local_addr,
             script,
             peeked_message: None,
         }
     }
 
     pub async fn run_client_connection(&mut self) -> anyhow::Result<()> {
+        info!(
+            self,
+            "S: <ACCEPT> {} -> {}", self.peer_addr, self.local_addr
+        );
+        let res = self.play_script().await;
+        info!(self, "S: <HANGUP>");
+        res
+    }
+
+    async fn play_script(&mut self) -> anyhow::Result<()> {
         match self.handshake().await {
             Err(NetActorError::Cancellation(reason))
                 if !self.shutting_down.load(atomic::Ordering::Acquire) =>
@@ -127,6 +141,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     self,
                     "Ignoring NetActor error because script reached the end: {err:#}"
                 );
+                info!(self, "Script finished");
                 Ok(())
             }
             Err(NetActorError::Cancellation(reason))
@@ -136,9 +151,13 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     self,
                     "Ignoring NetActor error because another connection failed: {reason}"
                 );
+                info!(self, "Script finished");
                 Ok(())
             }
-            Ok(res) => Ok(res),
+            Ok(res) => {
+                info!(self, "Script finished");
+                Ok(res)
+            }
             Err(err) => Err(err.into()),
         }
     }
@@ -735,11 +754,13 @@ impl<'a, C: Connection> NetActor<'a, C> {
             curr_idx += chunk_length;
         }
 
+        trace!(logging_ctx, "Read message: {}", fmt_bytes(&message_buffer));
         parse_message(message_buffer, bolt_version)
     }
 
     async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> NetActorResult<()> {
         let mut data = sender.send()?;
+        trace!(self, "Writing message: {}", fmt_bytes(data));
         info!(self, "{}", self.fmt_sender_message(sender));
         while !data.is_empty() {
             let chunk_size = data.len().min(0xFFFF);

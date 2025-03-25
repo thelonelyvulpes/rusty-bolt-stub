@@ -6,7 +6,7 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, StandardStreamLock, WriteColor};
 
 pub(super) fn init_logging(min_level: LevelFilter) {
-    let force_verbose = min_level >= LevelFilter::Info;
+    let force_verbose = min_level > LevelFilter::Info;
     let color_log: Box<dyn Log> = Box::new(ColoredLogger::new(force_verbose));
 
     Dispatch::new()
