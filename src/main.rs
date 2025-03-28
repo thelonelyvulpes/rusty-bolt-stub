@@ -15,18 +15,19 @@ mod types;
 mod util;
 mod values;
 
-use std::fmt::Display;
-use std::io::Write;
-use std::process::{ExitCode, Termination};
-use std::sync::OnceLock;
-use std::{fmt, io};
-
+use crate::logging::init_logging;
+use crate::parser::ActorScript;
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use log::{debug, LevelFilter};
-
-use crate::logging::init_logging;
-use crate::parser::ActorScript;
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use std::ffi::CString;
+use std::fmt::Display;
+use std::io::Write;
+use std::process::{ExitCode, Termination};
+use std::sync::{LazyLock, OnceLock};
+use std::{fmt, io};
 
 const TIMEOUT_HELP: &str = "The number of seconds for which the stub server will run \
 before automatically terminating. If unspecified, the server will wait for 30 seconds.";
@@ -51,6 +52,32 @@ struct StubArgs {
 static SCRIPT: OnceLock<String> = OnceLock::new();
 static SCRIPT_NAME: OnceLock<String> = OnceLock::new();
 static PARSED: OnceLock<ActorScript> = OnceLock::new();
+static SERVER_PY: LazyLock<Py<PyDict>> = LazyLock::new(|| {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        py.import("sys")
+            .unwrap()
+            .setattr("stdout", LoggingStdout.into_py(py))
+            .unwrap();
+        PyDict::new(py).unbind()
+    })
+});
+
+#[pyclass]
+struct LoggingStdout;
+#[pymethods]
+impl LoggingStdout {
+    fn write(&self, data: &str) {
+        print!("{}", data);
+    }
+}
+
+fn run_python(script_text: &String) -> anyhow::Result<()> {
+    let cstr = CString::new(script_text.clone())?;
+    let locals = &*SERVER_PY;
+    Python::with_gil(|py| py.run(&cstr, None, Some(locals.bind(py))))
+        .map_err(|error| anyhow!("failed to run python line: {error}"))
+}
 
 fn main() -> MainResult {
     MainResult(main_raw_error())

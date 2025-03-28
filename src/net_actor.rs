@@ -3,6 +3,7 @@ mod logging;
 
 use std::collections::HashSet;
 use std::error::Error;
+use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::io;
@@ -11,6 +12,7 @@ use std::sync::{atomic, Arc};
 
 use anyhow::{anyhow, Context as AnyhowContext};
 use logging::{debug, info};
+use pyo3::Python;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::select;
@@ -24,9 +26,9 @@ use crate::str_bytes::fmt_bytes;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
 };
-use crate::values;
 use crate::values::bolt_message::BoltMessage;
 use crate::values::pack_stream_value::PackStreamStruct;
+use crate::{run_python, values};
 
 type NetActorResult<T> = Result<T, NetActorError>;
 
@@ -434,12 +436,11 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     res.map_err(NetActorError::from_anyhow)
                 }
             },
-            BlockWithState::Python(state, _, _command) => match state.done {
+            BlockWithState::Python(state, _, command) => match state.done {
                 true => Ok(()),
                 false => {
-                    todo!("Python commands not yet implemented");
-                    // state.done = true;
-                    // Ok(())
+                    state.done = true;
+                    run_python(&command.to_string()).map_err(|e| e.into())
                 }
             },
             BlockWithState::Alt(state, ctx, blocks) => match state {

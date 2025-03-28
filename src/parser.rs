@@ -18,7 +18,6 @@ use crate::error::script_excerpt;
 use crate::ext::serde_json as serde_json_ext;
 use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
-use crate::str_bytes;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
 };
@@ -30,6 +29,7 @@ use crate::values::bolt_struct::{
     JoltTime, TAG_DATE, TAG_DURATION, TAG_LOCAL_TIME, TAG_POINT_2D, TAG_POINT_3D, TAG_TIME,
 };
 use crate::values::pack_stream_value::{PackStreamStruct, PackStreamValue};
+use crate::{str_bytes};
 
 #[derive(Debug)]
 pub struct ActorScript<'a> {
@@ -49,6 +49,7 @@ pub struct ActorConfig {
     pub handshake_delay: Option<Duration>,
     pub allow_restart: bool,
     pub allow_concurrent: bool,
+    pub py_lines: Vec<String>,
 }
 
 type Result<T> = StdResult<T, ParseError>;
@@ -110,6 +111,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     let mut handshake_delay: Option<Duration> = None;
     let mut allow_restart: Option<()> = None;
     let mut allow_concurrent: Option<()> = None;
+    let mut py_lines: Vec<String> = Vec::new();
 
     for bang_line in bang_lines {
         match bang_line {
@@ -207,8 +209,8 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 }
                 allow_concurrent = Some(());
             }
-            BangLine::Python(_, _) => {
-                todo!("Python blocks are not yet supported in the actor")
+            BangLine::Python(ctx, (line_ctx, line)) => {
+                py_lines.push(line.clone());
             }
             BangLine::Comment(_) => {}
         }
@@ -260,6 +262,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
         handshake_delay,
         allow_restart,
         allow_concurrent,
+        py_lines,
     })
 }
 
@@ -1781,6 +1784,7 @@ mod test {
             handshake_delay: None,
             allow_restart: false,
             allow_concurrent: false,
+            py_lines: Vec::new(),
         };
         let validator = create_validator(tag, ctx, Some((ctx, body)), &cfg).unwrap();
 

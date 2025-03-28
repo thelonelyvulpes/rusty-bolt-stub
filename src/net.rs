@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::net_actor::NetActor;
 use crate::parser::ActorScript;
+use crate::run_python;
 
 pub struct Server {
     address: String,
@@ -153,6 +154,10 @@ impl Server {
     ) -> Result<()> {
         let restarts = self.server_script_cfg.config.allow_restart;
         let concurrent = self.server_script_cfg.config.allow_concurrent;
+
+        for py_line in self.server_script_cfg.config.py_lines.iter() {
+            run_python(&py_line)?;
+        }
 
         match conn {
             Ok((conn, addr)) => {
