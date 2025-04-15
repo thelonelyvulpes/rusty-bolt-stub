@@ -22,7 +22,8 @@ use crate::net_actor::logging::{trace, HasLoggingCtx, LoggingCtx};
 use crate::parser::ActorScript;
 use crate::str_bytes::fmt_bytes;
 use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerAction, ServerActionLine,
+    ServerMessageSender,
 };
 use crate::values;
 use crate::values::bolt_message::BoltMessage;
@@ -384,6 +385,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 Ok(true)
             }
             BlockWithState::ServerMessageSend(..)
+            | BlockWithState::ServerActionLine(..)
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {
                 panic!("Should've called server_action before {block:?}")
@@ -427,11 +429,22 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     let res = self
                         .write_message(*sender)
                         .await
-                        .with_context(|| format!("Sending on {ctx}"))
                         .inspect_err(|err| info!(self, "Error sending message: {err}"));
                     state.done = true;
                     debug!(self, "server line ({ctx}): done");
-                    res.map_err(NetActorError::from_anyhow)
+                    res
+                }
+            },
+            BlockWithState::ServerActionLine(state, ctx, action) => match state.done {
+                true => Ok(()),
+                false => {
+                    let res = self
+                        .server_action_line(*action)
+                        .await
+                        .inspect_err(|err| info!(self, "Error on server action: {err}"));
+                    state.done = true;
+                    debug!(self, "server action ({ctx}): done");
+                    res
                 }
             },
             BlockWithState::Python(state, _, _command) => match state.done {
@@ -643,6 +656,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 }
             }
             BlockWithState::ServerMessageSend(..)
+            | BlockWithState::ServerActionLine(..)
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {}
         }
@@ -688,6 +702,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 !state.done && handler.client_validator.validate(message).is_ok()
             }
             BlockWithState::ServerMessageSend(..)
+            | BlockWithState::ServerActionLine(..)
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {
                 panic!("Should've called server_action before: {block:?}")
@@ -807,6 +822,98 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
     }
 
+    async fn server_action_line(&mut self, action: &dyn ServerActionLine) -> NetActorResult<()> {
+        info!(self, "{}", self.fmt_server_action_line(action));
+        match action.get_action() {
+            ServerAction::Exit => {
+                trace!(
+                    self,
+                    "It was an honor, captain 🫡! \
+                    See you on the other side of `std::process::exit(0)`."
+                );
+                std::process::exit(0);
+            }
+            ServerAction::Noop => {
+                cancelable_io(
+                    "writing noop",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.write_all(&[0, 0]),
+                )
+                .await?;
+                cancelable_io(
+                    "flushing noop",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.flush(),
+                )
+                .await
+            }
+            ServerAction::Raw(data) => {
+                cancelable_io(
+                    "writing raw data",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.write_all(data),
+                )
+                .await?;
+                cancelable_io(
+                    "flushing raw data",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.flush(),
+                )
+                .await
+            }
+            ServerAction::Sleep(duration) => {
+                trace!(
+                    self,
+                    "On sec, please 🥱... Sleeping for {} seconds",
+                    duration.as_secs_f64()
+                );
+                select! {
+                    _ = tokio::time::sleep(*duration) => {Ok(())}
+                    _ = self.ct.cancelled() => {
+                        let msg = "Sleeping cancelled";
+                        debug!(self, "{msg}");
+                        Err(NetActorError::from_cancellation(String::from(msg)))
+                    }
+                }
+            }
+            ServerAction::AssertOrder(duration) => {
+                trace!(
+                    self,
+                    "Waiting for {} seconds to verify that no pipelined message arrives",
+                    duration.as_secs_f64()
+                );
+                select! {
+                    _ = tokio::time::sleep(*duration) => {Ok(())}
+                    peeked_message = Self::peek_message(
+                        self.logging_ctx(),
+                        &self.ct,
+                        &mut self.conn,
+                        &mut self.peeked_message,
+                        self.script.config.bolt_version,
+                    ) => {
+                        let peeked_message = peeked_message?;
+                        Err(NetActorError::Anyhow(anyhow!(
+                            "Expected no pipelined message, received {}",
+                            peeked_message.repr()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    fn fmt_server_action_line(&self, action: &dyn ServerActionLine) -> String {
+        let line = action.line_repr(self.script.script.input);
+        match action.line_number() {
+            None => format!("(   ?) S: {line}"),
+            Some(line_number) => format!("({line_number:4}) S: {line}"),
+        }
+    }
+
     async fn peek_message<'buf>(
         logging_ctx: LoggingCtx,
         ct: &CancellationToken,
@@ -830,6 +937,7 @@ enum BlockWithState<'a> {
     BlockList(ListState, Context, Vec<BlockWithState<'a>>),
     ClientMessageValidate(OneShotState, Context, &'a dyn ClientMessageValidator),
     ServerMessageSend(OneShotState, Context, &'a dyn ServerMessageSender),
+    ServerActionLine(OneShotState, Context, &'a dyn ServerActionLine),
     // TODO: bring Python in
     #[allow(dead_code)]
     Python(OneShotState, Context, &'a str),
@@ -913,6 +1021,9 @@ impl<'a> BlockWithState<'a> {
             ActorBlock::ServerMessageSend(ctx, sender) => {
                 Self::ServerMessageSend(Default::default(), *ctx, sender.as_ref())
             }
+            ActorBlock::ServerActionLine(ctx, line) => {
+                Self::ServerActionLine(Default::default(), *ctx, line.as_ref())
+            }
             ActorBlock::Python(ctx, command) => Self::Python(Default::default(), *ctx, command),
             ActorBlock::Alt(ctx, blocks) => Self::Alt(
                 Default::default(),
@@ -955,6 +1066,7 @@ impl<'a> BlockWithState<'a> {
             BlockWithState::Repeat(_, _, _, _) => false,
             BlockWithState::ClientMessageValidate(state, _, _)
             | BlockWithState::ServerMessageSend(state, _, _)
+            | BlockWithState::ServerActionLine(state, _, _)
             | BlockWithState::Python(state, _, _)
             | BlockWithState::AutoMessage(state, _, _) => state.done,
             BlockWithState::NoOp(_) => true,
@@ -984,6 +1096,7 @@ impl<'a> BlockWithState<'a> {
             },
             BlockWithState::ClientMessageValidate(state, _, _)
             | BlockWithState::ServerMessageSend(state, _, _)
+            | BlockWithState::ServerActionLine(state, _, _)
             | BlockWithState::Python(state, _, _)
             | BlockWithState::AutoMessage(state, _, _) => state.done,
             BlockWithState::NoOp(_) => true,
@@ -1029,7 +1142,7 @@ async fn cancelable_io<
                 Ok(res) => Ok(res),
                 Err(err) => {
                     let msg = format!("IO failed {ctx}");
-                    debug!(logging_ctx,"{msg}");
+                    debug!(logging_ctx, "{msg}");
                     let err: anyhow::Error = err.into();
                     Err(NetActorError::from_anyhow(err.context(msg)))
                 }
@@ -1037,7 +1150,7 @@ async fn cancelable_io<
         },
         _ = ct.cancelled() => {
             let msg = format!("IO cancelled {ctx}");
-            debug!(logging_ctx,"{msg}");
+            debug!(logging_ctx, "{msg}");
             Err(NetActorError::from_cancellation(msg))
         }
     }

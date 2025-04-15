@@ -20,7 +20,8 @@ use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
 use crate::str_bytes;
 use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
+    ServerActionLine, ServerMessageSender,
 };
 use crate::types::{ScanBlock, Script};
 use crate::util::opt_res_ret;
@@ -393,7 +394,6 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
         ScanBlock::ServerMessage(ctx, message_name, body) => {
-            // TODO: Implement parser for the special messages like S: <Sleep 2>
             let server_message_sender = create_message_sender(
                 message_name,
                 *ctx,
@@ -405,6 +405,18 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 e
             })?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
+        }
+        ScanBlock::ServerAction(ctx, action_name, body) => {
+            let server_action = create_server_action(
+                action_name,
+                *ctx,
+                body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
+            )
+            .map_err(|mut e| {
+                e.ctx.get_or_insert(*ctx);
+                e
+            })?;
+            Ok(ActorBlock::ServerActionLine(*ctx, server_action))
         }
         ScanBlock::AutoMessage(ctx, client_message_name, client_body) => {
             Ok(ActorBlock::AutoMessage(
@@ -787,6 +799,136 @@ fn transcode_duration_value(s: &str) -> Option<Result<PackStreamValue>> {
     let bolt_duration = opt_res_ret!(JoltDuration::parse(s));
     let value_struct = opt_res_ret!(bolt_duration.as_struct());
     Some(Ok(PackStreamValue::Struct(value_struct)))
+}
+
+fn create_server_action(
+    action_name: &str,
+    ctx: Context,
+    message_body: Option<(Context, &str)>,
+) -> Result<Box<dyn ServerActionLine>> {
+    let action = match action_name {
+        "EXIT" => {
+            check_server_action_no_body(action_name, message_body)?;
+            ServerAction::Exit
+        }
+        "NOOP" => {
+            check_server_action_no_body(action_name, message_body)?;
+            ServerAction::Noop
+        }
+        "RAW" => {
+            let arg = check_server_action_hex_body(action_name, ctx, message_body)?;
+            ServerAction::Raw(arg)
+        }
+        "SLEEP" => {
+            let arg = check_server_action_duration_body(action_name, ctx, message_body)?;
+            ServerAction::Sleep(arg)
+        }
+        "ASSERT ORDER" => {
+            let arg = check_server_action_duration_body(action_name, ctx, message_body)?;
+            ServerAction::AssertOrder(arg)
+        }
+        _ => {
+            return Err(ParseError::new_ctx(
+                ctx,
+                format!("Unknown server action {action_name}"),
+            ))
+        }
+    };
+    Ok(Box::new(ParsedServerAction { ctx, action }))
+    // let tag = config
+    //     .bolt_version
+    //     .message_tag_from_response(message_name)
+    //     .ok_or_else(|| {
+    //         ParseError::new_ctx(
+    //             ctx,
+    //             format!(
+    //                 "Unknown response message name {message_name:?} for BOLT version {}",
+    //                 config.bolt_version,
+    //             ),
+    //         )
+    //     })?;
+    // let fields = transcode_body(message_body, config)?;
+    // let data = BoltMessage::new(tag, fields, config.bolt_version).into_data();
+    //
+    // Ok(Box::new(SenderBytes::new(
+    //     data,
+    //     SenderBytesLine::Ctx {
+    //         message_name: message_name.into(),
+    //         message_body: message_body.map(|(_, s)| s.into()),
+    //         ctx,
+    //     },
+    // )))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedServerAction {
+    ctx: Context,
+    action: ServerAction,
+}
+
+impl ScriptLine for ParsedServerAction {
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
+        self.ctx.original_line(script)
+    }
+
+    fn line_number(&self) -> Option<usize> {
+        Some(self.ctx.start_line_number)
+    }
+}
+
+impl ServerActionLine for ParsedServerAction {
+    fn get_action(&self) -> &ServerAction {
+        &self.action
+    }
+}
+
+fn check_server_action_no_body(
+    action_name: &str,
+    message_body: Option<(Context, &str)>,
+) -> Result<()> {
+    if let Some((ctx, body)) = message_body {
+        return Err(ParseError::new_ctx(
+            ctx,
+            format!("Server action {action_name} does not accept any arguments, found {body}"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_server_action_hex_body(
+    action_name: &str,
+    ctx: Context,
+    message_body: Option<(Context, &str)>,
+) -> Result<Vec<u8>> {
+    let Some((ctx, body)) = message_body else {
+        return Err(ParseError::new_ctx(
+            ctx,
+            format!("Server action {action_name} requires a hex argument, found none"),
+        ));
+    };
+    str_bytes::str_to_bytes(body)
+        .map_err(|e| ParseError::new_ctx(ctx, format!("Failed to parse hex argument: {e}")))
+}
+
+fn check_server_action_duration_body(
+    action_name: &str,
+    ctx: Context,
+    message_body: Option<(Context, &str)>,
+) -> Result<Duration> {
+    let Some((ctx, body)) = message_body else {
+        return Err(ParseError::new_ctx(
+            ctx,
+            format!("Server action {action_name} requires a duration argument (float), found none"),
+        ));
+    };
+    let arg = f64::from_str(body)
+        .map_err(|e| ParseError::new_ctx(ctx, format!("Failed to parse float argument: {e}")))?;
+    Duration::try_from_secs_f64(arg).map_err(|e| {
+        ParseError::new_ctx(
+            ctx,
+            format!("Failed to parse float {arg} as duration (seconds): {e}"),
+        )
+    })
 }
 
 struct ValidatorImpl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> {
@@ -1655,6 +1797,7 @@ fn is_skippable(block: &ActorBlock) -> bool {
         ActorBlock::Optional(..) | ActorBlock::NoOp(..) => true,
         ActorBlock::ClientMessageValidate(..)
         | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::ServerActionLine(..)
         | ActorBlock::Python(..)
         | ActorBlock::AutoMessage(..) => false,
     }
@@ -1671,6 +1814,7 @@ fn has_deterministic_end(block: &ActorBlock) -> bool {
             .unwrap_or(true),
         ActorBlock::ClientMessageValidate(..)
         | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::ServerActionLine(..)
         | ActorBlock::Python(..) => true,
         ActorBlock::Alt(_, blocks) | ActorBlock::Parallel(_, blocks) => {
             blocks.iter().all(has_deterministic_end)
@@ -1683,7 +1827,9 @@ fn has_deterministic_end(block: &ActorBlock) -> bool {
 
 fn is_action_block(block: &ActorBlock) -> bool {
     match block {
-        ActorBlock::Python(..) | ActorBlock::ServerMessageSend(..) => true,
+        ActorBlock::Python(..)
+        | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::ServerActionLine(..) => true,
         ActorBlock::BlockList(_, blocks) => 'arm: {
             for block in blocks {
                 if is_action_block(block) {
