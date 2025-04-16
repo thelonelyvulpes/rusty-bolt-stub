@@ -476,7 +476,7 @@ fn comment<'a, T>(
         preceded(
             multispace0,
             terminated(
-                recognize(preceded(tag("#"), rest_of_line)),
+                recognize(preceded(tag("#"), opt(rest_of_line))),
                 peek(end_of_line),
             ),
         ),
@@ -1062,6 +1062,7 @@ mod tests {
     #[case::no_space("#C: RUN foo bar", 15)]
     #[case::trailing("#C: RUN foo bar  ", 17)]
     #[case::messy("#C:  RUN   foo bar  ", 20)]
+    #[case::messy("#", 1)]
     fn test_comment(#[case] input: &str, #[case] bytes: usize) {
         let result = super::comment(ScanBlock::Comment)(wrap_input(input));
         let (rem, block) = result.unwrap();
