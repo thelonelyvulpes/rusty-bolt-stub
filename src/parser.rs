@@ -1872,7 +1872,7 @@ fn validate_non_empty(block: &ActorBlock, context: Option<&str>) -> Result<()> {
 }
 
 fn validate_list_children(blocks: &[ActorBlock]) -> Result<()> {
-    let mut previous_has_deterministic_end = false;
+    let mut previous_has_deterministic_end = true;
     for block in blocks {
         if !previous_has_deterministic_end {
             validate_non_action(block, Some("after a block with non-deterministic end"))?;
