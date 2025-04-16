@@ -41,8 +41,7 @@ pub(crate) fn script_excerpt(script_name: &str, script: &str, ctx: Context) -> S
             let col = line[..line_offset].chars().count();
             column = Some(col);
             excerpt_lines.push(
-                std::iter::repeat(" ")
-                    .take(col + 3 + line_num_width)
+                std::iter::repeat_n(" ", col + 3 + line_num_width)
                     .chain(["^"].into_iter())
                     .collect::<String>(),
             );

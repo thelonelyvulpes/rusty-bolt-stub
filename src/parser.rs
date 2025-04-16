@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use log::{trace, warn};
 use regex::Regex;
@@ -50,6 +51,7 @@ pub struct ActorConfig {
     pub handshake_delay: Option<Duration>,
     pub allow_restart: bool,
     pub allow_concurrent: bool,
+    pub auto_responses: IndexMap<u8, AutoBangLineHandler>,
 }
 
 type Result<T> = StdResult<T, ParseError>;
@@ -111,6 +113,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     let mut handshake_delay: Option<Duration> = None;
     let mut allow_restart: Option<()> = None;
     let mut allow_concurrent: Option<()> = None;
+    let mut auto_responses = IndexMap::new();
 
     for bang_line in bang_lines {
         match bang_line {
@@ -187,8 +190,14 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 })?;
                 handshake_delay = Some(delay);
             }
-            BangLine::Auto(_, _) => {
-                todo!("Auto bang lines are not yet supported in the actor")
+            BangLine::Auto(ctx, (ctx_msg, msg)) => {
+                let ctx_old = auto_responses.insert(msg, (ctx, ctx_msg));
+                if let Some((ctx_old, _)) = ctx_old {
+                    warn!(
+                        "Specified auto response for message \"{msg}\" more than once \
+                        ({ctx} and {ctx_old})."
+                    );
+                }
             }
             BangLine::AllowRestart(ctx) => {
                 if allow_restart.is_some() {
@@ -250,6 +259,44 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
             Some(handshake_response)
         }
     };
+    let auto_responses =
+        auto_responses
+            .into_iter()
+            .map(|(msg, (ctx, ctx_msg))| {
+                let Some(request_tag) = bolt_version.message_tag_from_request(msg) else {
+                    return Err(ParseError::new_ctx(
+                        *ctx_msg,
+                        format!(
+                            "Unknown request message name {msg:?} for BOLT version {bolt_version}"
+                        ),
+                    ));
+                };
+                let Some((response_tag, response_fields)) =
+                    bolt_version.message_auto_response(request_tag)
+                else {
+                    return Err(ParseError::new_ctx(
+                        *ctx,
+                        format!(
+                            "BOLT version {bolt_version} has no auto-response for message {msg:?}",
+                        ),
+                    ));
+                };
+                let response_message =
+                    BoltMessage::new(response_tag, response_fields, bolt_version);
+                let response_repr = response_message.repr();
+                let response_data = response_message.into_data();
+                Ok((
+                    request_tag,
+                    AutoBangLineHandler {
+                        ctx: *ctx_msg,
+                        sender: Box::new(SenderBytes::new(
+                            response_data,
+                            SenderBytesLine::Repr(response_repr),
+                        )),
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
 
     Ok(ActorConfig {
         bolt_version,
@@ -261,6 +308,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
         handshake_delay,
         allow_restart,
         allow_concurrent,
+        auto_responses,
     })
 }
 
@@ -460,6 +508,12 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
         }
     }
     res
+}
+
+#[derive(Debug)]
+pub(crate) struct AutoBangLineHandler {
+    pub(crate) ctx: Context,
+    pub(crate) sender: Box<dyn ServerMessageSender>,
 }
 
 fn create_auto_message_handler(
@@ -1921,6 +1975,7 @@ mod test {
             handshake_delay: None,
             allow_restart: false,
             allow_concurrent: false,
+            auto_responses: Default::default(),
         };
         let validator = create_validator(ctx, tag, Some((ctx, body)), &cfg).unwrap();
 

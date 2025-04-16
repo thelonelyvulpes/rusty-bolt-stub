@@ -1,6 +1,8 @@
 use std::cmp::{max, min};
 use std::fmt::Display;
 
+use crate::types::actor_types::ScriptLine;
+
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub struct Context {
     pub(crate) start_line_number: usize,
@@ -16,6 +18,16 @@ impl Display for Context {
             return write!(f, "line {start}");
         }
         write!(f, "lines {start}-{end}")
+    }
+}
+
+impl ScriptLine for Context {
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
+        self.original_line(script)
+    }
+
+    fn line_number(&self) -> Option<usize> {
+        Some(self.start_line_number)
     }
 }
 

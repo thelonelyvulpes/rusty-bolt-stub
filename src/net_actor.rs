@@ -22,8 +22,8 @@ use crate::net_actor::logging::{trace, HasLoggingCtx, LoggingCtx};
 use crate::parser::ActorScript;
 use crate::str_bytes::fmt_bytes;
 use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerAction, ServerActionLine,
-    ServerMessageSender,
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
+    ServerActionLine, ServerMessageSender,
 };
 use crate::values;
 use crate::values::bolt_message::BoltMessage;
@@ -169,7 +169,12 @@ impl<'a, C: Connection> NetActor<'a, C> {
             if block.done() {
                 break;
             }
-            match self.try_consume(block).await {
+            let mut consume_res = self.try_consume(block).await;
+            if let Ok(false) = consume_res {
+                debug!(self, "No match in script found, trying auto bang handlers");
+                consume_res = self.try_auto_bang_handler().await;
+            }
+            match consume_res {
                 Ok(true) => {}
                 Ok(false) => {
                     let msg = self.format_script_missmatch(block);
@@ -393,6 +398,28 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
     }
 
+    async fn try_auto_bang_handler(&mut self) -> anyhow::Result<bool> {
+        let peeked_message = Self::peek_message(
+            self.logging_ctx(),
+            &self.ct,
+            &mut self.conn,
+            &mut self.peeked_message,
+            self.script.config.bolt_version,
+        )
+        .await?;
+        let tag = peeked_message.tag;
+        let Some(handler) = self.script.config.auto_responses.get(&tag) else {
+            debug!(self, "No auto bang handler found for tag: {tag}");
+            return Ok(false);
+        };
+        debug!(self, "Found auto bang handler for tag: {tag}");
+        _ = self.read_message(&handler.ctx).await?; // consume the message
+        self.write_message(&*handler.sender)
+            .await
+            .inspect_err(|err| info!(self, "Error sending message: {err}"))?;
+        Ok(true)
+    }
+
     /// Progresses the state even if the call fails.
     async fn server_action(&mut self, block: &mut BlockWithState<'_>) -> NetActorResult<()> {
         match block {
@@ -579,15 +606,22 @@ impl<'a, C: Connection> NetActor<'a, C> {
     fn format_possible_verifiers(&self, current_block: &BlockWithState<'_>) -> Vec<String> {
         let possible_verifiers = &mut Vec::new();
         Self::current_verifiers(current_block, possible_verifiers);
-        possible_verifiers
-            .iter()
-            .map(|v| {
+        self.script
+            .config
+            .auto_responses
+            .values()
+            .map(|handler| {
+                let line = handler.ctx.original_line(self.script.script.input);
+                let line_number = handler.ctx.start_line_number;
+                format!("({line_number:4}) !: AUTO {line}")
+            })
+            .chain(possible_verifiers.iter().map(|v| {
                 let line = v.line_repr(self.script.script.input);
                 match v.line_number() {
                     None => format!("(   ?) C: {line}"),
                     Some(line_number) => format!("({line_number:4}) C: {line}"),
                 }
-            })
+            }))
             .collect()
     }
 
@@ -710,10 +744,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
     }
 
-    async fn read_message(
-        &mut self,
-        line: &dyn ClientMessageValidator,
-    ) -> anyhow::Result<BoltMessage> {
+    async fn read_message(&mut self, line: &dyn ScriptLine) -> anyhow::Result<BoltMessage> {
         if let Some(peeked) = self.peeked_message.take() {
             info!(self, "{}", self.fmt_reader_message(&peeked, line));
             return Ok(peeked);
@@ -724,12 +755,13 @@ impl<'a, C: Connection> NetActor<'a, C> {
             &mut self.conn,
             self.script.config.bolt_version,
         )
-        .await?;
+        .await
+        .inspect_err(|err| info!(self, "Error reading message: {err}"))?;
         info!(self, "{}", self.fmt_reader_message(&res, line));
         Ok(res)
     }
 
-    fn fmt_reader_message(&self, msg: &BoltMessage, sender: &dyn ClientMessageValidator) -> String {
+    fn fmt_reader_message(&self, msg: &BoltMessage, sender: &dyn ScriptLine) -> String {
         let line = msg.repr();
         match sender.line_number() {
             None => format!("(   ?) C: {line}"),
