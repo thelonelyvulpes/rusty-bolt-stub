@@ -774,9 +774,9 @@ impl<'a, C: Connection> NetActor<'a, C> {
     }
 
     async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> NetActorResult<()> {
+        info!(self, "{}", self.fmt_sender_message(sender));
         let mut data = sender.send()?;
         trace!(self, "Writing message: {}", fmt_bytes(data));
-        info!(self, "{}", self.fmt_sender_message(sender));
         while !data.is_empty() {
             let chunk_size = data.len().min(0xFFFF);
             cancelable_io(
@@ -834,6 +834,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 std::process::exit(0);
             }
             ServerAction::Noop => {
+                trace!(self, "Writing noop: {}", fmt_bytes(&[0, 0]));
                 cancelable_io(
                     "writing noop",
                     self.logging_ctx(),
@@ -850,6 +851,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 .await
             }
             ServerAction::Raw(data) => {
+                trace!(self, "Writing raw data: {}", fmt_bytes(data));
                 cancelable_io(
                     "writing raw data",
                     self.logging_ctx(),

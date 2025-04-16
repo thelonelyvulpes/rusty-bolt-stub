@@ -380,10 +380,10 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             validate_non_empty(&b, Some("inside a repeat block"))?;
             Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
         }
-        ScanBlock::ClientMessage(ctx, message_name, body) => {
+        ScanBlock::ClientMessage(ctx, (message_name_ctx, message_name), body) => {
             let validator = create_validator(
+                *message_name_ctx,
                 message_name,
-                *ctx,
                 body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
                 config,
             )
@@ -393,10 +393,10 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             })?;
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
-        ScanBlock::ServerMessage(ctx, message_name, body) => {
+        ScanBlock::ServerMessage(ctx, (message_name_ctx, message_name), body) => {
             let server_message_sender = create_message_sender(
+                *message_name_ctx,
                 message_name,
-                *ctx,
                 body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
                 config,
             )
@@ -406,10 +406,10 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             })?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
-        ScanBlock::ServerAction(ctx, action_name, body) => {
+        ScanBlock::ServerAction(ctx, (action_name_ctx, action_name), body) => {
             let server_action = create_server_action(
+                *action_name_ctx,
                 action_name,
-                *ctx,
                 body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
             )
             .map_err(|mut e| {
@@ -418,19 +418,21 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             })?;
             Ok(ActorBlock::ServerActionLine(*ctx, server_action))
         }
-        ScanBlock::AutoMessage(ctx, client_message_name, client_body) => {
-            Ok(ActorBlock::AutoMessage(
-                *ctx,
-                create_auto_message_handler(
-                    client_message_name,
-                    *ctx,
-                    client_body
-                        .as_ref()
-                        .map(|(ctx, body)| (*ctx, body.as_str())),
-                    config,
-                )?,
-            ))
-        }
+        ScanBlock::AutoMessage(
+            ctx,
+            (client_message_name_ctx, client_message_name),
+            client_body,
+        ) => Ok(ActorBlock::AutoMessage(
+            *ctx,
+            create_auto_message_handler(
+                *client_message_name_ctx,
+                client_message_name,
+                client_body
+                    .as_ref()
+                    .map(|(ctx, body)| (*ctx, body.as_str())),
+                config,
+            )?,
+        )),
         ScanBlock::Comment(ctx) => Ok(ActorBlock::NoOp(*ctx)),
         ScanBlock::Python(_, _) => {
             todo!("Python blocks are not yet supported in the actor")
@@ -461,12 +463,17 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
 }
 
 fn create_auto_message_handler(
+    client_message_name_ctx: Context,
     client_message_name: &str,
-    ctx: Context,
     client_body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<AutoMessageHandler> {
-    let client_validator = create_validator(client_message_name, ctx, client_body, config)?;
+    let client_validator = create_validator(
+        client_message_name_ctx,
+        client_message_name,
+        client_body,
+        config,
+    )?;
     let client_message_tag = config
         .bolt_version
         .message_tag_from_request(client_message_name)
@@ -495,8 +502,8 @@ fn create_auto_message_handler(
 }
 
 fn create_message_sender(
+    message_name_ctx: Context,
     message_name: &str,
-    ctx: Context,
     message_body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
@@ -505,7 +512,7 @@ fn create_message_sender(
         .message_tag_from_response(message_name)
         .ok_or_else(|| {
             ParseError::new_ctx(
-                ctx,
+                message_name_ctx,
                 format!(
                     "Unknown response message name {message_name:?} for BOLT version {}",
                     config.bolt_version,
@@ -520,7 +527,10 @@ fn create_message_sender(
         SenderBytesLine::Ctx {
             message_name: message_name.into(),
             message_body: message_body.map(|(_, s)| s.into()),
-            ctx,
+            ctx: match &message_body {
+                None => message_name_ctx,
+                Some((ctx, _)) => message_name_ctx.fuse(ctx),
+            },
         },
     )))
 }
@@ -802,10 +812,14 @@ fn transcode_duration_value(s: &str) -> Option<Result<PackStreamValue>> {
 }
 
 fn create_server_action(
+    action_name_ctx: Context,
     action_name: &str,
-    ctx: Context,
     message_body: Option<(Context, &str)>,
 ) -> Result<Box<dyn ServerActionLine>> {
+    let ctx = match &message_body {
+        None => action_name_ctx,
+        Some((ctx, _)) => action_name_ctx.fuse(ctx),
+    };
     let action = match action_name {
         "EXIT" => {
             check_server_action_no_body(action_name, message_body)?;
@@ -962,8 +976,8 @@ impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ClientMessageValid
 }
 
 fn create_validator(
+    message_name_ctx: Context,
     message_name: &str,
-    ctx: Context,
     body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
@@ -972,7 +986,7 @@ fn create_validator(
         .message_tag_from_request(message_name)
         .ok_or_else(|| {
             ParseError::new_ctx(
-                ctx,
+                message_name_ctx,
                 format!(
                     "Unknown request message name {message_name:?} for BOLT version {}",
                     config.bolt_version
@@ -987,7 +1001,10 @@ fn create_validator(
             }
             expected_body_behavior(&client_message.fields)
         },
-        ctx,
+        ctx: match &body {
+            None => message_name_ctx,
+            Some((ctx, _)) => message_name_ctx.fuse(ctx),
+        },
     }))
 }
 
@@ -1928,7 +1945,7 @@ mod test {
             allow_restart: false,
             allow_concurrent: false,
         };
-        let validator = create_validator(tag, ctx, Some((ctx, body)), &cfg).unwrap();
+        let validator = create_validator(ctx, tag, Some((ctx, body)), &cfg).unwrap();
 
         let cm = BoltMessage::new(
             0x01,

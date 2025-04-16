@@ -1,4 +1,5 @@
 use std::cmp::max;
+use std::ops::RangeTo;
 
 use anyhow::anyhow;
 use log::trace;
@@ -9,7 +10,7 @@ use nom::combinator::{complete, cond, consumed, eof, map, opt, peek, recognize, 
 use nom::error::{context, ErrorKind, FromExternalError, ParseError};
 use nom::multi::{many1, many_till};
 use nom::sequence::{delimited, pair, preceded, terminated};
-use nom::{AsChar, Compare, InputLength, InputTake, InputTakeAtPosition, Parser, Slice};
+use nom::{AsChar, Compare, InputLength, InputTake, InputTakeAtPosition, Offset, Parser, Slice};
 use nom_span::Spanned;
 
 use crate::bang_line::BangLine;
@@ -325,12 +326,12 @@ fn keyword(input: Input) -> IResult<()> {
 // ############
 fn multi_message<'a, 'b>(
     message_tag: Option<&'static str>,
-    mut block: impl FnMut(Context, String, Option<(Context, String)>) -> ScanBlock + 'b,
+    mut block: impl FnMut(Context, (Context, String), Option<(Context, String)>) -> ScanBlock + 'b,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> + 'b {
     move |input| {
         let (input, (ctx, blocks)) = consumed(multi_message_vec(
             message_tag,
-            |ctx, msg_name, body| block(ctx, String::from(*msg_name), body),
+            |ctx, msg_name, body| block(ctx, (msg_name.into(), String::from(*msg_name)), body),
             message_name,
         ))(input)?;
         Ok((input, wrap_block_vec(ctx.into(), blocks)))
@@ -339,15 +340,24 @@ fn multi_message<'a, 'b>(
 
 fn multi_message_or_action<'a, 'b>(
     message_tag: Option<&'static str>,
-    mut block: impl FnMut(Context, String, Option<(Context, String)>) -> ScanBlock + 'b,
-    mut action_block: impl FnMut(Context, String, Option<(Context, String)>) -> ScanBlock + 'b,
+    mut block: impl FnMut(Context, (Context, String), Option<(Context, String)>) -> ScanBlock + 'b,
+    mut action_block: impl FnMut(Context, (Context, String), Option<(Context, String)>) -> ScanBlock
+        + 'b,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> + 'b {
     move |input| {
         let (input, (ctx, blocks)) = consumed(multi_message_vec(
             message_tag,
-            |ctx, (msg_name, msg_type), body| match msg_type {
-                MessageNameType::Name => block(ctx, String::from(*msg_name), body),
-                MessageNameType::Action => action_block(ctx, String::from(*msg_name), body),
+            |ctx, (msg_name, msg_name_stripped, msg_type), body| match msg_type {
+                MessageNameType::Name => block(
+                    ctx,
+                    (msg_name.into(), String::from(*msg_name_stripped)),
+                    body,
+                ),
+                MessageNameType::Action => action_block(
+                    ctx,
+                    (msg_name.into(), String::from(*msg_name_stripped)),
+                    body,
+                ),
             },
             server_message_name,
         ))(input)?;
@@ -384,11 +394,11 @@ fn multi_message_vec<'a, 'b, 'c, N: 'a>(
 
 fn message_with_simple_name<'a, 'b>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(Context, String, Option<(Context, String)>) -> ScanBlock + 'b,
+    mut block: impl FnMut(Context, (Context, String), Option<(Context, String)>) -> ScanBlock + 'b,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
     message(
         tag,
-        move |ctx, name, body| block(ctx, String::from(*name), body),
+        move |ctx, name, body| block(ctx, (name.into(), String::from(*name)), body),
         message_name,
     )
 }
@@ -443,7 +453,7 @@ fn prefixed_line<'a, 'n, N: 'a>(
 
 fn message_simple_content<'a>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(Context, String) -> ScanBlock,
+    mut block: impl FnMut(Context, (Context, String)) -> ScanBlock,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
     map(
         preceded(
@@ -453,7 +463,7 @@ fn message_simple_content<'a>(
                 peek(end_of_line),
             ),
         ),
-        move |(ctx, content)| block(ctx.into(), String::from(*content)),
+        move |(ctx, content)| block(ctx.into(), (content.into(), String::from(*content))),
     )
 }
 
@@ -529,46 +539,33 @@ fn multiblock<'a>(
 // ###############
 // TODO: add tests
 fn auto_repeat_0(input: Input) -> IResult<ScanBlock> {
-    let (input, (message, args)) = prefixed_line(Some("*:"), message_name)(input)?;
-    Ok((
-        input,
-        ScanBlock::Repeat0(
-            message.into(),
-            Box::new(ScanBlock::AutoMessage(
-                message.into(),
-                String::from(*message),
-                args.map(|s| (s.into(), String::from(*s))),
-            )),
-        ),
-    ))
+    auto_syntactic_sugar(input, "*:", ScanBlock::Repeat0)
 }
 
 // TODO: add tests
 fn auto_repeat_1(input: Input) -> IResult<ScanBlock> {
-    let (input, (message, args)) = prefixed_line(Some("+:"), message_name)(input)?;
-    Ok((
-        input,
-        ScanBlock::Repeat1(
-            message.into(),
-            Box::new(ScanBlock::AutoMessage(
-                message.into(),
-                String::from(*message),
-                args.map(|s| (s.into(), String::from(*s))),
-            )),
-        ),
-    ))
+    auto_syntactic_sugar(input, "+:", ScanBlock::Repeat1)
 }
 
 // TODO: add tests
 fn auto_optional(input: Input) -> IResult<ScanBlock> {
-    let (input, (message, args)) = prefixed_line(Some("?:"), message_name)(input)?;
+    auto_syntactic_sugar(input, "?:", ScanBlock::Optional)
+}
+
+fn auto_syntactic_sugar<'a>(
+    input: Input<'a>,
+    prefix: &'static str,
+    mut wrapper_block: impl FnMut(Context, Box<ScanBlock>) -> ScanBlock,
+) -> IResult<'a, ScanBlock> {
+    let (input, (line_ctx, (message_name, args))) =
+        consumed(prefixed_line(Some(prefix), message_name))(input)?;
     Ok((
         input,
-        ScanBlock::Optional(
-            message.into(),
+        wrapper_block(
+            line_ctx.into(),
             Box::new(ScanBlock::AutoMessage(
-                message.into(),
-                String::from(*message),
+                line_ctx.into(),
+                (message_name.into(), String::from(*message_name)),
                 args.map(|s| (s.into(), String::from(*s))),
             )),
         ),
@@ -586,23 +583,28 @@ where
     take_while1(|item: T::Item| item.clone().is_alphanum() || item.as_char() == '_')(input)
 }
 
-fn server_message_name<T, E: ParseError<T>>(input: T) -> nom::IResult<T, (T, MessageNameType), E>
+fn server_message_name<T, E: ParseError<T>>(input: T) -> nom::IResult<T, (T, T, MessageNameType), E>
 where
-    T: InputTakeAtPosition + Clone + Compare<&'static str> + InputTake,
+    T: InputTakeAtPosition
+        + Clone
+        + Compare<&'static str>
+        + InputTake
+        + Offset
+        + Slice<RangeTo<usize>>,
     <T as InputTakeAtPosition>::Item: AsChar + Clone,
 {
     alt((
         map(
             take_while1(|item: T::Item| item.clone().is_alphanum() || item.as_char() == '_'),
-            |o| (o, MessageNameType::Name),
+            |o: T| (o.clone(), o, MessageNameType::Name),
         ),
         map(
-            delimited(
+            consumed(delimited(
                 tag("<"),
                 take_while1(|item: T::Item| item.as_char() != '>'),
                 tag(">"),
-            ),
-            |o| (o, MessageNameType::Action),
+            )),
+            |(outer, inner)| (outer, inner, MessageNameType::Action),
         ),
     ))(input)
 }
@@ -938,17 +940,19 @@ mod tests {
     // Simple Lines
     // ############
     #[rstest]
-    #[case::implicit("C: Foo a b\n   Bar lel lol", 7, 10, 14, 18, 25)]
-    #[case::explicit("C: Foo a b\nC: Bar lel lol", 7, 10, 11, 18, 25)]
-    #[case::implicit_space_post("C: Foo a b \n   Bar lel lol ", 7, 11, 15, 19, 27)]
-    #[case::explicit_space_post("C: Foo a b \nC: Bar lel lol ", 7, 11, 12, 19, 27)]
-    #[case::implicit_space_pre("C:  Foo a b \n    Bar lel lol", 8, 12, 17, 21, 28)]
-    #[case::explicit_space_pre("C:  Foo a b \nC:  Bar lel lol", 8, 12, 13, 21, 28)]
+    #[case::implicit("C: Foo a b\n   Bar lel lol", 3, 7, 10, 14, 14, 18, 25)]
+    #[case::explicit("C: Foo a b\nC: Bar lel lol", 3, 7, 10, 11, 14, 18, 25)]
+    #[case::implicit_space_post("C: Foo a b \n   Bar lel lol ", 3, 7, 11, 15, 15, 19, 27)]
+    #[case::explicit_space_post("C: Foo a b \nC: Bar lel lol ", 3, 7, 11, 12, 15, 19, 27)]
+    #[case::implicit_space_pre("C:  Foo a b \n    Bar lel lol", 4, 8, 12, 17, 17, 21, 28)]
+    #[case::explicit_space_pre("C:  Foo a b \nC:  Bar lel lol", 4, 8, 12, 13, 17, 21, 28)]
     fn test_multi_message(
         #[case] input: &'static str,
+        #[case] b_msg_start_1: usize,
         #[case] b_body_start_1: usize,
         #[case] b_end_1: usize,
         #[case] b_start_2: usize,
+        #[case] b_msg_start_2: usize,
         #[case] b_body_start_2: usize,
         #[case] b_end_2: usize,
         #[values("", "\n", "\nS: Baz\n", "\n \n\n  S: Baz\n", "\n?}")] ending: &'static str,
@@ -970,12 +974,18 @@ mod tests {
                 vec![
                     ScanBlock::ClientMessage(
                         new_ctx(1, 1, 0, b_end_1),
-                        "Foo".into(),
+                        (
+                            new_ctx(1, 1, b_msg_start_1, b_msg_start_1 + 3),
+                            "Foo".into()
+                        ),
                         Some((new_ctx(1, 1, b_body_start_1, b_body_end_1), body_1.into()))
                     ),
                     ScanBlock::ClientMessage(
                         new_ctx(2, 2, b_start_2, b_end_2),
-                        "Bar".into(),
+                        (
+                            new_ctx(2, 2, b_msg_start_2, b_msg_start_2 + 3),
+                            "Bar".into()
+                        ),
                         Some((new_ctx(2, 2, b_body_start_2, b_body_end_2), body_2.into()))
                     )
                 ]
@@ -1000,12 +1010,12 @@ mod tests {
                 vec![
                     ScanBlock::ClientMessage(
                         new_ctx(1, 1, 0, 10),
-                        "Foo".into(),
+                        (new_ctx(1, 1, 3, 6), "Foo".into()),
                         Some((new_ctx(1, 1, 7, 10), "a b".into()))
                     ),
                     ScanBlock::ClientMessage(
                         new_ctx(2, 2, 11, 25),
-                        "Bar".into(),
+                        (new_ctx(2, 2, 14, 17), "Bar".into()),
                         Some((new_ctx(2, 2, 18, 25), "lel lol".into()))
                     )
                 ]
@@ -1014,11 +1024,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_space("C:RUN", 5)]
-    #[case::clean("C: RUN", 6)]
-    #[case::trailing("C: RUN  ", 8)]
-    #[case::messy("C:   RUN  ", 10)]
-    fn test_client_message_with_no_args(#[case] input: &str, #[case] bytes: usize) {
+    #[case::no_space("C:RUN", 2, 5)]
+    #[case::clean("C: RUN", 3, 6)]
+    #[case::trailing("C: RUN  ", 3, 8)]
+    #[case::messy("C:   RUN  ", 5, 10)]
+    fn test_client_message_with_no_args(
+        #[case] input: &str,
+        #[case] bytes_msg_start: usize,
+        #[case] bytes: usize,
+    ) {
         let result = super::message_with_simple_name(Some("C:"), ScanBlock::ClientMessage)(
             wrap_input(input),
         );
@@ -1026,17 +1040,25 @@ mod tests {
         assert_eq!(*rem, "");
         assert_eq!(
             block,
-            ScanBlock::ClientMessage(new_ctx(1, 1, 0, bytes), "RUN".into(), None)
+            ScanBlock::ClientMessage(
+                new_ctx(1, 1, 0, bytes),
+                (
+                    new_ctx(1, 1, bytes_msg_start, bytes_msg_start + 3),
+                    "RUN".into()
+                ),
+                None
+            )
         );
     }
 
     #[rstest]
-    #[case::no_space("C:RUN foo bar", 6, 13)]
-    #[case::no_space("C: RUN foo bar", 7, 14)]
-    #[case::trailing("C: RUN foo bar  ", 7, 16)]
-    #[case::messy("C:  RUN   foo bar  ", 10, 19)]
+    #[case::no_space("C:RUN foo bar", 2, 6, 13)]
+    #[case::no_space("C: RUN foo bar", 3, 7, 14)]
+    #[case::trailing("C: RUN foo bar  ", 3, 7, 16)]
+    #[case::messy("C:  RUN   foo bar  ", 4, 10, 19)]
     fn test_client_message_con_args(
         #[case] input: &str,
+        #[case] message_start: usize,
         #[case] body_start: usize,
         #[case] bytes: usize,
     ) {
@@ -1051,7 +1073,10 @@ mod tests {
             block,
             ScanBlock::ClientMessage(
                 new_ctx(1, 1, 0, bytes),
-                "RUN".into(),
+                (
+                    new_ctx(1, 1, message_start, message_start + 3),
+                    "RUN".into()
+                ),
                 Some((new_ctx(1, 1, body_start, body_end), body.into()))
             )
         );
@@ -1081,7 +1106,10 @@ mod tests {
         assert_eq!(*rem, "");
         assert_eq!(
             block,
-            ScanBlock::Python(new_ctx(1, 1, 0, 26), "print('Hello, World!')".into())
+            ScanBlock::Python(
+                new_ctx(1, 1, 0, 26),
+                (new_ctx(1, 1, 4, 26), "print('Hello, World!')".into())
+            )
         );
     }
 
@@ -1097,8 +1125,16 @@ mod tests {
         assert_eq!(
             blocks,
             vec![
-                ScanBlock::ClientMessage(new_ctx(2, 2, 7, 13), "RUN".into(), None),
-                ScanBlock::ServerMessage(new_ctx(3, 3, 18, 23), "OK".into(), None),
+                ScanBlock::ClientMessage(
+                    new_ctx(2, 2, 7, 13),
+                    (new_ctx(2, 2, 10, 13), "RUN".into()),
+                    None
+                ),
+                ScanBlock::ServerMessage(
+                    new_ctx(3, 3, 18, 23),
+                    (new_ctx(3, 3, 21, 23), "OK".into()),
+                    None
+                ),
             ]
         );
     }
@@ -1115,11 +1151,23 @@ mod tests {
                 ScanBlock::List(
                     new_ctx(2, 3, 7, 24),
                     vec![
-                        ScanBlock::ClientMessage(new_ctx(2, 2, 7, 14), "RUN1".into(), None),
-                        ScanBlock::ServerMessage(new_ctx(3, 3, 19, 24), "OK".into(), None),
+                        ScanBlock::ClientMessage(
+                            new_ctx(2, 2, 7, 14),
+                            (new_ctx(2, 2, 10, 14), "RUN1".into()),
+                            None
+                        ),
+                        ScanBlock::ServerMessage(
+                            new_ctx(3, 3, 19, 24),
+                            (new_ctx(3, 3, 22, 24), "OK".into()),
+                            None
+                        ),
                     ]
                 ),
-                ScanBlock::ClientMessage(new_ctx(5, 5, 34, 41), "RUN2".into(), None),
+                ScanBlock::ClientMessage(
+                    new_ctx(5, 5, 34, 41),
+                    (new_ctx(5, 5, 37, 41), "RUN2".into()),
+                    None
+                ),
             ]
         );
     }
@@ -1234,15 +1282,17 @@ mod tests {
     fn test_server_message_name_normal_name() {
         let (rem, taken) = super::server_message_name::<_, super::PError<_>>("AB_C").unwrap();
         assert_eq!(taken.0, "AB_C");
-        assert_eq!(taken.1, super::MessageNameType::Name);
+        assert_eq!(taken.1, "AB_C");
+        assert_eq!(taken.2, super::MessageNameType::Name);
         assert_eq!(rem, "");
     }
 
     #[test]
     fn test_server_message_name_action() {
         let (rem, taken) = super::server_message_name::<_, super::PError<_>>("<A1 O?>").unwrap();
-        assert_eq!(taken.0, "A1 O?");
-        assert_eq!(taken.1, super::MessageNameType::Action);
+        assert_eq!(taken.0, "<A1 O?>");
+        assert_eq!(taken.1, "A1 O?");
+        assert_eq!(taken.2, super::MessageNameType::Action);
         assert_eq!(rem, "");
     }
 }

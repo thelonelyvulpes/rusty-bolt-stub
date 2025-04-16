@@ -17,12 +17,12 @@ pub enum ScanBlock {
     Optional(Context, Box<ScanBlock>),
     Repeat0(Context, Box<ScanBlock>),
     Repeat1(Context, Box<ScanBlock>),
-    ClientMessage(Context, String, Option<(Context, String)>),
-    ServerMessage(Context, String, Option<(Context, String)>),
-    ServerAction(Context, String, Option<(Context, String)>),
-    AutoMessage(Context, String, Option<(Context, String)>),
+    ClientMessage(Context, (Context, String), Option<(Context, String)>),
+    ServerMessage(Context, (Context, String), Option<(Context, String)>),
+    ServerAction(Context, (Context, String), Option<(Context, String)>),
+    AutoMessage(Context, (Context, String), Option<(Context, String)>),
     Comment(Context),
-    Python(Context, String),
+    Python(Context, (Context, String)),
     // TODO: bring Python in
     #[allow(dead_code)]
     Condition(Context, CompositeConditionBlock),
