@@ -849,29 +849,6 @@ fn create_server_action(
         }
     };
     Ok(Box::new(ParsedServerAction { ctx, action }))
-    // let tag = config
-    //     .bolt_version
-    //     .message_tag_from_response(message_name)
-    //     .ok_or_else(|| {
-    //         ParseError::new_ctx(
-    //             ctx,
-    //             format!(
-    //                 "Unknown response message name {message_name:?} for BOLT version {}",
-    //                 config.bolt_version,
-    //             ),
-    //         )
-    //     })?;
-    // let fields = transcode_body(message_body, config)?;
-    // let data = BoltMessage::new(tag, fields, config.bolt_version).into_data();
-    //
-    // Ok(Box::new(SenderBytes::new(
-    //     data,
-    //     SenderBytesLine::Ctx {
-    //         message_name: message_name.into(),
-    //         message_body: message_body.map(|(_, s)| s.into()),
-    //         ctx,
-    //     },
-    // )))
 }
 
 #[derive(Debug, Clone)]
