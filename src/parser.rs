@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use log::{trace, warn};
 use regex::Regex;
@@ -19,7 +20,8 @@ use crate::ext::serde_json as serde_json_ext;
 use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
 use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerMessageSender,
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
+    ServerActionLine, ServerMessageSender,
 };
 use crate::types::{ScanBlock, Script};
 use crate::util::opt_res_ret;
@@ -49,6 +51,7 @@ pub struct ActorConfig {
     pub handshake_delay: Option<Duration>,
     pub allow_restart: bool,
     pub allow_concurrent: bool,
+    pub auto_responses: IndexMap<u8, AutoBangLineHandler>,
     pub py_lines: Vec<String>,
 }
 
@@ -111,6 +114,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     let mut handshake_delay: Option<Duration> = None;
     let mut allow_restart: Option<()> = None;
     let mut allow_concurrent: Option<()> = None;
+    let mut auto_responses = IndexMap::new();
     let mut py_lines: Vec<String> = Vec::new();
 
     for bang_line in bang_lines {
@@ -188,8 +192,14 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 })?;
                 handshake_delay = Some(delay);
             }
-            BangLine::Auto(_, _) => {
-                todo!("Auto bang lines are not yet supported in the actor")
+            BangLine::Auto(ctx, (ctx_msg, msg)) => {
+                let ctx_old = auto_responses.insert(msg, (ctx, ctx_msg));
+                if let Some((ctx_old, _)) = ctx_old {
+                    warn!(
+                        "Specified auto response for message \"{msg}\" more than once \
+                        ({ctx} and {ctx_old})."
+                    );
+                }
             }
             BangLine::AllowRestart(ctx) => {
                 if allow_restart.is_some() {
@@ -251,6 +261,44 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
             Some(handshake_response)
         }
     };
+    let auto_responses =
+        auto_responses
+            .into_iter()
+            .map(|(msg, (ctx, ctx_msg))| {
+                let Some(request_tag) = bolt_version.message_tag_from_request(msg) else {
+                    return Err(ParseError::new_ctx(
+                        *ctx_msg,
+                        format!(
+                            "Unknown request message name {msg:?} for BOLT version {bolt_version}"
+                        ),
+                    ));
+                };
+                let Some((response_tag, response_fields)) =
+                    bolt_version.message_auto_response(request_tag)
+                else {
+                    return Err(ParseError::new_ctx(
+                        *ctx,
+                        format!(
+                            "BOLT version {bolt_version} has no auto-response for message {msg:?}",
+                        ),
+                    ));
+                };
+                let response_message =
+                    BoltMessage::new(response_tag, response_fields, bolt_version);
+                let response_repr = response_message.repr();
+                let response_data = response_message.into_data();
+                Ok((
+                    request_tag,
+                    AutoBangLineHandler {
+                        ctx: *ctx_msg,
+                        sender: Box::new(SenderBytes::new(
+                            response_data,
+                            SenderBytesLine::Repr(response_repr),
+                        )),
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
 
     Ok(ActorConfig {
         bolt_version,
@@ -262,6 +310,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
         handshake_delay,
         allow_restart,
         allow_concurrent,
+        auto_responses,
         py_lines,
     })
 }
@@ -382,10 +431,10 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             validate_non_empty(&b, Some("inside a repeat block"))?;
             Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
         }
-        ScanBlock::ClientMessage(ctx, message_name, body) => {
+        ScanBlock::ClientMessage(ctx, (message_name_ctx, message_name), body) => {
             let validator = create_validator(
+                *message_name_ctx,
                 message_name,
-                *ctx,
                 body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
                 config,
             )
@@ -395,11 +444,10 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             })?;
             Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
         }
-        ScanBlock::ServerMessage(ctx, message_name, body) => {
-            // TODO: Implement parser for the special messages like S: <Sleep 2>
+        ScanBlock::ServerMessage(ctx, (message_name_ctx, message_name), body) => {
             let server_message_sender = create_message_sender(
+                *message_name_ctx,
                 message_name,
-                *ctx,
                 body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
                 config,
             )
@@ -409,19 +457,33 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             })?;
             Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
         }
-        ScanBlock::AutoMessage(ctx, client_message_name, client_body) => {
-            Ok(ActorBlock::AutoMessage(
-                *ctx,
-                create_auto_message_handler(
-                    client_message_name,
-                    *ctx,
-                    client_body
-                        .as_ref()
-                        .map(|(ctx, body)| (*ctx, body.as_str())),
-                    config,
-                )?,
-            ))
+        ScanBlock::ServerAction(ctx, (action_name_ctx, action_name), body) => {
+            let server_action = create_server_action(
+                *action_name_ctx,
+                action_name,
+                body.as_ref().map(|(ctx, body)| (*ctx, body.as_str())),
+            )
+            .map_err(|mut e| {
+                e.ctx.get_or_insert(*ctx);
+                e
+            })?;
+            Ok(ActorBlock::ServerActionLine(*ctx, server_action))
         }
+        ScanBlock::AutoMessage(
+            ctx,
+            (client_message_name_ctx, client_message_name),
+            client_body,
+        ) => Ok(ActorBlock::AutoMessage(
+            *ctx,
+            create_auto_message_handler(
+                *client_message_name_ctx,
+                client_message_name,
+                client_body
+                    .as_ref()
+                    .map(|(ctx, body)| (*ctx, body.as_str())),
+                config,
+            )?,
+        )),
         ScanBlock::Comment(ctx) => Ok(ActorBlock::NoOp(*ctx)),
         ScanBlock::Python(_, _) => {
             todo!("Python blocks are not yet supported in the actor")
@@ -451,13 +513,24 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
     res
 }
 
+#[derive(Debug)]
+pub(crate) struct AutoBangLineHandler {
+    pub(crate) ctx: Context,
+    pub(crate) sender: Box<dyn ServerMessageSender>,
+}
+
 fn create_auto_message_handler(
+    client_message_name_ctx: Context,
     client_message_name: &str,
-    ctx: Context,
     client_body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<AutoMessageHandler> {
-    let client_validator = create_validator(client_message_name, ctx, client_body, config)?;
+    let client_validator = create_validator(
+        client_message_name_ctx,
+        client_message_name,
+        client_body,
+        config,
+    )?;
     let client_message_tag = config
         .bolt_version
         .message_tag_from_request(client_message_name)
@@ -486,8 +559,8 @@ fn create_auto_message_handler(
 }
 
 fn create_message_sender(
+    message_name_ctx: Context,
     message_name: &str,
-    ctx: Context,
     message_body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ServerMessageSender>> {
@@ -496,7 +569,7 @@ fn create_message_sender(
         .message_tag_from_response(message_name)
         .ok_or_else(|| {
             ParseError::new_ctx(
-                ctx,
+                message_name_ctx,
                 format!(
                     "Unknown response message name {message_name:?} for BOLT version {}",
                     config.bolt_version,
@@ -511,7 +584,10 @@ fn create_message_sender(
         SenderBytesLine::Ctx {
             message_name: message_name.into(),
             message_body: message_body.map(|(_, s)| s.into()),
-            ctx,
+            ctx: match &message_body {
+                None => message_name_ctx,
+                Some((ctx, _)) => message_name_ctx.fuse(ctx),
+            },
         },
     )))
 }
@@ -792,6 +868,117 @@ fn transcode_duration_value(s: &str) -> Option<Result<PackStreamValue>> {
     Some(Ok(PackStreamValue::Struct(value_struct)))
 }
 
+fn create_server_action(
+    action_name_ctx: Context,
+    action_name: &str,
+    message_body: Option<(Context, &str)>,
+) -> Result<Box<dyn ServerActionLine>> {
+    let ctx = match &message_body {
+        None => action_name_ctx,
+        Some((ctx, _)) => action_name_ctx.fuse(ctx),
+    };
+    let action = match action_name {
+        "EXIT" => {
+            check_server_action_no_body(action_name, message_body)?;
+            ServerAction::Exit
+        }
+        "NOOP" => {
+            check_server_action_no_body(action_name, message_body)?;
+            ServerAction::Noop
+        }
+        "RAW" => {
+            let arg = check_server_action_hex_body(action_name, ctx, message_body)?;
+            ServerAction::Raw(arg)
+        }
+        "SLEEP" => {
+            let arg = check_server_action_duration_body(action_name, ctx, message_body)?;
+            ServerAction::Sleep(arg)
+        }
+        "ASSERT ORDER" => {
+            let arg = check_server_action_duration_body(action_name, ctx, message_body)?;
+            ServerAction::AssertOrder(arg)
+        }
+        _ => {
+            return Err(ParseError::new_ctx(
+                ctx,
+                format!("Unknown server action {action_name}"),
+            ))
+        }
+    };
+    Ok(Box::new(ParsedServerAction { ctx, action }))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedServerAction {
+    ctx: Context,
+    action: ServerAction,
+}
+
+impl ScriptLine for ParsedServerAction {
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
+        self.ctx.original_line(script)
+    }
+
+    fn line_number(&self) -> Option<usize> {
+        Some(self.ctx.start_line_number)
+    }
+}
+
+impl ServerActionLine for ParsedServerAction {
+    fn get_action(&self) -> &ServerAction {
+        &self.action
+    }
+}
+
+fn check_server_action_no_body(
+    action_name: &str,
+    message_body: Option<(Context, &str)>,
+) -> Result<()> {
+    if let Some((ctx, body)) = message_body {
+        return Err(ParseError::new_ctx(
+            ctx,
+            format!("Server action {action_name} does not accept any arguments, found {body}"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_server_action_hex_body(
+    action_name: &str,
+    ctx: Context,
+    message_body: Option<(Context, &str)>,
+) -> Result<Vec<u8>> {
+    let Some((ctx, body)) = message_body else {
+        return Err(ParseError::new_ctx(
+            ctx,
+            format!("Server action {action_name} requires a hex argument, found none"),
+        ));
+    };
+    str_bytes::str_to_bytes(body)
+        .map_err(|e| ParseError::new_ctx(ctx, format!("Failed to parse hex argument: {e}")))
+}
+
+fn check_server_action_duration_body(
+    action_name: &str,
+    ctx: Context,
+    message_body: Option<(Context, &str)>,
+) -> Result<Duration> {
+    let Some((ctx, body)) = message_body else {
+        return Err(ParseError::new_ctx(
+            ctx,
+            format!("Server action {action_name} requires a duration argument (float), found none"),
+        ));
+    };
+    let arg = f64::from_str(body)
+        .map_err(|e| ParseError::new_ctx(ctx, format!("Failed to parse float argument: {e}")))?;
+    Duration::try_from_secs_f64(arg).map_err(|e| {
+        ParseError::new_ctx(
+            ctx,
+            format!("Failed to parse float {arg} as duration (seconds): {e}"),
+        )
+    })
+}
+
 struct ValidatorImpl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> {
     pub func: T,
     pub ctx: Context,
@@ -823,8 +1010,8 @@ impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ClientMessageValid
 }
 
 fn create_validator(
+    message_name_ctx: Context,
     message_name: &str,
-    ctx: Context,
     body: Option<(Context, &str)>,
     config: &ActorConfig,
 ) -> Result<Box<dyn ClientMessageValidator>> {
@@ -833,7 +1020,7 @@ fn create_validator(
         .message_tag_from_request(message_name)
         .ok_or_else(|| {
             ParseError::new_ctx(
-                ctx,
+                message_name_ctx,
                 format!(
                     "Unknown request message name {message_name:?} for BOLT version {}",
                     config.bolt_version
@@ -848,7 +1035,10 @@ fn create_validator(
             }
             expected_body_behavior(&client_message.fields)
         },
-        ctx,
+        ctx: match &body {
+            None => message_name_ctx,
+            Some((ctx, _)) => message_name_ctx.fuse(ctx),
+        },
     }))
 }
 
@@ -1658,6 +1848,7 @@ fn is_skippable(block: &ActorBlock) -> bool {
         ActorBlock::Optional(..) | ActorBlock::NoOp(..) => true,
         ActorBlock::ClientMessageValidate(..)
         | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::ServerActionLine(..)
         | ActorBlock::Python(..)
         | ActorBlock::AutoMessage(..) => false,
     }
@@ -1674,6 +1865,7 @@ fn has_deterministic_end(block: &ActorBlock) -> bool {
             .unwrap_or(true),
         ActorBlock::ClientMessageValidate(..)
         | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::ServerActionLine(..)
         | ActorBlock::Python(..) => true,
         ActorBlock::Alt(_, blocks) | ActorBlock::Parallel(_, blocks) => {
             blocks.iter().all(has_deterministic_end)
@@ -1686,7 +1878,9 @@ fn has_deterministic_end(block: &ActorBlock) -> bool {
 
 fn is_action_block(block: &ActorBlock) -> bool {
     match block {
-        ActorBlock::Python(..) | ActorBlock::ServerMessageSend(..) => true,
+        ActorBlock::Python(..)
+        | ActorBlock::ServerMessageSend(..)
+        | ActorBlock::ServerActionLine(..) => true,
         ActorBlock::BlockList(_, blocks) => 'arm: {
             for block in blocks {
                 if is_action_block(block) {
@@ -1735,7 +1929,7 @@ fn validate_non_empty(block: &ActorBlock, context: Option<&str>) -> Result<()> {
 }
 
 fn validate_list_children(blocks: &[ActorBlock]) -> Result<()> {
-    let mut previous_has_deterministic_end = false;
+    let mut previous_has_deterministic_end = true;
     for block in blocks {
         if !previous_has_deterministic_end {
             validate_non_action(block, Some("after a block with non-deterministic end"))?;
@@ -1784,9 +1978,10 @@ mod test {
             handshake_delay: None,
             allow_restart: false,
             allow_concurrent: false,
+            auto_responses: Default::default(),
             py_lines: Vec::new(),
         };
-        let validator = create_validator(tag, ctx, Some((ctx, body)), &cfg).unwrap();
+        let validator = create_validator(ctx, tag, Some((ctx, body)), &cfg).unwrap();
 
         let cm = BoltMessage::new(
             0x01,

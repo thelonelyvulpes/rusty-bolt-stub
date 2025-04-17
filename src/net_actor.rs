@@ -24,7 +24,8 @@ use crate::net_actor::logging::{trace, HasLoggingCtx, LoggingCtx};
 use crate::parser::ActorScript;
 use crate::str_bytes::fmt_bytes;
 use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ServerMessageSender,
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
+    ServerActionLine, ServerMessageSender,
 };
 use crate::values::bolt_message::BoltMessage;
 use crate::values::pack_stream_value::PackStreamStruct;
@@ -170,7 +171,12 @@ impl<'a, C: Connection> NetActor<'a, C> {
             if block.done() {
                 break;
             }
-            match self.try_consume(block).await {
+            let mut consume_res = self.try_consume(block).await;
+            if let Ok(false) = consume_res {
+                debug!(self, "No match in script found, trying auto bang handlers");
+                consume_res = self.try_auto_bang_handler().await;
+            }
+            match consume_res {
                 Ok(true) => {}
                 Ok(false) => {
                     let msg = self.format_script_missmatch(block);
@@ -386,11 +392,34 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 Ok(true)
             }
             BlockWithState::ServerMessageSend(..)
+            | BlockWithState::ServerActionLine(..)
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {
                 panic!("Should've called server_action before {block:?}")
             }
         }
+    }
+
+    async fn try_auto_bang_handler(&mut self) -> anyhow::Result<bool> {
+        let peeked_message = Self::peek_message(
+            self.logging_ctx(),
+            &self.ct,
+            &mut self.conn,
+            &mut self.peeked_message,
+            self.script.config.bolt_version,
+        )
+        .await?;
+        let tag = peeked_message.tag;
+        let Some(handler) = self.script.config.auto_responses.get(&tag) else {
+            debug!(self, "No auto bang handler found for tag: {tag}");
+            return Ok(false);
+        };
+        debug!(self, "Found auto bang handler for tag: {tag}");
+        _ = self.read_message(&handler.ctx).await?; // consume the message
+        self.write_message(&*handler.sender)
+            .await
+            .inspect_err(|err| info!(self, "Error sending message: {err}"))?;
+        Ok(true)
     }
 
     /// Progresses the state even if the call fails.
@@ -429,11 +458,22 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     let res = self
                         .write_message(*sender)
                         .await
-                        .with_context(|| format!("Sending on {ctx}"))
                         .inspect_err(|err| info!(self, "Error sending message: {err}"));
                     state.done = true;
                     debug!(self, "server line ({ctx}): done");
-                    res.map_err(NetActorError::from_anyhow)
+                    res
+                }
+            },
+            BlockWithState::ServerActionLine(state, ctx, action) => match state.done {
+                true => Ok(()),
+                false => {
+                    let res = self
+                        .server_action_line(*action)
+                        .await
+                        .inspect_err(|err| info!(self, "Error on server action: {err}"));
+                    state.done = true;
+                    debug!(self, "server action ({ctx}): done");
+                    res
                 }
             },
             BlockWithState::Python(state, _, command) => match state.done {
@@ -567,15 +607,22 @@ impl<'a, C: Connection> NetActor<'a, C> {
     fn format_possible_verifiers(&self, current_block: &BlockWithState<'_>) -> Vec<String> {
         let possible_verifiers = &mut Vec::new();
         Self::current_verifiers(current_block, possible_verifiers);
-        possible_verifiers
-            .iter()
-            .map(|v| {
+        self.script
+            .config
+            .auto_responses
+            .values()
+            .map(|handler| {
+                let line = handler.ctx.original_line(self.script.script.input);
+                let line_number = handler.ctx.start_line_number;
+                format!("({line_number:4}) !: AUTO {line}")
+            })
+            .chain(possible_verifiers.iter().map(|v| {
                 let line = v.line_repr(self.script.script.input);
                 match v.line_number() {
                     None => format!("(   ?) C: {line}"),
                     Some(line_number) => format!("({line_number:4}) C: {line}"),
                 }
-            })
+            }))
             .collect()
     }
 
@@ -644,6 +691,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 }
             }
             BlockWithState::ServerMessageSend(..)
+            | BlockWithState::ServerActionLine(..)
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {}
         }
@@ -689,6 +737,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 !state.done && handler.client_validator.validate(message).is_ok()
             }
             BlockWithState::ServerMessageSend(..)
+            | BlockWithState::ServerActionLine(..)
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {
                 panic!("Should've called server_action before: {block:?}")
@@ -696,10 +745,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
     }
 
-    async fn read_message(
-        &mut self,
-        line: &dyn ClientMessageValidator,
-    ) -> anyhow::Result<BoltMessage> {
+    async fn read_message(&mut self, line: &dyn ScriptLine) -> anyhow::Result<BoltMessage> {
         if let Some(peeked) = self.peeked_message.take() {
             info!(self, "{}", self.fmt_reader_message(&peeked, line));
             return Ok(peeked);
@@ -710,12 +756,13 @@ impl<'a, C: Connection> NetActor<'a, C> {
             &mut self.conn,
             self.script.config.bolt_version,
         )
-        .await?;
+        .await
+        .inspect_err(|err| info!(self, "Error reading message: {err}"))?;
         info!(self, "{}", self.fmt_reader_message(&res, line));
         Ok(res)
     }
 
-    fn fmt_reader_message(&self, msg: &BoltMessage, sender: &dyn ClientMessageValidator) -> String {
+    fn fmt_reader_message(&self, msg: &BoltMessage, sender: &dyn ScriptLine) -> String {
         let line = msg.repr();
         match sender.line_number() {
             None => format!("(   ?) C: {line}"),
@@ -760,9 +807,9 @@ impl<'a, C: Connection> NetActor<'a, C> {
     }
 
     async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> NetActorResult<()> {
+        info!(self, "{}", self.fmt_sender_message(sender));
         let mut data = sender.send()?;
         trace!(self, "Writing message: {}", fmt_bytes(data));
-        info!(self, "{}", self.fmt_sender_message(sender));
         while !data.is_empty() {
             let chunk_size = data.len().min(0xFFFF);
             cancelable_io(
@@ -808,6 +855,100 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
     }
 
+    async fn server_action_line(&mut self, action: &dyn ServerActionLine) -> NetActorResult<()> {
+        info!(self, "{}", self.fmt_server_action_line(action));
+        match action.get_action() {
+            ServerAction::Exit => {
+                trace!(
+                    self,
+                    "It was an honor, captain 🫡! \
+                    See you on the other side of `std::process::exit(0)`."
+                );
+                std::process::exit(0);
+            }
+            ServerAction::Noop => {
+                trace!(self, "Writing noop: {}", fmt_bytes(&[0, 0]));
+                cancelable_io(
+                    "writing noop",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.write_all(&[0, 0]),
+                )
+                .await?;
+                cancelable_io(
+                    "flushing noop",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.flush(),
+                )
+                .await
+            }
+            ServerAction::Raw(data) => {
+                trace!(self, "Writing raw data: {}", fmt_bytes(data));
+                cancelable_io(
+                    "writing raw data",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.write_all(data),
+                )
+                .await?;
+                cancelable_io(
+                    "flushing raw data",
+                    self.logging_ctx(),
+                    &self.ct,
+                    self.conn.flush(),
+                )
+                .await
+            }
+            ServerAction::Sleep(duration) => {
+                trace!(
+                    self,
+                    "On sec, please 🥱... Sleeping for {} seconds",
+                    duration.as_secs_f64()
+                );
+                select! {
+                    _ = tokio::time::sleep(*duration) => {Ok(())}
+                    _ = self.ct.cancelled() => {
+                        let msg = "Sleeping cancelled";
+                        debug!(self, "{msg}");
+                        Err(NetActorError::from_cancellation(String::from(msg)))
+                    }
+                }
+            }
+            ServerAction::AssertOrder(duration) => {
+                trace!(
+                    self,
+                    "Waiting for {} seconds to verify that no pipelined message arrives",
+                    duration.as_secs_f64()
+                );
+                select! {
+                    _ = tokio::time::sleep(*duration) => {Ok(())}
+                    peeked_message = Self::peek_message(
+                        self.logging_ctx(),
+                        &self.ct,
+                        &mut self.conn,
+                        &mut self.peeked_message,
+                        self.script.config.bolt_version,
+                    ) => {
+                        let peeked_message = peeked_message?;
+                        Err(NetActorError::Anyhow(anyhow!(
+                            "Expected no pipelined message, received {}",
+                            peeked_message.repr()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    fn fmt_server_action_line(&self, action: &dyn ServerActionLine) -> String {
+        let line = action.line_repr(self.script.script.input);
+        match action.line_number() {
+            None => format!("(   ?) S: {line}"),
+            Some(line_number) => format!("({line_number:4}) S: {line}"),
+        }
+    }
+
     async fn peek_message<'buf>(
         logging_ctx: LoggingCtx,
         ct: &CancellationToken,
@@ -831,6 +972,7 @@ enum BlockWithState<'a> {
     BlockList(ListState, Context, Vec<BlockWithState<'a>>),
     ClientMessageValidate(OneShotState, Context, &'a dyn ClientMessageValidator),
     ServerMessageSend(OneShotState, Context, &'a dyn ServerMessageSender),
+    ServerActionLine(OneShotState, Context, &'a dyn ServerActionLine),
     // TODO: bring Python in
     #[allow(dead_code)]
     Python(OneShotState, Context, &'a str),
@@ -914,6 +1056,9 @@ impl<'a> BlockWithState<'a> {
             ActorBlock::ServerMessageSend(ctx, sender) => {
                 Self::ServerMessageSend(Default::default(), *ctx, sender.as_ref())
             }
+            ActorBlock::ServerActionLine(ctx, line) => {
+                Self::ServerActionLine(Default::default(), *ctx, line.as_ref())
+            }
             ActorBlock::Python(ctx, command) => Self::Python(Default::default(), *ctx, command),
             ActorBlock::Alt(ctx, blocks) => Self::Alt(
                 Default::default(),
@@ -956,6 +1101,7 @@ impl<'a> BlockWithState<'a> {
             BlockWithState::Repeat(_, _, _, _) => false,
             BlockWithState::ClientMessageValidate(state, _, _)
             | BlockWithState::ServerMessageSend(state, _, _)
+            | BlockWithState::ServerActionLine(state, _, _)
             | BlockWithState::Python(state, _, _)
             | BlockWithState::AutoMessage(state, _, _) => state.done,
             BlockWithState::NoOp(_) => true,
@@ -985,6 +1131,7 @@ impl<'a> BlockWithState<'a> {
             },
             BlockWithState::ClientMessageValidate(state, _, _)
             | BlockWithState::ServerMessageSend(state, _, _)
+            | BlockWithState::ServerActionLine(state, _, _)
             | BlockWithState::Python(state, _, _)
             | BlockWithState::AutoMessage(state, _, _) => state.done,
             BlockWithState::NoOp(_) => true,
@@ -1030,7 +1177,7 @@ async fn cancelable_io<
                 Ok(res) => Ok(res),
                 Err(err) => {
                     let msg = format!("IO failed {ctx}");
-                    debug!(logging_ctx,"{msg}");
+                    debug!(logging_ctx, "{msg}");
                     let err: anyhow::Error = err.into();
                     Err(NetActorError::from_anyhow(err.context(msg)))
                 }
@@ -1038,7 +1185,7 @@ async fn cancelable_io<
         },
         _ = ct.cancelled() => {
             let msg = format!("IO cancelled {ctx}");
-            debug!(logging_ctx,"{msg}");
+            debug!(logging_ctx, "{msg}");
             Err(NetActorError::from_cancellation(msg))
         }
     }

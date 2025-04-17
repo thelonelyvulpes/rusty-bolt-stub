@@ -17,11 +17,12 @@ pub enum ScanBlock {
     Optional(Context, Box<ScanBlock>),
     Repeat0(Context, Box<ScanBlock>),
     Repeat1(Context, Box<ScanBlock>),
-    ClientMessage(Context, String, Option<(Context, String)>),
-    ServerMessage(Context, String, Option<(Context, String)>),
-    AutoMessage(Context, String, Option<(Context, String)>),
+    ClientMessage(Context, (Context, String), Option<(Context, String)>),
+    ServerMessage(Context, (Context, String), Option<(Context, String)>),
+    ServerAction(Context, (Context, String), Option<(Context, String)>),
+    AutoMessage(Context, (Context, String), Option<(Context, String)>),
     Comment(Context),
-    Python(Context, String),
+    Python(Context, (Context, String)),
     // TODO: bring Python in
     #[allow(dead_code)]
     Condition(Context, CompositeConditionBlock),
@@ -42,6 +43,7 @@ pub struct ConditionBranch {
 
 pub mod actor_types {
     use std::fmt::Debug;
+    use std::time::Duration;
 
     use crate::context::Context;
     use crate::values::bolt_message::BoltMessage;
@@ -57,6 +59,19 @@ pub mod actor_types {
 
     pub trait ServerMessageSender: ScriptLine + Send {
         fn send(&self) -> anyhow::Result<&[u8]>;
+    }
+
+    pub trait ServerActionLine: ScriptLine + Send {
+        fn get_action(&self) -> &ServerAction;
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum ServerAction {
+        Exit,
+        Noop,
+        Raw(Vec<u8>),
+        Sleep(Duration),
+        AssertOrder(Duration),
     }
 
     // impl ScriptLine for () {
@@ -106,6 +121,7 @@ pub mod actor_types {
         BlockList(Context, Vec<ActorBlock>),
         ClientMessageValidate(Context, Box<dyn ClientMessageValidator>),
         ServerMessageSend(Context, Box<dyn ServerMessageSender>),
+        ServerActionLine(Context, Box<dyn ServerActionLine>),
         // TODO: bring Python in
         #[allow(dead_code)]
         Python(Context, String),
@@ -123,6 +139,7 @@ pub mod actor_types {
                 ActorBlock::BlockList(ctx, _)
                 | ActorBlock::ClientMessageValidate(ctx, _)
                 | ActorBlock::ServerMessageSend(ctx, _)
+                | ActorBlock::ServerActionLine(ctx, _)
                 | ActorBlock::Python(ctx, _)
                 | ActorBlock::Alt(ctx, _)
                 | ActorBlock::Parallel(ctx, _)
