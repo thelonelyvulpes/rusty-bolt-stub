@@ -23,22 +23,12 @@ pub enum ScanBlock {
     AutoMessage(Context, (Context, String), Option<(Context, String)>),
     Comment(Context),
     Python(Context, (Context, String)),
-    // TODO: bring Python in
-    #[allow(dead_code)]
-    Condition(Context, CompositeConditionBlock),
+    ConditionPart(Branch, Context, Option<(Context, String)>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct CompositeConditionBlock {
-    if_: Box<ConditionBranch>,
-    elif_: Vec<ConditionBranch>,
-    else_: Option<Box<ScanBlock>>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct ConditionBranch {
-    condition: (Context, String),
-    body: ScanBlock,
+pub enum Branch {
+    If, Else, ElseIf
 }
 
 pub mod actor_types {

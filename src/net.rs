@@ -155,12 +155,13 @@ impl Server {
         let restarts = self.server_script_cfg.config.allow_restart;
         let concurrent = self.server_script_cfg.config.allow_concurrent;
 
-        for py_line in self.server_script_cfg.config.py_lines.iter() {
-            run_python(&py_line)?;
-        }
+
 
         match conn {
             Ok((conn, addr)) => {
+                for py_line in self.server_script_cfg.config.py_lines.iter() {
+                    run_python(&py_line)?;
+                }
                 debug!("Server accepted connection from {}", addr);
                 conn.set_nodelay(true)?;
                 let script = self.server_script_cfg;

@@ -19,6 +19,7 @@ use crate::error::script_excerpt;
 use crate::ext::serde_json as serde_json_ext;
 use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
+use crate::str_bytes;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
     ServerActionLine, ServerMessageSender,
@@ -31,7 +32,6 @@ use crate::values::bolt_struct::{
     JoltTime, TAG_DATE, TAG_DURATION, TAG_LOCAL_TIME, TAG_POINT_2D, TAG_POINT_3D, TAG_TIME,
 };
 use crate::values::pack_stream_value::{PackStreamStruct, PackStreamValue};
-use crate::{str_bytes};
 
 #[derive(Debug)]
 pub struct ActorScript<'a> {
@@ -488,7 +488,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
         ScanBlock::Python(_, _) => {
             todo!("Python blocks are not yet supported in the actor")
         }
-        ScanBlock::Condition(_, _) => {
+        ScanBlock::ConditionPart(_, _, _) => {
             todo!("Python blocks are not yet supported in the actor")
         }
     }

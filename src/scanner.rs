@@ -16,7 +16,7 @@ use nom_span::Spanned;
 use crate::bang_line::BangLine;
 use crate::context::Context;
 use crate::error::script_excerpt;
-use crate::types::{ScanBlock, Script};
+use crate::types::{Branch, ScanBlock, Script};
 
 type PError<I> = nom::error::Error<I>;
 type Input<'a> = Spanned<&'a str>;
@@ -280,6 +280,9 @@ fn scan_block(input: Input) -> IResult<ScanBlock> {
                 "python lines",
                 message_simple_content(Some("PY:"), ScanBlock::Python),
             ),
+            context("IF", message_simple_content(Some("IF:"), |outer, inner| ScanBlock::ConditionPart(Branch::If, outer, Some(inner))),),
+            context("ELIF", message_simple_content(Some("ELIF:"), |outer, inner| ScanBlock::ConditionPart(Branch::ElseIf, outer, Some(inner))),),
+            context("ELSE", message_empty_content(Some("ELSE:"), |outer| ScanBlock::ConditionPart(Branch::Else, outer, None)),),
             // TODO: Add IF, ELSE and ELIF blocks
             context(
                 "client lines",
@@ -476,6 +479,34 @@ fn prefixed_line_simple_content<'a>(
             terminated(tag(prefix.unwrap_or_default()), space0),
         ),
         preceded(space0, rest_of_line),
+    )
+}
+
+fn message_empty_content<'a>(
+    tag: Option<&'static str>,
+    mut block: impl FnMut(Context) -> ScanBlock,
+) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
+    map(
+        preceded(
+            multispace0,
+            terminated(
+                recognize(prefixed_line_empty_content(tag)),
+                peek(end_of_line),
+            ),
+        ),
+        move |ctx| block(ctx.into()),
+    )
+}
+
+fn prefixed_line_empty_content<'a>(
+    prefix: Option<&'static str>,
+) -> impl FnMut(Input<'a>) -> IResult<'a, ()> {
+   preceded(
+        cond(
+            prefix.is_some(),
+            terminated(tag(prefix.unwrap_or_default()), space0),
+        ),
+        void(space0),
     )
 }
 
@@ -721,7 +752,7 @@ mod tests {
 
     use crate::bang_line::BangLine;
     use crate::context::Context;
-    use crate::types::ScanBlock;
+    use crate::types::{ScanBlock, Branch};
 
     #[test]
     fn test_scan_minimal_script() {
@@ -1112,7 +1143,21 @@ mod tests {
             )
         );
     }
-
+    
+    #[rstest]
+    #[case::cond_if("IF: foo == 10", Branch::If)]
+    #[case::cond_else_if("ELIF: baz == 20", Branch::ElseIf)]
+    #[case::cond_else("ELSE:", Branch::Else)]
+    fn test_conditions(#[case] input: &str, #[case] branch: Branch) {
+        let result = super::scan_block(wrap_input(input));
+        let (rem, block) = result.unwrap();
+        match block {
+            ScanBlock::ConditionPart(cond, _, _) if cond == branch => {},
+            _ => panic!("no dice")
+        }
+        assert_eq!(*rem, "");
+    }
+    
     // #################
     // Logic/Flow Blocks
     // #################

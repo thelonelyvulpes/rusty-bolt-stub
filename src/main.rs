@@ -19,10 +19,10 @@ use crate::logging::init_logging;
 use crate::parser::ActorScript;
 use anyhow::{anyhow, Context};
 use clap::Parser;
-use log::{debug, LevelFilter};
+use log::{debug, error, LevelFilter};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::ffi::CString;
+use std::ffi::{CString};
 use std::fmt::Display;
 use std::io::Write;
 use std::process::{ExitCode, Termination};
@@ -55,28 +55,41 @@ static PARSED: OnceLock<ActorScript> = OnceLock::new();
 static SERVER_PY: LazyLock<Py<PyDict>> = LazyLock::new(|| {
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
-        py.import("sys")
-            .unwrap()
-            .setattr("stdout", LoggingStdout.into_py(py))
-            .unwrap();
+        let sys = py.import("sys").unwrap();
+        sys.setattr(
+            "stdout",
+            LoggingStdout { err: false }.into_pyobject(py).unwrap(),
+        )
+        .unwrap();
+        sys.setattr(
+            "stderr",
+            LoggingStdout { err: true }.into_pyobject(py).unwrap(),
+        )
+        .unwrap();
         PyDict::new(py).unbind()
     })
 });
 
 #[pyclass]
-struct LoggingStdout;
+struct LoggingStdout {
+    err: bool,
+}
 #[pymethods]
 impl LoggingStdout {
     fn write(&self, data: &str) {
-        print!("{}", data);
+        match self.err {
+            true => eprint!("err {}", data),
+            false => print!("{}", data),
+        }
     }
 }
 
-fn run_python(script_text: &String) -> anyhow::Result<()> {
-    let cstr = CString::new(script_text.clone())?;
+fn run_python(script_text: &str) -> anyhow::Result<()> {
+    let cstr = CString::new(script_text)?;
     let locals = &*SERVER_PY;
-    Python::with_gil(|py| py.run(&cstr, None, Some(locals.bind(py))))
-        .map_err(|error| anyhow!("failed to run python line: {error}"))
+    // ctx, include script text
+    Python::with_gil(|py| py.run(&cstr, Some(locals.bind(py)), None))
+        .map_err(|error| anyhow!("failed to run python line: {error}, {script_text}"))
 }
 
 fn main() -> MainResult {
@@ -124,6 +137,10 @@ fn main_raw_error() -> Result<(), MainError> {
     })?;
 
     PARSED.get_or_init(move || engine);
+
+    for py_line in PARSED.get().unwrap().config.py_lines.iter() {
+        run_python(&py_line)?;
+    }
 
     let mut server = net::Server::new(&args.listen_addr, PARSED.get().unwrap());
     with_exit_code(99, || server.start())?;
