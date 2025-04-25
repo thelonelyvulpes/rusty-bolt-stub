@@ -155,8 +155,6 @@ impl Server {
         let restarts = self.server_script_cfg.config.allow_restart;
         let concurrent = self.server_script_cfg.config.allow_concurrent;
 
-
-
         match conn {
             Ok((conn, addr)) => {
                 for py_line in self.server_script_cfg.config.py_lines.iter() {

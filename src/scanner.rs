@@ -280,10 +280,24 @@ fn scan_block(input: Input) -> IResult<ScanBlock> {
                 "python lines",
                 message_simple_content(Some("PY:"), ScanBlock::Python),
             ),
-            context("IF", message_simple_content(Some("IF:"), |outer, inner| ScanBlock::ConditionPart(Branch::If, outer, Some(inner))),),
-            context("ELIF", message_simple_content(Some("ELIF:"), |outer, inner| ScanBlock::ConditionPart(Branch::ElseIf, outer, Some(inner))),),
-            context("ELSE", message_empty_content(Some("ELSE:"), |outer| ScanBlock::ConditionPart(Branch::Else, outer, None)),),
-            // TODO: Add IF, ELSE and ELIF blocks
+            context(
+                "IF",
+                message_simple_content_with_block(Some("IF:"), |outer, inner, block| {
+                    ScanBlock::ConditionPart(Branch::If, outer, Some(inner), Box::new(block))
+                }),
+            ),
+            context(
+                "ELIF",
+                message_simple_content_with_block(Some("ELIF:"), |outer, inner, block| {
+                    ScanBlock::ConditionPart(Branch::ElseIf, outer, Some(inner), Box::new(block))
+                }),
+            ),
+            context(
+                "ELSE",
+                message_empty_content_with_block(Some("ELSE:"), |outer, block| {
+                    ScanBlock::ConditionPart(Branch::Else, outer, None, Box::new(block))
+                }),
+            ),
             context(
                 "client lines",
                 multi_message(Some("C:"), ScanBlock::ClientMessage),
@@ -459,14 +473,36 @@ fn message_simple_content<'a>(
     mut block: impl FnMut(Context, (Context, String)) -> ScanBlock,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
     map(
-        preceded(
-            multispace0,
-            terminated(
-                consumed(prefixed_line_simple_content(tag)),
-                peek(end_of_line),
-            ),
-        ),
+        message_simple_content_matcher(tag),
         move |(ctx, content)| block(ctx.into(), (content.into(), String::from(*content))),
+    )
+}
+
+fn message_simple_content_matcher<'a>(
+    tag: Option<&'static str>,
+) -> impl FnMut(Input<'a>) -> IResult<'a, (Input<'a>, Input<'a>)> {
+    preceded(
+        multispace0,
+        terminated(
+            consumed(prefixed_line_simple_content(tag)),
+            peek(end_of_line),
+        ),
+    )
+}
+
+fn message_simple_content_with_block<'a>(
+    tag: Option<&'static str>,
+    mut block: impl FnMut(Context, (Context, String), ScanBlock) -> ScanBlock,
+) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
+    map(
+        pair(message_simple_content_matcher(tag), scan_block),
+        move |((ctx, content), subsequent)| {
+            block(
+                ctx.into(),
+                (content.into(), String::from(*content)),
+                subsequent,
+            )
+        },
     )
 }
 
@@ -482,26 +518,29 @@ fn prefixed_line_simple_content<'a>(
     )
 }
 
-fn message_empty_content<'a>(
+fn message_empty_content_with_block<'a>(
     tag: Option<&'static str>,
-    mut block: impl FnMut(Context) -> ScanBlock,
+    mut block: impl FnMut(Context, ScanBlock) -> ScanBlock,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
     map(
-        preceded(
-            multispace0,
-            terminated(
-                recognize(prefixed_line_empty_content(tag)),
-                peek(end_of_line),
+        pair(
+            preceded(
+                multispace0,
+                terminated(
+                    recognize(prefixed_line_empty_content(tag)),
+                    peek(end_of_line),
+                ),
             ),
+            scan_block,
         ),
-        move |ctx| block(ctx.into()),
+        move |(ctx, subsequent_block)| block(ctx.into(), subsequent_block),
     )
 }
 
 fn prefixed_line_empty_content<'a>(
     prefix: Option<&'static str>,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ()> {
-   preceded(
+    preceded(
         cond(
             prefix.is_some(),
             terminated(tag(prefix.unwrap_or_default()), space0),
@@ -752,7 +791,7 @@ mod tests {
 
     use crate::bang_line::BangLine;
     use crate::context::Context;
-    use crate::types::{ScanBlock, Branch};
+    use crate::types::{Branch, ScanBlock};
 
     #[test]
     fn test_scan_minimal_script() {
@@ -1143,7 +1182,7 @@ mod tests {
             )
         );
     }
-    
+
     #[rstest]
     #[case::cond_if("IF: foo == 10", Branch::If)]
     #[case::cond_else_if("ELIF: baz == 20", Branch::ElseIf)]
@@ -1152,12 +1191,12 @@ mod tests {
         let result = super::scan_block(wrap_input(input));
         let (rem, block) = result.unwrap();
         match block {
-            ScanBlock::ConditionPart(cond, _, _) if cond == branch => {},
-            _ => panic!("no dice")
+            ScanBlock::ConditionPart(cond, _, _) if cond == branch => {}
+            _ => panic!("no dice"),
         }
         assert_eq!(*rem, "");
     }
-    
+
     // #################
     // Logic/Flow Blocks
     // #################

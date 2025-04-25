@@ -1,4 +1,5 @@
 use std::cell::LazyCell;
+use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::result::Result as StdResult;
@@ -24,6 +25,7 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
     ServerActionLine, ServerMessageSender,
 };
+use crate::types::Branch;
 use crate::types::{ScanBlock, Script};
 use crate::util::opt_res_ret;
 use crate::values::bolt_message::BoltMessage;
@@ -485,11 +487,17 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
             )?,
         )),
         ScanBlock::Comment(ctx) => Ok(ActorBlock::NoOp(*ctx)),
-        ScanBlock::Python(_, _) => {
-            todo!("Python blocks are not yet supported in the actor")
+        ScanBlock::Python(ctx, (_, py)) => {
+            // python can't be validated, so we just assume it will work, if it errors at run time,
+            // the actor can explain error from ctx
+            Ok(ActorBlock::Python(*ctx, py.clone()))
         }
-        ScanBlock::ConditionPart(_, _, _) => {
-            todo!("Python blocks are not yet supported in the actor")
+        ScanBlock::ConditionPart(branch_type, ctx, condition, body) => {
+            match (branch_type, condition) {
+                (Branch::If, Some(condition)) => Ok(todo!()),
+
+                _ => Err(ParseError::new_ctx(*ctx, "wrong")),
+            }
         }
     }
 }

@@ -23,12 +23,14 @@ pub enum ScanBlock {
     AutoMessage(Context, (Context, String), Option<(Context, String)>),
     Comment(Context),
     Python(Context, (Context, String)),
-    ConditionPart(Branch, Context, Option<(Context, String)>),
+    ConditionPart(Branch, Context, Option<(Context, String)>, Box<ScanBlock>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Branch {
-    If, Else, ElseIf
+    If,
+    Else,
+    ElseIf,
 }
 
 pub mod actor_types {
@@ -112,9 +114,8 @@ pub mod actor_types {
         ClientMessageValidate(Context, Box<dyn ClientMessageValidator>),
         ServerMessageSend(Context, Box<dyn ServerMessageSender>),
         ServerActionLine(Context, Box<dyn ServerActionLine>),
-        // TODO: bring Python in
-        #[allow(dead_code)]
         Python(Context, String),
+        Condition(Context, Option<String>),
         Alt(Context, Vec<ActorBlock>),
         Parallel(Context, Vec<ActorBlock>),
         Optional(Context, Box<ActorBlock>),
@@ -131,6 +132,7 @@ pub mod actor_types {
                 | ActorBlock::ServerMessageSend(ctx, _)
                 | ActorBlock::ServerActionLine(ctx, _)
                 | ActorBlock::Python(ctx, _)
+                | ActorBlock::Condition(ctx, _)
                 | ActorBlock::Alt(ctx, _)
                 | ActorBlock::Parallel(ctx, _)
                 | ActorBlock::Optional(ctx, _)

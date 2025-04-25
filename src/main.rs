@@ -21,8 +21,8 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use log::{debug, error, LevelFilter};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
-use std::ffi::{CString};
+use pyo3::types::{PyBool, PyDict};
+use std::ffi::CString;
 use std::fmt::Display;
 use std::io::Write;
 use std::process::{ExitCode, Termination};
@@ -90,6 +90,14 @@ fn run_python(script_text: &str) -> anyhow::Result<()> {
     // ctx, include script text
     Python::with_gil(|py| py.run(&cstr, Some(locals.bind(py)), None))
         .map_err(|error| anyhow!("failed to run python line: {error}, {script_text}"))
+}
+
+fn condition_python(script_text: &str) -> anyhow::Result<bool> {
+    let cstr = CString::new(script_text)?;
+    let locals = &*SERVER_PY;
+    // ctx, include script text
+    Python::with_gil(|py| py.eval(&cstr, Some(locals.bind(py)), None)?.is_truthy())
+        .map_err(|error: PyErr| anyhow!("failed to evaluate condition: {error}, {script_text}"))
 }
 
 fn main() -> MainResult {
