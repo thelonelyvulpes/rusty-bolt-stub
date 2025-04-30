@@ -25,8 +25,7 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
     ServerActionLine, ServerMessageSender,
 };
-use crate::types::Branch;
-use crate::types::{ScanBlock, Script};
+use crate::types::{Branch, ConditionBlock, ScanBlock, Script};
 use crate::util::opt_res_ret;
 use crate::values::bolt_message::BoltMessage;
 use crate::values::bolt_struct::{
@@ -91,7 +90,8 @@ pub fn contextualize_res<T>(res: Result<T>, script_name: &str, script: &str) -> 
 
 pub fn parse(script: Script) -> Result<ActorScript> {
     let config = parse_config(&script.bang_lines)?;
-    let tree = parse_block(&script.body, &config)?;
+    let (body_ctx, body_blocks) = &script.body;
+    let tree = parse_blocks(*body_ctx, body_blocks, &config)?;
 
     trace!(
         "Parser output\n\
@@ -380,23 +380,24 @@ fn parse_bolt_version(ctx: Context, s: &str) -> Result<((u8, u8), BoltVersion)> 
     }
 }
 
-fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
-    match block {
-        ScanBlock::List(ctx, scan_blocks) => {
-            let mut actor_blocks = condense_actor_blocks(
-                scan_blocks
-                    .iter()
-                    .map(|b| parse_block(b, config))
-                    .collect::<Result<_>>()?,
-            );
-            validate_list_children(&actor_blocks)?;
+fn parse_blocks(ctx: Context, blocks: &[ScanBlock], config: &ActorConfig) -> Result<ActorBlock> {
+    let mut actor_blocks = condense_actor_blocks(
+        blocks
+            .iter()
+            .map(|b| parse_block(b, config)),
+    )?;
+    validate_list_children(&actor_blocks)?;
 
-            match actor_blocks.len() {
-                0 => Ok(ActorBlock::NoOp(*ctx)),
-                1 => Ok(actor_blocks.remove(0)),
-                _ => Ok(ActorBlock::BlockList(*ctx, actor_blocks)),
-            }
-        }
+    match actor_blocks.len() {
+        0 => Ok(ActorBlock::NoOp(ctx)),
+        1 => Ok(actor_blocks.remove(0)),
+        _ => Ok(ActorBlock::BlockList(ctx, actor_blocks)),
+    }
+}
+
+fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<IntermediateActorBlock> {
+    match block {
+        ScanBlock::List(ctx, scan_blocks) => parse_blocks(*ctx, scan_blocks, config).map(Into::into),
         ScanBlock::Alt(ctx, scan_blocks) => {
             let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
             for block in scan_blocks {
@@ -404,7 +405,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 validate_alt_child(&b)?;
                 actor_blocks.push(b);
             }
-            Ok(ActorBlock::Alt(*ctx, actor_blocks))
+            Ok(ActorBlock::Alt(*ctx, actor_blocks).into())
         }
         ScanBlock::Parallel(ctx, scan_blocks) => {
             let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
@@ -494,7 +495,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
         }
         ScanBlock::ConditionPart(branch_type, ctx, condition, body) => {
             match (branch_type, condition) {
-                (Branch::If, Some(condition)) => Ok(todo!()),
+                (Branch::If, Some(condition)) => Ok(ActorBlock::Condition(*ctx, ConditionBlock)),
 
                 _ => Err(ParseError::new_ctx(*ctx, "wrong")),
             }
@@ -502,12 +503,15 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
     }
 }
 
-fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
-    let mut res = Vec::with_capacity(blocks.len());
-    for block in blocks.into_iter() {
+fn condense_actor_blocks(blocks: impl IntoIterator<Item=Result<IntermediateActorBlock>>) -> Result<Vec<ActorBlock>> {
+    let blocks = blocks.into_iter();
+    let mut res = Vec::with_capacity(blocks.size_hint().1.unwrap_or_default());
+    for block in blocks {
+        let block = block?;
         let last = res.last_mut();
         match (block, last) {
             (ActorBlock::NoOp(_), _) => continue,
+            (ActorBlock::Condition())
             (
                 ActorBlock::BlockList(ctx, list),
                 Some(ActorBlock::BlockList(ctx_last, list_last)),
@@ -520,6 +524,27 @@ fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
     }
     res
 }
+
+
+#[derive(Debug)]
+enum IntermediateActorBlock {
+    Finished(ActorBlock),
+    PartialCondition(PartialCondition),
+}
+
+impl From<ActorBlock> for IntermediateActorBlock {
+    fn from(value: ActorBlock) -> Self {
+        IntermediateActorBlock::Finished(value)
+    }
+}
+
+#[derive(Debug)]
+enum PartialCondition {
+    If((Context, String, Box<ActorBlock>)),
+    ElseIf(Vec<(Context, String, Box<ActorBlock>)>),
+    Else(Option<(Context, Box<ActorBlock>)>),
+}
+
 
 #[derive(Debug)]
 pub(crate) struct AutoBangLineHandler {
@@ -1887,6 +1912,8 @@ fn has_deterministic_end(block: &ActorBlock) -> bool {
 fn is_action_block(block: &ActorBlock) -> bool {
     match block {
         ActorBlock::Python(..)
+        // TODO: assuming condition has no side-effects, it might be safe to treat is as non-action block
+        | ActorBlock::Condition(..)
         | ActorBlock::ServerMessageSend(..)
         | ActorBlock::ServerActionLine(..) => true,
         ActorBlock::BlockList(_, blocks) => 'arm: {
@@ -1910,6 +1937,27 @@ fn is_action_block(block: &ActorBlock) -> bool {
         | ActorBlock::NoOp(..) => false,
     }
 }
+
+/*
+
+TODO: how should IFs work? Eager? What when nested inside alt blocks, etc.
+
+S: BAZ
+IF foo
+    S: BAZ2
+    C: FOO
+ELIF bar
+    C: BAR
+    
+{{
+    IF foo
+        C: FOO
+----
+    IF bar
+        C: BAR
+}}
+
+ */
 
 fn validate_non_action(block: &ActorBlock, context: Option<&str>) -> Result<()> {
     if is_action_block(block) {
@@ -1944,6 +1992,7 @@ fn validate_list_children(blocks: &[ActorBlock]) -> Result<()> {
         }
         previous_has_deterministic_end = has_deterministic_end(block);
     }
+    compile_error!("TODO: validate conditionals");
     Ok(())
 }
 

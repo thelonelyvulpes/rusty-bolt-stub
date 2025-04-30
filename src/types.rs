@@ -5,7 +5,7 @@ use crate::context::Context;
 pub struct Script<'a> {
     pub(crate) name: &'a str,
     pub(crate) bang_lines: Vec<BangLine>,
-    pub(crate) body: ScanBlock,
+    pub(crate) body: (Context, Vec<ScanBlock>),
     pub(crate) input: &'a str,
 }
 
@@ -29,8 +29,8 @@ pub enum ScanBlock {
 #[derive(Debug, Eq, PartialEq)]
 pub enum Branch {
     If,
-    Else,
     ElseIf,
+    Else,
 }
 
 pub mod actor_types {
@@ -115,13 +115,20 @@ pub mod actor_types {
         ServerMessageSend(Context, Box<dyn ServerMessageSender>),
         ServerActionLine(Context, Box<dyn ServerActionLine>),
         Python(Context, String),
-        Condition(Context, Option<String>),
+        Condition(Context, ConditionBlock),
         Alt(Context, Vec<ActorBlock>),
         Parallel(Context, Vec<ActorBlock>),
         Optional(Context, Box<ActorBlock>),
         Repeat(Context, Box<ActorBlock>, usize),
         AutoMessage(Context, AutoMessageHandler),
         NoOp(Context),
+    }
+
+    #[derive(Debug)]
+    pub struct ConditionBlock {
+        if_: (Context, String, Box<ActorBlock>),
+        else_if: Vec<(Context, String, Box<ActorBlock>)>,
+        else_: Option<(Context, Box<ActorBlock>)>,
     }
 
     impl ActorBlock {

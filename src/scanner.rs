@@ -53,7 +53,7 @@ pub fn scan_script<'a>(
             anyhow!("Trailing input"),
         )));
     }
-    let body = body.unwrap_or(ScanBlock::List(span.into(), vec![]));
+    let body = body.unwrap_or((span.into(), vec![]));
 
     trace!(
         "Scan output\n\
@@ -223,9 +223,9 @@ fn wrap_block_vec(context: Context, blocks: Vec<ScanBlock>) -> ScanBlock {
     }
 }
 
-fn scan_body(input: Input) -> IResult<ScanBlock> {
+fn scan_body(input: Input) -> IResult<(Context, Vec<ScanBlock>)> {
     let (input, (i, blocks)) = consumed(many1(scan_block))(input)?;
-    Ok((input, ScanBlock::List(i.into(), blocks)))
+    Ok((input, (i.into(), blocks)))
 }
 
 fn scan_block(input: Input) -> IResult<ScanBlock> {
