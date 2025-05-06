@@ -283,19 +283,19 @@ fn scan_block(input: Input) -> IResult<ScanBlock> {
             context(
                 "IF",
                 message_simple_content_with_block(Some("IF:"), |outer, inner, block| {
-                    ScanBlock::ConditionPart(Branch::If, outer, Some(inner), Box::new(block))
+                    ScanBlock::ConditionPart(outer, Branch::If, Some(inner), Box::new(block))
                 }),
             ),
             context(
                 "ELIF",
                 message_simple_content_with_block(Some("ELIF:"), |outer, inner, block| {
-                    ScanBlock::ConditionPart(Branch::ElseIf, outer, Some(inner), Box::new(block))
+                    ScanBlock::ConditionPart(outer, Branch::ElseIf, Some(inner), Box::new(block))
                 }),
             ),
             context(
                 "ELSE",
                 message_empty_content_with_block(Some("ELSE:"), |outer, block| {
-                    ScanBlock::ConditionPart(Branch::Else, outer, None, Box::new(block))
+                    ScanBlock::ConditionPart(outer, Branch::Else, None, Box::new(block))
                 }),
             ),
             context(
@@ -784,6 +784,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 mod tests {
     use indoc::indoc;
     use nom_span::Spanned;
@@ -796,14 +797,14 @@ mod tests {
     #[test]
     fn test_scan_minimal_script() {
         let input = "!: BOLT 5.5\n";
-        let result = dbg!(super::scan_script(input, "test.script".into()));
+        let result = dbg!(super::scan_script(input, "test.script"));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_failing_scan() {
         let input = "!: BOLT 5.4\n\nF: NOPE foo\n";
-        let result = dbg!(super::scan_script(input, "test.script".into()));
+        let result = dbg!(super::scan_script(input, "test.script"));
         assert!(result.is_err());
         println!("{:}", result.unwrap_err());
     }
@@ -926,7 +927,7 @@ mod tests {
         #[values(1, 3)] repetition: usize,
     ) {
         let input = input.repeat(repetition);
-        let result = dbg!(super::scan_script(input.as_str(), "test.script".into()));
+        let result = dbg!(super::scan_script(input.as_str(), "test.script"));
         let result = result.unwrap();
         let start_bytes = expected.ctx().start_byte;
         let end_bytes = expected.ctx().end_byte;
@@ -943,7 +944,7 @@ mod tests {
     #[test]
     fn test_scan_multiple_bangs() {
         let input = "!: BOLT 5.4\n!: AUTO Nonsense\n!: ALLOW RESTART\n";
-        let result = dbg!(super::scan_script(input, "test.script".into()));
+        let result = dbg!(super::scan_script(input, "test.script"));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
         assert_eq!(
@@ -981,7 +982,7 @@ mod tests {
         let base = "!: AUTO Nonsense";
         let input = format!("{base}{ending}");
         let bytes = base.len() + ending.find(char::is_whitespace).unwrap_or(ending.len());
-        let result = dbg!(super::scan_script(&input, "test.script".into()));
+        let result = dbg!(super::scan_script(&input, "test.script"));
         let result = result.unwrap();
         assert_eq!(
             result.bang_lines.first(),
@@ -1184,16 +1185,24 @@ mod tests {
     }
 
     #[rstest]
-    #[case::cond_if("IF: foo == 10", Branch::If)]
-    #[case::cond_else_if("ELIF: baz == 20", Branch::ElseIf)]
-    #[case::cond_else("ELSE:", Branch::Else)]
-    fn test_conditions(#[case] input: &str, #[case] branch: Branch) {
+    #[case::cond_if("IF: foo == 10", Branch::If, Some("foo == 10"))]
+    #[case::cond_else_if("ELIF: baz == 20", Branch::ElseIf, Some("bay == 20"))]
+    #[case::cond_else("ELSE:", Branch::Else, None)]
+    fn test_conditions(
+        #[case] input: &str,
+        #[case] expected_branch: Branch,
+        #[case] expected_condition: Option<&str>,
+    ) {
         let result = super::scan_block(wrap_input(input));
         let (rem, block) = result.unwrap();
-        match block {
-            ScanBlock::ConditionPart(cond, _, _) if cond == branch => {}
-            _ => panic!("no dice"),
-        }
+        let ScanBlock::ConditionPart(_, branch, condition, _) = block else {
+            panic!("Expected ConditionPart, found {block:?}");
+        };
+        assert_eq!(branch, expected_branch);
+        assert_eq!(
+            condition.as_ref().map(|(_, cond)| cond.as_str()),
+            expected_condition
+        );
         assert_eq!(*rem, "");
     }
 
@@ -1359,7 +1368,7 @@ mod tests {
             ?: GOODBYE"#
         };
 
-        dbg!(super::scan_script(input, "test.script".into())).unwrap();
+        dbg!(super::scan_script(input, "test.script")).unwrap();
     }
 
     #[test]

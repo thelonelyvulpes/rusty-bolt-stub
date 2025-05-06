@@ -23,7 +23,7 @@ pub enum ScanBlock {
     AutoMessage(Context, (Context, String), Option<(Context, String)>),
     Comment(Context),
     Python(Context, (Context, String)),
-    ConditionPart(Branch, Context, Option<(Context, String)>, Box<ScanBlock>),
+    ConditionPart(Context, Branch, Option<(Context, String)>, Box<ScanBlock>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -31,6 +31,13 @@ pub enum Branch {
     If,
     ElseIf,
     Else,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum BoolIsh {
+    True,
+    False,
+    Maybe,
 }
 
 pub mod actor_types {
@@ -126,9 +133,9 @@ pub mod actor_types {
 
     #[derive(Debug)]
     pub struct ConditionBlock {
-        if_: (Context, String, Box<ActorBlock>),
-        else_if: Vec<(Context, String, Box<ActorBlock>)>,
-        else_: Option<(Context, Box<ActorBlock>)>,
+        pub if_: (Context, String, Box<ActorBlock>),
+        pub else_if: Vec<(Context, String, Box<ActorBlock>)>,
+        pub else_: Option<(Context, Box<ActorBlock>)>,
     }
 
     impl ActorBlock {

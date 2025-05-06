@@ -80,3 +80,10 @@ macro_rules! info {
     };
 }
 pub(super) use info;
+
+macro_rules! error {
+    ($actor:ident, $($arg:tt)+) => {
+        crate::net_actor::logging::log!(log::Level::Error, $actor, $($arg)+)
+    };
+}
+pub(super) use error;

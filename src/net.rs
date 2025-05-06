@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::net_actor::NetActor;
 use crate::parser::ActorScript;
-use crate::run_python;
 
 pub struct Server {
     address: String,
@@ -157,9 +156,6 @@ impl Server {
 
         match conn {
             Ok((conn, addr)) => {
-                for py_line in self.server_script_cfg.config.py_lines.iter() {
-                    run_python(&py_line)?;
-                }
                 debug!("Server accepted connection from {}", addr);
                 conn.set_nodelay(true)?;
                 let script = self.server_script_cfg;
@@ -203,7 +199,7 @@ fn validate_results(results: &[Result<()>]) -> Result<()> {
         let mut sb = String::with_capacity(1024);
         sb = sb.add(
             format!(
-                "{} errors occurred while shutting down.\n---\n",
+                "{} error(s) occurred while shutting down.\n----\n",
                 errors.len()
             )
             .as_str(),
