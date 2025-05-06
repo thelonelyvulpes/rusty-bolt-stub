@@ -468,7 +468,7 @@ impl<'a> PackStreamDecoder<'a> {
 
         Ok(match marker {
             // tiny int
-            _ if marker as i8 >= -16 => marker.into(),
+            _ if marker as i8 >= -16 => (marker as i8).into(),
             NULL => PackStreamValue::Null,
             FLOAT_64 => self.read_f64()?.into(),
             FALSE => false.into(),
@@ -905,4 +905,23 @@ pub(super) fn write_joined_entries<'e>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::tiny_int_min(&[0xF0], PackStreamValue::Integer(-16))]
+    #[case::tiny_int_m1(&[0xFF], PackStreamValue::Integer(-1))]
+    #[case::tiny_int_0(&[0x00], PackStreamValue::Integer(0))]
+    #[case::tiny_int_p1(&[0x01], PackStreamValue::Integer(1))]
+    #[case::tiny_int_max(&[0x7F], PackStreamValue::Integer(127))]
+    fn decode(#[case] bytes: &[u8], #[case] expected: PackStreamValue) {
+        let mut decoder = PackStreamDecoder::new(bytes, 0);
+        let value = decoder.read().unwrap();
+        assert_eq!(value, expected);
+    }
 }
