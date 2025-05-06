@@ -1223,10 +1223,6 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
             };
 
             build_map_validator(expected, config)?
-            // try to build jolt matcher (incl. Structs like datetime)
-            //   * if has 1 key-value pair
-            //   * && key is known sigil
-            //   * Special string "*" applies: E.g., `C: RUN {"Z": "*"}` will match any integer: `C: RUN 1` and `C: RUN 2`, but not `C: RUN 1.2` or `C: RUN "*"`.
         }
     })
 }
@@ -1353,6 +1349,10 @@ fn build_jolt_validator(
     expected: JsonMap<String, JsonValue>,
     config: &ActorConfig,
 ) -> Result<IsJoltValidator> {
+    // try to build jolt matcher (incl. Structs like datetime)
+    //   * if has 1 key-value pair
+    //   * && key is known sigil
+    //   * Special string "*" applies: E.g., `C: RUN {"Z": "*"}` will match any integer: `C: RUN 1` and `C: RUN 2`, but not `C: RUN 1.2` or `C: RUN "*"`.
     fn is_match_all(value: &JsonValue) -> bool {
         value.as_str().map(|s| s == "*").unwrap_or_default()
     }
@@ -1958,19 +1958,6 @@ fn is_skippable(block: &ActorBlock) -> bool {
         | ActorBlock::ServerActionLine(..)
         | ActorBlock::Python(..)
         | ActorBlock::AutoMessage(..) => false,
-        // ActorBlock::Condition(_, condition_block) => {
-        //     let (_, _, ref if_block) = condition_block.if_;
-        //     is_skippable(if_block)
-        //         || condition_block
-        //             .else_if
-        //             .iter()
-        //             .all(|(_, _, else_if_block)| has_deterministic_end(else_if_block))
-        //         || condition_block
-        //             .else_
-        //             .as_ref()
-        //             .map(|(_, else_block)| has_deterministic_end(else_block))
-        //             .unwrap_or(false)
-
         // For static analysis we consider conditional blocks to be skippable
         // if either they are non-exhaustive or any branch is skippable.
         // At runtime we can be more differentiated.

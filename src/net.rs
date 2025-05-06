@@ -78,7 +78,7 @@ impl Server {
                     }
                     i += 1;
                 }
-                #[allow(unreachable_code)] // needed to disambiguate the return type
+                #[allow(unreachable_code, reason = "needed to disambiguate the return type")]
                 Ok::<(), Error>(())
             }
         };

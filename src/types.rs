@@ -73,47 +73,11 @@ pub mod actor_types {
         AssertOrder(Duration),
     }
 
-    // impl ScriptLine for () {
-    //     fn original_line(&self) -> &str {
-    //         ""
-    //     }
-    // }
-    //
-    // impl ClientMessageValidator for () {
-    //     fn validate(&self, _message: ClientMessage) -> anyhow::Result<()> {
-    //         Ok(())
-    //     }
-    // }
-    //
-    // impl ServerMessageSender for () {
-    //     fn send(&self, _stream: &mut TcpStream) -> anyhow::Result<()> {
-    //         Ok(())
-    //     }
-    // }
-
     #[derive(Debug)]
     pub struct AutoMessageHandler {
         pub(crate) client_validator: Box<dyn ClientMessageValidator>,
         pub(crate) server_sender: Box<dyn ServerMessageSender>,
     }
-
-    // impl ClientMessageValidator for AutoMessageHandler {
-    //     fn validate(&self, message: &BoltMessage) -> anyhow::Result<()> {
-    //         self.client_validator.validate(message)
-    //     }
-    // }
-    //
-    // impl ServerMessageSender for AutoMessageHandler {
-    //     fn send(&self) -> anyhow::Result<&[u8]> {
-    //         self.server_sender.send()
-    //     }
-    // }
-    //
-    // impl ScriptLine for AutoMessageHandler {
-    //     fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
-    //         self.client_validator.line_repr(script)
-    //     }
-    // }
 
     #[derive(Debug)]
     pub enum ActorBlock {

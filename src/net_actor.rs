@@ -1212,43 +1212,6 @@ enum ConditionState<'a> {
     Done,
 }
 
-// impl<'a> ConditionState<'a> {
-//     fn swap_chosen_branch(&mut self, ctx: Context) -> NetActorResult<()> {
-//         let mut tmp_self = ConditionState::Done;
-//         swap(&mut tmp_self, self);
-//         let ConditionState::Init(state) = tmp_self else {
-//             swap(&mut tmp_self, self);
-//             panic!("ConditionState::swap_chosen_branch called on non-init state");
-//         };
-//         match state.chose_branch() {
-//             Ok(BranchChoice::None(state)) => {
-//                 *self = ConditionState::Init(state);
-//             }
-//             Err(e) => {
-//                 swap(&mut tmp_self, self);
-//                 return Err(e);
-//             }
-//         }
-//         *self = ConditionState::Done;
-//         let (_, cond, _) = &self.if_;
-//         if condition_python(cond)? {
-//             let (ctx, _, body) = self.if_;
-//             return Ok(BranchChoice::Some(ctx, body));
-//         }
-//         for i in 0..self.else_if.len() {
-//             let (_, cond, _) = &self.else_if[i];
-//             if condition_python(cond)? {
-//                 let (ctx, _, body) = self.else_if.swap_remove(i);
-//                 return Ok(BranchChoice::Some(ctx, body));
-//             }
-//         }
-//         if let Some((ctx, body)) = self.else_.take() {
-//             return Ok(BranchChoice::Some(ctx, body));
-//         }
-//         Ok(BranchChoice::None(self))
-//     }
-// }
-
 #[derive(Debug, Clone)]
 struct ConditionStateInit<'a> {
     if_: (Context, &'a str, Box<BlockWithState<'a>>),
@@ -1257,24 +1220,6 @@ struct ConditionStateInit<'a> {
 }
 
 impl<'a> ConditionStateInit<'a> {
-    // fn chose_branch(mut self) -> NetActorResult<BranchChoice<'a>> {
-    //     let (_, cond, _) = &self.if_;
-    //     if condition_python(cond)? {
-    //         let (ctx, _, body) = self.if_;
-    //         return Ok(BranchChoice::Some(ctx, body));
-    //     }
-    //     for i in 0..self.else_if.len() {
-    //         let (_, cond, _) = &self.else_if[i];
-    //         if condition_python(cond)? {
-    //             let (ctx, _, body) = self.else_if.swap_remove(i);
-    //             return Ok(BranchChoice::Some(ctx, body));
-    //         }
-    //     }
-    //     if let Some((ctx, body)) = self.else_.take() {
-    //         return Ok(BranchChoice::Some(ctx, body));
-    //     }
-    //     Ok(BranchChoice::None(self))
-    // }
     fn choose_branch(
         &self,
         script: &Script,
