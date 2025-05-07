@@ -879,6 +879,10 @@ fn create_server_action(
             check_server_action_no_body(action_name, message_body)?;
             ServerAction::Exit
         }
+        "SHUTDOWN" => {
+            check_server_action_no_body(action_name, message_body)?;
+            ServerAction::Shutdown
+        }
         "NOOP" => {
             check_server_action_no_body(action_name, message_body)?;
             ServerAction::Noop

@@ -68,6 +68,7 @@ pub mod actor_types {
     #[derive(Debug, Clone)]
     pub enum ServerAction {
         Exit,
+        Shutdown,
         Noop,
         Raw(Vec<u8>),
         Sleep(Duration),

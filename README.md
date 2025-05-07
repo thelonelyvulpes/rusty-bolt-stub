@@ -5,7 +5,6 @@ Todos:
 - WebSocket support for JS testing
 - Pretty errors using `codespan-reporting`.
 - Write tests
-- When `!: ALLOW CONCURRENT`/`!: ALLOW RESTART`, `S: <EXIT>` should only kill the current connection
 - Fix connection id auto response not incrementing (maybe `!: ALLOW CONCURRENT` is required to reproduce?)
 
 notes:

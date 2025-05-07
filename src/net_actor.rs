@@ -35,6 +35,7 @@ type NetActorResult<T> = Result<T, NetActorError>;
 enum NetActorError {
     Anyhow(anyhow::Error),
     Cancellation(String),
+    Exit,
 }
 
 impl Display for NetActorError {
@@ -42,6 +43,7 @@ impl Display for NetActorError {
         match self {
             NetActorError::Anyhow(err) => err.fmt(f),
             NetActorError::Cancellation(reason) => reason.fmt(f),
+            NetActorError::Exit => write!(f, "<EXIT> signal"),
         }
     }
 }
@@ -137,6 +139,13 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
         let mut block = BlockWithState::new(&self.script.tree);
         match self.run_block(&mut block).await {
+            Err(NetActorError::Exit) => {
+                debug!(
+                    self,
+                    "Handling NetActorError::Exit (<EXIT>): done playing script"
+                );
+                Ok(())
+            }
             Err(err) if block.can_skip() => {
                 debug!(
                     self,
@@ -858,6 +867,10 @@ impl<'a, C: Connection> NetActor<'a, C> {
         info!(self, "{}", self.fmt_server_action_line(action));
         match action.get_action() {
             ServerAction::Exit => {
+                trace!(self, "¡Hasta la vista ✌️! Closing the connection.");
+                Err(NetActorError::Exit)
+            }
+            ServerAction::Shutdown => {
                 trace!(
                     self,
                     "It was an honor, captain 🫡! \
