@@ -22,8 +22,8 @@ impl Display for Context {
 }
 
 impl ScriptLine for Context {
-    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
-        self.original_line(script)
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> Option<&'c str> {
+        Some(self.original_line(script))
     }
 
     fn line_number(&self) -> Option<usize> {

@@ -3,10 +3,10 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::atomic::AtomicI64;
 
+use crate::types::Resolvable;
+use crate::values::pack_stream_value::PackStreamValue;
 use indexmap::{indexmap, IndexMap};
 use itertools::{EitherOrBoth, Itertools};
-
-use crate::values::pack_stream_value::PackStreamValue;
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
 pub enum BoltVersion {
@@ -249,7 +249,7 @@ impl BoltVersion {
         })
     }
 
-    pub fn message_auto_response(&self, tag: u8) -> Option<(u8, Vec<PackStreamValue>)> {
+    pub fn message_auto_response(&self, tag: u8) -> Option<Resolvable<(u8, Vec<PackStreamValue>)>> {
         const SUCCESS_TAG: u8 = 0x70;
         let success_meta = match tag {
             0x01 => {
@@ -259,15 +259,11 @@ impl BoltVersion {
                     String::from("server"),
                     PackStreamValue::String(String::from(self.server_agent())),
                 );
-                if self >= &BoltVersion::V3 {
-                    static CONNECTION_ID: AtomicI64 = AtomicI64::new(1);
-                    let connection_id =
-                        CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    assert_ne!(connection_id, 0, "Connection ID overflowed");
-                    success_map.insert(
-                        String::from("connection_id"),
-                        PackStreamValue::String(format!("bolt-{connection_id}")),
-                    );
+                if self < &BoltVersion::V3 {
+                    return Some(Resolvable::Static((
+                        SUCCESS_TAG,
+                        vec![PackStreamValue::Dict(success_map)],
+                    )));
                 }
                 if self >= &BoltVersion::V5_7 {
                     success_map.insert(
@@ -283,11 +279,28 @@ impl BoltVersion {
                         ),
                     );
                 }
-                success_map
+                return Some(Resolvable::Dynamic {
+                    func: Box::new(move || {
+                        let mut success_map = success_map.clone();
+                        static CONNECTION_ID: AtomicI64 = AtomicI64::new(1);
+                        let connection_id =
+                            CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        assert_ne!(connection_id, 0, "Connection ID overflowed");
+                        success_map.insert(
+                            String::from("connection_id"),
+                            PackStreamValue::String(format!("bolt-{connection_id}")),
+                        );
+                        (SUCCESS_TAG, vec![PackStreamValue::Dict(success_map)])
+                    }),
+                    repr: format!("Auto-HELLO-SUCCESS @{}:{}", file!(), line!()),
+                });
             }
             _ => Default::default(),
         };
-        Some((SUCCESS_TAG, vec![PackStreamValue::Dict(success_meta)]))
+        Some(Resolvable::Static((
+            SUCCESS_TAG,
+            vec![PackStreamValue::Dict(success_meta)],
+        )))
     }
 
     fn server_agent(&self) -> &'static str {

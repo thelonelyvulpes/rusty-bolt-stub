@@ -1,6 +1,7 @@
 mod handshake;
 mod logging;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -625,7 +626,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 format!("({line_number:4}) !: AUTO {line}")
             })
             .chain(possible_verifiers.iter().map(|v| {
-                let line = v.line_repr(self.script.script.input);
+                let line = v.line_repr(self.script.script.input).unwrap_or("???");
                 match v.line_number() {
                     None => format!("(   ?) C: {line}"),
                     Some(line_number) => format!("({line_number:4}) C: {line}"),
@@ -754,6 +755,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
     }
 
     async fn read_message(&mut self, line: &dyn ScriptLine) -> anyhow::Result<BoltMessage> {
+        trace!(self, "read_message: {line:?}");
         if let Some(peeked) = self.peeked_message.take() {
             info!(self, "{}", self.fmt_reader_message(&peeked, line));
             return Ok(peeked);
@@ -811,13 +813,15 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
 
         trace!(logging_ctx, "Read message: {}", fmt_bytes(&message_buffer));
-        parse_message(message_buffer, bolt_version)
+        parse_message(&message_buffer, bolt_version)
     }
 
     async fn write_message(&mut self, sender: &dyn ServerMessageSender) -> NetActorResult<()> {
-        info!(self, "{}", self.fmt_sender_message(sender));
-        let mut data = sender.send()?;
-        trace!(self, "Writing message: {}", fmt_bytes(data));
+        trace!(self, "write_message: {:?}", sender);
+        let full_data = sender.send()?;
+        info!(self, "{}", self.fmt_sender_message(sender, &full_data));
+        trace!(self, "Writing message: {}", fmt_bytes(&full_data));
+        let mut data: &[u8] = &full_data;
         while !data.is_empty() {
             let chunk_size = data.len().min(0xFFFF);
             cancelable_io(
@@ -855,8 +859,16 @@ impl<'a, C: Connection> NetActor<'a, C> {
         Ok(())
     }
 
-    fn fmt_sender_message(&self, sender: &dyn ServerMessageSender) -> String {
-        let line = sender.line_repr(self.script.script.input);
+    fn fmt_sender_message(&self, sender: &dyn ServerMessageSender, data: &[u8]) -> String {
+        let line = sender
+            .line_repr(self.script.script.input)
+            .map(Cow::Borrowed)
+            .unwrap_or_else(
+                || match parse_message(data, self.script.config.bolt_version) {
+                    Ok(message) => message.repr().into(),
+                    Err(e) => format!("??? ({e:#?})").into(),
+                },
+            );
         match sender.line_number() {
             None => format!("(AUTO) S: {line}"),
             Some(line_number) => format!("({line_number:4}) S: {line}"),
@@ -864,6 +876,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
     }
 
     async fn server_action_line(&mut self, action: &dyn ServerActionLine) -> NetActorResult<()> {
+        trace!(self, "server_action: {:?}", action);
         info!(self, "{}", self.fmt_server_action_line(action));
         match action.get_action() {
             ServerAction::Exit => {
@@ -954,7 +967,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
     }
 
     fn fmt_server_action_line(&self, action: &dyn ServerActionLine) -> String {
-        let line = action.line_repr(self.script.script.input);
+        let line = action.line_repr(self.script.script.input).unwrap_or("???");
         match action.line_number() {
             None => format!("(   ?) S: {line}"),
             Some(line_number) => format!("({line_number:4}) S: {line}"),
@@ -1151,14 +1164,14 @@ impl<'a> BlockWithState<'a> {
     }
 }
 
-fn parse_message(data: Vec<u8>, bolt_version: BoltVersion) -> NetActorResult<BoltMessage> {
+fn parse_message(data: &[u8], bolt_version: BoltVersion) -> NetActorResult<BoltMessage> {
     if data.len() <= 1 {
         return Err(NetActorError::Anyhow(anyhow!(
             "Message too short, less than or one byte was received."
         )));
     }
 
-    let value = values::pack_stream_value::PackStreamValue::from_data_consume_all(&data)
+    let value = values::pack_stream_value::PackStreamValue::from_data_consume_all(data)
         .context("Parsing bolt message")?;
     let values::pack_stream_value::PackStreamValue::Struct(PackStreamStruct { tag, fields }) =
         value
@@ -1221,9 +1234,10 @@ mod tests {
         }
 
         impl ScriptLine for TestValidator {
-            fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, _script: &'a str) -> &'c str {
-                ""
+            fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, _script: &'a str) -> Option<&'c str> {
+                Some("")
             }
+
             fn line_number(&self) -> Option<usize> {
                 None
             }

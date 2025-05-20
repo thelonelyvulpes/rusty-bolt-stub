@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::LazyCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
@@ -24,7 +25,7 @@ use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
     ServerActionLine, ServerMessageSender,
 };
-use crate::types::{ScanBlock, Script};
+use crate::types::{Resolvable, ScanBlock, Script};
 use crate::util::opt_res_ret;
 use crate::values::bolt_message::BoltMessage;
 use crate::values::bolt_struct::{
@@ -271,8 +272,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                         ),
                     ));
                 };
-                let Some((response_tag, response_fields)) =
-                    bolt_version.message_auto_response(request_tag)
+                let Some(response_resolver) = bolt_version.message_auto_response(request_tag)
                 else {
                     return Err(ParseError::new_ctx(
                         *ctx,
@@ -281,17 +281,13 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                         ),
                     ));
                 };
-                let response_message =
-                    BoltMessage::new(response_tag, response_fields, bolt_version);
-                let response_repr = response_message.repr();
-                let response_data = response_message.into_data();
                 Ok((
                     request_tag,
                     AutoBangLineHandler {
                         ctx: *ctx_msg,
-                        sender: Box::new(SenderBytes::new(
-                            response_data,
-                            SenderBytesLine::Repr(response_repr),
+                        sender: Box::new(SenderBytes::new_auto_response(
+                            response_resolver,
+                            bolt_version,
                         )),
                     },
                 ))
@@ -532,7 +528,7 @@ fn create_auto_message_handler(
         .bolt_version
         .message_tag_from_request(client_message_name)
         .expect("checked in create_validator");
-    let (server_message_tag, server_message_fields) = config
+    let response_resolver = config
         .bolt_version
         .message_auto_response(client_message_tag)
         .ok_or_else(|| {
@@ -541,14 +537,10 @@ fn create_auto_message_handler(
                 config.bolt_version,
             ))
         })?;
-    let message = BoltMessage::new(
-        server_message_tag,
-        server_message_fields,
+    let server_sender = Box::new(SenderBytes::new_auto_response(
+        response_resolver,
         config.bolt_version,
-    );
-    let repr = message.repr();
-    let data = message.into_data();
-    let server_sender = Box::new(SenderBytes::new(data, SenderBytesLine::Repr(repr)));
+    ));
     Ok(AutoMessageHandler {
         client_validator,
         server_sender,
@@ -589,16 +581,25 @@ fn create_message_sender(
     )))
 }
 
-struct SenderBytes {
-    pub data: Vec<u8>,
-    pub line: SenderBytesLine,
+enum SenderBytes {
+    Static {
+        data: Vec<u8>,
+        line: SenderBytesLine,
+    },
+    Dynamic {
+        data: Box<dyn Fn() -> (u8, Vec<PackStreamValue>) + Send + Sync>,
+        repr: String,
+        bolt_version: BoltVersion,
+    },
 }
 
 #[derive(Debug)]
 enum SenderBytesLine {
     Ctx {
         ctx: Context,
+        #[allow(dead_code, reason = "Very useful in Debug representation")]
         message_name: String,
+        #[allow(dead_code, reason = "Very useful in Debug representation")]
         message_body: Option<String>,
     },
     Repr(String),
@@ -606,46 +607,87 @@ enum SenderBytesLine {
 
 impl SenderBytes {
     pub fn new(data: Vec<u8>, line: SenderBytesLine) -> Self {
-        Self { data, line }
+        Self::Static { data, line }
+    }
+
+    pub fn new_auto_response(
+        resolver: Resolvable<(u8, Vec<PackStreamValue>)>,
+        bolt_version: BoltVersion,
+    ) -> Self {
+        match resolver {
+            Resolvable::Static((tag, fields)) => {
+                let response_message = BoltMessage::new(tag, fields, bolt_version);
+                let response_repr = response_message.repr();
+                let response_data = response_message.into_data();
+                Self::new(response_data, SenderBytesLine::Repr(response_repr))
+            }
+            Resolvable::Dynamic { func, repr } => Self::Dynamic {
+                data: func,
+                repr,
+                bolt_version,
+            },
+        }
     }
 }
 
 impl ScriptLine for SenderBytes {
-    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
-        match &self.line {
-            SenderBytesLine::Ctx { ctx, .. } => ctx.original_line(script),
-            SenderBytesLine::Repr(repr) => repr,
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> Option<&'c str> {
+        match self {
+            Self::Static { line, .. } => Some(match line {
+                SenderBytesLine::Ctx { ctx, .. } => ctx.original_line(script),
+                SenderBytesLine::Repr(repr) => repr,
+            }),
+            Self::Dynamic { .. } => None,
         }
     }
+
     fn line_number(&self) -> Option<usize> {
-        match &self.line {
-            SenderBytesLine::Ctx { ctx, .. } => Some(ctx.start_line_number),
-            SenderBytesLine::Repr(_) => None,
+        match self {
+            Self::Static {
+                line: SenderBytesLine::Ctx { ctx, .. },
+                ..
+            } => Some(ctx.start_line_number),
+            Self::Static { .. } | Self::Dynamic { .. } => None,
         }
     }
 }
 
 impl Debug for SenderBytes {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self.line {
-            SenderBytesLine::Ctx {
-                message_name,
-                message_body,
-                ..
-            } => match message_body {
-                None => write!(f, "{message_name}"),
-                Some(body) => write!(f, "{message_name} {body}"),
-            },
-            SenderBytesLine::Repr(repr) => {
-                write!(f, "SenderBytes {repr:?}")
-            }
+        match self {
+            Self::Static { data, line } => f
+                .debug_struct("SenderBytes::Static")
+                .field("data", data)
+                .field("line", line)
+                .finish(),
+            Self::Dynamic {
+                repr,
+                bolt_version,
+                data: _,
+            } => f
+                .debug_struct("SenderBytes::Dynamic")
+                .field("data", &"...")
+                .field("repr", repr)
+                .field("bolt_version", bolt_version)
+                .finish(),
         }
     }
 }
 
 impl ServerMessageSender for SenderBytes {
-    fn send(&self) -> anyhow::Result<&[u8]> {
-        Ok(&self.data)
+    fn send(&self) -> anyhow::Result<Cow<[u8]>> {
+        Ok(match self {
+            SenderBytes::Static { data, line: _ } => data.into(),
+            SenderBytes::Dynamic {
+                data,
+                repr: _,
+                bolt_version,
+            } => {
+                let (tag, fields) = data();
+                let message = BoltMessage::new(tag, fields, *bolt_version);
+                message.into_data().into()
+            }
+        })
     }
 }
 
@@ -916,8 +958,8 @@ struct ParsedServerAction {
 }
 
 impl ScriptLine for ParsedServerAction {
-    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
-        self.ctx.original_line(script)
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> Option<&'c str> {
+        Some(self.ctx.original_line(script))
     }
 
     fn line_number(&self) -> Option<usize> {
@@ -994,9 +1036,10 @@ impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> Debug for Validato
 }
 
 impl<T: Fn(&BoltMessage) -> anyhow::Result<()> + Send + Sync> ScriptLine for ValidatorImpl<T> {
-    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
-        self.ctx.original_line(script)
+    fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> Option<&'c str> {
+        Some(self.ctx.original_line(script))
     }
+
     fn line_number(&self) -> Option<usize> {
         Some(self.ctx.start_line_number)
     }

@@ -5,7 +5,6 @@ Todos:
 - WebSocket support for JS testing
 - Pretty errors using `codespan-reporting`.
 - Write tests
-- Fix connection id auto response not incrementing (maybe `!: ALLOW CONCURRENT` is required to reproduce?)
 
 notes:
 - master vim.

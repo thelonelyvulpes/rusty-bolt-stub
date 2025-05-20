@@ -1,5 +1,7 @@
 use crate::bang_line::BangLine;
 use crate::context::Context;
+use std::borrow::Cow;
+use std::fmt::Debug;
 
 #[derive(Debug)]
 pub struct Script<'a> {
@@ -41,7 +43,35 @@ pub struct ConditionBranch {
     body: ScanBlock,
 }
 
+pub enum Resolvable<T> {
+    Static(T),
+    Dynamic {
+        func: Box<dyn Fn() -> T + Send + Sync>,
+        repr: String,
+    },
+}
+
+impl<T: ToOwned<Owned = T>> Resolvable<T> {
+    #[allow(dead_code, reason = "Most useful function")]
+    pub fn resolve(&self) -> Cow<T> {
+        match self {
+            Self::Static(t) => Cow::Borrowed(t),
+            Self::Dynamic { func, .. } => Cow::Owned(func()),
+        }
+    }
+}
+
+impl<T: Debug> Debug for Resolvable<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(t) => write!(f, "{t:?}"),
+            Self::Dynamic { repr, .. } => write!(f, "{repr}"),
+        }
+    }
+}
+
 pub mod actor_types {
+    use std::borrow::Cow;
     use std::fmt::Debug;
     use std::time::Duration;
 
@@ -49,7 +79,7 @@ pub mod actor_types {
     use crate::values::bolt_message::BoltMessage;
 
     pub trait ScriptLine: Debug + Send + Sync {
-        fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str;
+        fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> Option<&'c str>;
         fn line_number(&self) -> Option<usize>;
     }
 
@@ -58,7 +88,7 @@ pub mod actor_types {
     }
 
     pub trait ServerMessageSender: ScriptLine + Send {
-        fn send(&self) -> anyhow::Result<&[u8]>;
+        fn send(&self) -> anyhow::Result<Cow<[u8]>>;
     }
 
     pub trait ServerActionLine: ScriptLine + Send {
