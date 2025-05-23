@@ -233,7 +233,7 @@ impl<C: Connection> NetActor<'_, C> {
         let capabilities = self.script.config.bolt_capabilities.raw();
         info!(
             self,
-            "S: <HANDSHAKE> 0x0000FF01 [{}] {} {}",
+            "S: <HANDSHAKE> 0x000001FF [{}] {} {}",
             versions.len(),
             versions
                 .iter()
