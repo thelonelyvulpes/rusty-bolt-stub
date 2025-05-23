@@ -271,14 +271,38 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     Ok(true)
                 }
             },
-            BlockWithState::Condition(state, _) => match state {
-                ConditionState::Init(_) => {
-                    panic!("Should've called server_action before {block:?}")
+            BlockWithState::Condition(state, ctx) => match state {
+                ConditionState::Init(init_state) => {
+                    match init_state.choose_branch(&self.script.script)? {
+                        None => {
+                            debug!(
+                                self,
+                                "conditional block ({ctx}) no branch is True: moving to Done"
+                            );
+                            *state = ConditionState::Done;
+                            Ok(false)
+                        }
+                        Some((ctx_b, body)) => {
+                            debug!(
+                            self,
+                            "conditional block ({ctx}) chose branch ({ctx_b}): moving to Chosen"
+                        );
+                            let mut body = Box::new(body.clone());
+                            let res = Box::pin(self.try_consume(&mut body)).await;
+                            if body.done() {
+                                debug!(self, "conditional body ({ctx_b}) done: moving to Done");
+                                *state = ConditionState::Done
+                            } else {
+                                *state = ConditionState::Chosen(ctx_b, body);
+                            }
+                            res
+                        }
+                    }
                 }
-                ConditionState::Chosen(ctx_body, body) => {
-                    let res = Box::pin(self.try_consume(body)).await;
-                    if body.done() {
-                        debug!(self, "conditional body ({ctx_body}) done: moving to Done");
+                ConditionState::Chosen(ctx, b) => {
+                    let res = Box::pin(self.try_consume(b)).await;
+                    if b.done() {
+                        debug!(self, "conditional body ({ctx}) done: moving to Done");
                         *state = ConditionState::Done
                     }
                     res
@@ -384,7 +408,11 @@ impl<'a, C: Connection> NetActor<'a, C> {
                         self.script.config.bolt_version,
                     )
                     .await?;
-                    match Self::can_consume(state.initial_state.as_ref(), peeked_message) {
+                    match Self::can_consume(
+                        state.initial_state.as_ref(),
+                        peeked_message,
+                        &self.script.script,
+                    )? {
                         true => {
                             *block = state.initial_state.clone();
                             state.count += 1;
@@ -530,11 +558,12 @@ impl<'a, C: Connection> NetActor<'a, C> {
                             *state = ConditionState::Done;
                             Ok(())
                         }
-                        Some((ctx_b, mut body)) => {
+                        Some((ctx_b, body)) => {
                             debug!(
                             self,
                             "conditional block ({ctx}) chose branch ({ctx_b}): moving to Chosen"
                         );
+                            let mut body = Box::new(body.clone());
                             let res = Box::pin(self.server_action(&mut body)).await;
                             if body.done() {
                                 debug!(self, "conditional body ({ctx_b}) done: moving to Done");
@@ -634,8 +663,8 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 // repeat block children cannot start with an action block
                 false => Ok(()),
             },
-            BlockWithState::AutoMessage(..)
-            | BlockWithState::ClientMessageValidate(..)
+            BlockWithState::ClientMessageValidate(..)
+            | BlockWithState::AutoMessage(..)
             | BlockWithState::NoOp(..) => Ok(()),
         }
     }
@@ -800,49 +829,65 @@ impl<'a, C: Connection> NetActor<'a, C> {
 
     /// # Returns
     /// bool indicating the message can be consumed `true` or there was a script mismatch `false`
-    fn can_consume(block: &BlockWithState<'_>, message: &BoltMessage) -> bool {
+    fn can_consume(
+        block: &BlockWithState<'_>,
+        message: &BoltMessage,
+        script: &Script,
+    ) -> NetActorResult<bool> {
         match block {
             BlockWithState::BlockList(state, _, blocks) => {
                 for block in blocks.iter().skip(state.current_block) {
-                    if Self::can_consume(block, message) {
-                        return true;
+                    if Self::can_consume(block, message, script)? {
+                        return Ok(true);
                     }
                     if !block.can_skip() {
                         break;
                     }
                 }
-                false
+                Ok(false)
             }
             BlockWithState::ClientMessageValidate(state, _, validator) => {
-                !state.done && validator.validate(message).is_ok()
+                Ok(!state.done && validator.validate(message).is_ok())
             }
             BlockWithState::Condition(state, _) => match state {
-                ConditionState::Init(_) => {
-                    panic!("Should've called server_action before: {block:?}")
-                }
-                ConditionState::Chosen(_, block) => Self::can_consume(block, message),
-                ConditionState::Done => false,
+                ConditionState::Init(state) => match state.choose_branch(script)? {
+                    None => Ok(false),
+                    Some((_, block)) => Self::can_consume(&block, message, script),
+                },
+                ConditionState::Chosen(_, block) => Self::can_consume(block, message, script),
+                ConditionState::Done => Ok(false),
             },
             BlockWithState::Alt(state, _, child_blocks) => match state {
-                BranchState::Init => child_blocks.iter().any(|b| Self::can_consume(b, message)),
-                BranchState::InBlock(i) => Self::can_consume(&child_blocks[*i], message),
-                BranchState::Done => false,
+                BranchState::Init => child_blocks
+                    .iter()
+                    .map(|b| Self::can_consume(b, message, script))
+                    .skip_while(|res| matches!(res, Ok(false)))
+                    .next()
+                    .unwrap_or(Ok(false)),
+                BranchState::InBlock(i) => Self::can_consume(&child_blocks[*i], message, script),
+                BranchState::Done => Ok(false),
             },
-            BlockWithState::Parallel(state, _, blocks) => {
-                !state.done && blocks.iter().any(|b| Self::can_consume(b, message))
-            }
+            BlockWithState::Parallel(state, _, blocks) => Ok(!state.done
+                && blocks
+                    .iter()
+                    .map(|b| Self::can_consume(b, message, script))
+                    .skip_while(|res| matches!(res, Ok(false)))
+                    .next()
+                    .unwrap_or(Ok(false))?),
             BlockWithState::Optional(state, _, block) => match state {
-                OptionalState::Init | OptionalState::Started => Self::can_consume(block, message),
-                OptionalState::Done => false,
+                OptionalState::Init | OptionalState::Started => {
+                    Self::can_consume(block, message, script)
+                }
+                OptionalState::Done => Ok(false),
             },
             BlockWithState::Repeat(state, _, block, _) => {
-                Self::can_consume(block, message)
+                Ok(Self::can_consume(block, message, script)?
                     || (state.in_block
                         && block.can_skip()
-                        && Self::can_consume(&state.initial_state, message))
+                        && Self::can_consume(&state.initial_state, message, script)?))
             }
             BlockWithState::AutoMessage(state, _, handler) => {
-                !state.done && handler.client_validator.validate(message).is_ok()
+                Ok(!state.done && handler.client_validator.validate(message).is_ok())
             }
             BlockWithState::ServerMessageSend(..)
             | BlockWithState::ServerActionLine(..)
@@ -1113,6 +1158,7 @@ match block {
     BlockWithState::ClientMessageValidate(state, ctx, validator) => {},
     BlockWithState::ServerMessageSend(state, ctx, sender) => {},
     BlockWithState::Python(state, ctx, command) => {},
+    BlockWithState::Condition(state, ctx) => {},
     BlockWithState::Alt(state, ctx, blocks) => {},
     BlockWithState::Parallel(state, ctx, blocks) => {},
     BlockWithState::Optional(state, ctx, block) => {},
@@ -1147,7 +1193,7 @@ impl BlockWithState<'_> {
                             logging_ctx,
                             "conditional block ({ctx}) chose branch ({ctx_b}): moving to Chosen"
                         );
-                            ConditionState::Chosen(ctx_b, body)
+                            ConditionState::Chosen(ctx_b, Box::new(body.clone()))
                         }
                         None => {
                             debug!(
@@ -1246,21 +1292,21 @@ struct ConditionStateInit<'a> {
 }
 
 impl<'a> ConditionStateInit<'a> {
-    fn choose_branch(
-        &self,
+    fn choose_branch<'b>(
+        &'b self,
         script: &Script,
-    ) -> NetActorResult<Option<(Context, Box<BlockWithState<'a>>)>> {
+    ) -> NetActorResult<Option<(Context, &'b BlockWithState<'a>)>> {
         let (ctx, cond, body) = &self.if_;
         if condition_python(*ctx, cond, script)? {
-            return Ok(Some((*ctx, body.clone())));
+            return Ok(Some((*ctx, body)));
         }
         for (ctx, cond, body) in self.else_if.iter() {
             if condition_python(*ctx, cond, script)? {
-                return Ok(Some((*ctx, body.clone())));
+                return Ok(Some((*ctx, body)));
             }
         }
         if let Some((ctx, body)) = self.else_.as_ref() {
-            return Ok(Some((*ctx, body.clone())));
+            return Ok(Some((*ctx, body)));
         }
         Ok(None)
     }
@@ -1522,8 +1568,26 @@ mod tests {
             }
         }
 
+        fn make_script() -> Script<'static> {
+            Script {
+                name: "test",
+                bang_lines: vec![],
+                body: (
+                    Context {
+                        start_line_number: 0,
+                        end_line_number: 0,
+                        start_byte: 0,
+                        end_byte: 0,
+                    },
+                    vec![],
+                ),
+                input: "test",
+            }
+        }
+
         #[test]
         fn should_ok() {
+            let script = make_script();
             let test_block = ActorBlock::Alt(
                 make_ctx(0, 1),
                 vec![ActorBlock::BlockList(
@@ -1537,12 +1601,14 @@ mod tests {
 
             let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message, &script);
+            let res = res.unwrap();
             assert!(res);
         }
 
         #[test]
         fn should_fail() {
+            let script = make_script();
             let test_block = ActorBlock::Alt(
                 make_ctx(0, 1),
                 vec![ActorBlock::BlockList(
@@ -1556,12 +1622,14 @@ mod tests {
 
             let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message, &script);
+            let res = res.unwrap();
             assert!(!res);
         }
 
         #[test]
         fn nested_pass() {
+            let script = make_script();
             let test_block = ActorBlock::Alt(
                 make_ctx(0, 1),
                 vec![
@@ -1599,12 +1667,14 @@ mod tests {
 
             let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message, &script);
+            let res = res.unwrap();
             assert!(res);
         }
 
         #[test]
         fn nested_failure() {
+            let script = make_script();
             let test_block = ActorBlock::Alt(
                 make_ctx(0, 1),
                 vec![
@@ -1642,7 +1712,8 @@ mod tests {
 
             let test_block_stateful = BlockWithState::new(&test_block);
             let message = BoltMessage::new(0, vec![], BoltVersion::V4_4);
-            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message);
+            let res = NetActor::<TcpStream>::can_consume(&test_block_stateful, &message, &script);
+            let res = res.unwrap();
             assert!(!res);
         }
     }
