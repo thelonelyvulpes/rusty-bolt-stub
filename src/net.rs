@@ -18,8 +18,14 @@ use crate::parser::ActorScript;
 pub struct Server {
     address: String,
     server_script_cfg: &'static ActorScript<'static>,
-    ever_acted: bool,
+    ever_acted: Arc<atomic::AtomicBool>,
     shutting_down: Arc<atomic::AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TakeNewConnection {
+    Yes,
+    No,
 }
 
 impl Server {
@@ -96,13 +102,12 @@ impl Server {
             }
         }?;
 
-        self.ever_acted = !set.is_empty();
         let r = set.join_all().await;
         validate_results(&r)
     }
 
     pub(crate) fn ever_acted(&self) -> bool {
-        self.ever_acted
+        self.ever_acted.load(atomic::Ordering::SeqCst)
     }
 
     fn exit_signal() -> Result<impl Future<Output = Option<()>>> {
@@ -134,12 +139,25 @@ impl Server {
     ) -> Result<()> {
         loop {
             let ct_connection = ct.clone();
-            select! {
+            let result = select! {
                 conn = listener.accept() => {
-                    self.handle_connection(conn, ct_connection,handles).await?;
+                    self.handle_connection(conn, ct_connection,handles).await
                 },
                 _ = ct.cancelled() => {
-                    return Err(anyhow!("Shutdown while awaiting new connection"));
+                    Err(anyhow!("Shutdown while awaiting new connection"))
+                }
+            };
+            match result {
+                Ok(TakeNewConnection::No) => {
+                    debug!("Server stops listening after connection handler completed");
+                    return Ok(());
+                }
+                Ok(TakeNewConnection::Yes) => {
+                    debug!("Server continues listening for new connections");
+                }
+                Err(e) => {
+                    debug!("Server stops listening after error: {e}");
+                    return Err(e);
                 }
             }
         }
@@ -150,32 +168,42 @@ impl Server {
         conn: io::Result<(TcpStream, SocketAddr)>,
         ct: CancellationToken,
         handles: &mut JoinSet<Result<()>>,
-    ) -> Result<()> {
+    ) -> Result<TakeNewConnection> {
         let restarts = self.server_script_cfg.config.allow_restart;
         let concurrent = self.server_script_cfg.config.allow_concurrent;
 
         match conn {
             Ok((conn, addr)) => {
                 debug!("Server accepted connection from {}", addr);
+                self.ever_acted.store(true, atomic::Ordering::SeqCst);
                 conn.set_nodelay(true)?;
                 let script = self.server_script_cfg;
                 let shutting_down = Arc::clone(&self.shutting_down);
                 let mut actor = NetActor::new(ct.child_token(), shutting_down, conn, script);
-                handles.spawn(async move {
-                    let res = actor.run_client_connection().await;
-                    if res.is_err() {
-                        debug!("Error on connection {addr}, cancelling other workers: {res:?}");
-                        ct.cancel();
+                let handler = {
+                    let ct = ct.clone();
+                    async move {
+                        let res = actor.run_client_connection().await;
+                        if res.is_err() {
+                            debug!("Error on connection {addr}, cancelling other workers: {res:?}");
+                            ct.cancel();
+                        }
+                        res
                     }
-                    res
-                });
-
-                if !(concurrent || restarts) {
-                    debug!("Server stops listening after single connection.");
-                    return Ok(());
+                };
+                if concurrent {
+                    handles.spawn(handler);
+                    debug!("Spawned new connection handler concurrently");
+                    return Ok(TakeNewConnection::Yes);
                 }
-                debug!("Server listening for more connections.");
-                Ok(())
+                debug!("Spawning new connection handler serially");
+                handler.await?;
+                debug!("Connection handler completed");
+                Ok(if restarts {
+                    TakeNewConnection::Yes
+                } else {
+                    TakeNewConnection::No
+                })
             }
             Err(inner) => {
                 debug!("Server stops listening after error: {inner}");
