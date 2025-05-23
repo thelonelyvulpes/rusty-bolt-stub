@@ -78,7 +78,7 @@ impl Server {
                     }
                     i += 1;
                 }
-                #[allow(unreachable_code)] // needed to disambiguate the return type
+                #[allow(unreachable_code, reason = "needed to disambiguate the return type")]
                 Ok::<(), Error>(())
             }
         };
@@ -199,7 +199,7 @@ fn validate_results(results: &[Result<()>]) -> Result<()> {
         let mut sb = String::with_capacity(1024);
         sb = sb.add(
             format!(
-                "{} errors occurred while shutting down.\n---\n",
+                "{} error(s) occurred while shutting down.\n----\n",
                 errors.len()
             )
             .as_str(),

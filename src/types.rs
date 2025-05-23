@@ -7,7 +7,7 @@ use std::fmt::Debug;
 pub struct Script<'a> {
     pub(crate) name: &'a str,
     pub(crate) bang_lines: Vec<BangLine>,
-    pub(crate) body: ScanBlock,
+    pub(crate) body: (Context, Vec<ScanBlock>),
     pub(crate) input: &'a str,
 }
 
@@ -25,22 +25,21 @@ pub enum ScanBlock {
     AutoMessage(Context, (Context, String), Option<(Context, String)>),
     Comment(Context),
     Python(Context, (Context, String)),
-    // TODO: bring Python in
-    #[allow(dead_code)]
-    Condition(Context, CompositeConditionBlock),
+    ConditionPart(Context, Branch, Option<(Context, String)>, Box<ScanBlock>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct CompositeConditionBlock {
-    if_: Box<ConditionBranch>,
-    elif_: Vec<ConditionBranch>,
-    else_: Option<Box<ScanBlock>>,
+pub enum Branch {
+    If,
+    ElseIf,
+    Else,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct ConditionBranch {
-    condition: (Context, String),
-    body: ScanBlock,
+pub enum BoolIsh {
+    True,
+    False,
+    Maybe,
 }
 
 pub enum Resolvable<T> {
@@ -105,47 +104,11 @@ pub mod actor_types {
         AssertOrder(Duration),
     }
 
-    // impl ScriptLine for () {
-    //     fn original_line(&self) -> &str {
-    //         ""
-    //     }
-    // }
-    //
-    // impl ClientMessageValidator for () {
-    //     fn validate(&self, _message: ClientMessage) -> anyhow::Result<()> {
-    //         Ok(())
-    //     }
-    // }
-    //
-    // impl ServerMessageSender for () {
-    //     fn send(&self, _stream: &mut TcpStream) -> anyhow::Result<()> {
-    //         Ok(())
-    //     }
-    // }
-
     #[derive(Debug)]
     pub struct AutoMessageHandler {
         pub(crate) client_validator: Box<dyn ClientMessageValidator>,
         pub(crate) server_sender: Box<dyn ServerMessageSender>,
     }
-
-    // impl ClientMessageValidator for AutoMessageHandler {
-    //     fn validate(&self, message: &BoltMessage) -> anyhow::Result<()> {
-    //         self.client_validator.validate(message)
-    //     }
-    // }
-    //
-    // impl ServerMessageSender for AutoMessageHandler {
-    //     fn send(&self) -> anyhow::Result<&[u8]> {
-    //         self.server_sender.send()
-    //     }
-    // }
-    //
-    // impl ScriptLine for AutoMessageHandler {
-    //     fn line_repr<'a: 'c, 'b: 'c, 'c>(&'b self, script: &'a str) -> &'c str {
-    //         self.client_validator.line_repr(script)
-    //     }
-    // }
 
     #[derive(Debug)]
     pub enum ActorBlock {
@@ -153,15 +116,21 @@ pub mod actor_types {
         ClientMessageValidate(Context, Box<dyn ClientMessageValidator>),
         ServerMessageSend(Context, Box<dyn ServerMessageSender>),
         ServerActionLine(Context, Box<dyn ServerActionLine>),
-        // TODO: bring Python in
-        #[allow(dead_code)]
         Python(Context, String),
+        Condition(Context, ConditionBlock),
         Alt(Context, Vec<ActorBlock>),
         Parallel(Context, Vec<ActorBlock>),
         Optional(Context, Box<ActorBlock>),
         Repeat(Context, Box<ActorBlock>, usize),
         AutoMessage(Context, AutoMessageHandler),
         NoOp(Context),
+    }
+
+    #[derive(Debug)]
+    pub struct ConditionBlock {
+        pub if_: (Context, String, Box<ActorBlock>),
+        pub else_if: Vec<(Context, String, Box<ActorBlock>)>,
+        pub else_: Option<(Context, Box<ActorBlock>)>,
     }
 
     impl ActorBlock {
@@ -172,6 +141,7 @@ pub mod actor_types {
                 | ActorBlock::ServerMessageSend(ctx, _)
                 | ActorBlock::ServerActionLine(ctx, _)
                 | ActorBlock::Python(ctx, _)
+                | ActorBlock::Condition(ctx, _)
                 | ActorBlock::Alt(ctx, _)
                 | ActorBlock::Parallel(ctx, _)
                 | ActorBlock::Optional(ctx, _)

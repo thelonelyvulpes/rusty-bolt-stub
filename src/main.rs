@@ -9,6 +9,7 @@ mod net;
 mod net_actor;
 mod parse_error;
 mod parser;
+mod python;
 mod scanner;
 mod str_bytes;
 mod types;
@@ -27,6 +28,7 @@ use log::{debug, LevelFilter};
 
 use crate::logging::init_logging;
 use crate::parser::ActorScript;
+use crate::python::run_python;
 
 const TIMEOUT_HELP: &str = "The number of seconds for which the stub server will run \
 before automatically terminating. If unspecified, the server will wait for 30 seconds.";
@@ -97,6 +99,11 @@ fn main_raw_error() -> Result<(), MainError> {
     })?;
 
     PARSED.get_or_init(move || engine);
+
+    for (ctx, py_line) in PARSED.get().unwrap().config.py_lines.iter() {
+        debug!("Running Python bang ({ctx}): {py_line}");
+        python::contextualize_res(run_python(py_line), *ctx, script_name, script)?;
+    }
 
     let mut server = net::Server::new(&args.listen_addr, PARSED.get().unwrap());
     with_exit_code(99, || server.start())?;

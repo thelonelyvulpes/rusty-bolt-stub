@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::{atomic, Arc};
 
 use anyhow::{anyhow, Context as AnyhowContext};
-use logging::{debug, info};
+use logging::{debug, error, info};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::select;
@@ -21,11 +21,13 @@ use crate::bolt_version::BoltVersion;
 use crate::context::Context;
 use crate::net_actor::logging::{trace, HasLoggingCtx, LoggingCtx};
 use crate::parser::ActorScript;
+use crate::python;
 use crate::str_bytes::fmt_bytes;
 use crate::types::actor_types::{
     ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
     ServerActionLine, ServerMessageSender,
 };
+use crate::types::Script;
 use crate::values;
 use crate::values::bolt_message::BoltMessage;
 use crate::values::pack_stream_value::PackStreamStruct;
@@ -35,6 +37,7 @@ type NetActorResult<T> = Result<T, NetActorError>;
 #[derive(Debug)]
 enum NetActorError {
     Anyhow(anyhow::Error),
+    Fatal(anyhow::Error),
     Cancellation(String),
     Exit,
 }
@@ -42,7 +45,7 @@ enum NetActorError {
 impl Display for NetActorError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetActorError::Anyhow(err) => err.fmt(f),
+            NetActorError::Anyhow(err) | NetActorError::Fatal(err) => err.fmt(f),
             NetActorError::Cancellation(reason) => reason.fmt(f),
             NetActorError::Exit => write!(f, "<EXIT> signal"),
         }
@@ -54,6 +57,10 @@ impl Error for NetActorError {}
 impl NetActorError {
     fn from_anyhow(err: anyhow::Error) -> Self {
         Self::Anyhow(err)
+    }
+
+    fn from_fatal(err: anyhow::Error) -> Self {
+        Self::Fatal(err)
     }
 
     fn from_cancellation(reason: String) -> Self {
@@ -140,6 +147,11 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
         let mut block = BlockWithState::new(&self.script.tree);
         match self.run_block(&mut block).await {
+            Ok(res) => {
+                info!(self, "Script finished");
+                Ok(res)
+            }
+            Err(NetActorError::Fatal(err)) => Err(err),
             Err(NetActorError::Exit) => {
                 debug!(
                     self,
@@ -147,29 +159,31 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 );
                 Ok(())
             }
-            Err(err) if block.can_skip() => {
-                debug!(
-                    self,
-                    "Ignoring NetActor error because script reached the end: {err:#}"
-                );
-                info!(self, "Script finished");
-                Ok(())
+            Err(err) => {
+                block.ensure_branched(self.logging_ctx(), &self.script.script)?;
+                if block.can_skip() {
+                    debug!(
+                        self,
+                        "Ignoring NetActor error because script reached the end: {err:#}"
+                    );
+                    info!(self, "Script finished");
+                    return Ok(());
+                }
+                match err {
+                    NetActorError::Cancellation(reason)
+                        if !self.shutting_down.load(atomic::Ordering::Acquire) =>
+                    {
+                        debug!(
+                            self,
+                            "Ignoring NetActor error because another connection failed: {reason}"
+                        );
+                        info!(self, "Script finished");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                Err(err.into())
             }
-            Err(NetActorError::Cancellation(reason))
-                if !self.shutting_down.load(atomic::Ordering::Acquire) =>
-            {
-                debug!(
-                    self,
-                    "Ignoring NetActor error because another connection failed: {reason}"
-                );
-                info!(self, "Script finished");
-                Ok(())
-            }
-            Ok(res) => {
-                info!(self, "Script finished");
-                Ok(res)
-            }
-            Err(err) => Err(err.into()),
         }
     }
 
@@ -187,7 +201,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
             match consume_res {
                 Ok(true) => {}
                 Ok(false) => {
-                    let msg = self.format_script_missmatch(block);
+                    let msg = self.format_script_mismatch(block);
                     return Err(NetActorError::Anyhow(anyhow::Error::msg(msg)));
                 }
                 Err(err) => {
@@ -256,6 +270,20 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     state.done = true;
                     Ok(true)
                 }
+            },
+            BlockWithState::Condition(state, _) => match state {
+                ConditionState::Init(_) => {
+                    panic!("Should've called server_action before {block:?}")
+                }
+                ConditionState::Chosen(ctx_body, body) => {
+                    let res = Box::pin(self.try_consume(body)).await;
+                    if body.done() {
+                        debug!(self, "conditional body ({ctx_body}) done: moving to Done");
+                        *state = ConditionState::Done
+                    }
+                    res
+                }
+                ConditionState::Done => Ok(false),
             },
             BlockWithState::Alt(state, ctx, blocks) => match state {
                 BranchState::Init => {
@@ -484,16 +512,58 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     res
                 }
             },
-            BlockWithState::Python(state, _, _command) => match state.done {
+            BlockWithState::Python(state, ctx, command) => match state.done {
                 true => Ok(()),
                 false => {
-                    todo!("Python commands not yet implemented");
-                    // state.done = true;
-                    // Ok(())
+                    state.done = true;
+                    run_python(*ctx, command, &self.script.script)
                 }
             },
+            BlockWithState::Condition(state, ctx) => match state {
+                ConditionState::Init(init_state) => {
+                    match init_state.choose_branch(&self.script.script)? {
+                        None => {
+                            debug!(
+                                self,
+                                "conditional block ({ctx}) no branch is True: moving to Done"
+                            );
+                            *state = ConditionState::Done;
+                            Ok(())
+                        }
+                        Some((ctx_b, mut body)) => {
+                            debug!(
+                            self,
+                            "conditional block ({ctx}) chose branch ({ctx_b}): moving to Chosen"
+                        );
+                            let res = Box::pin(self.server_action(&mut body)).await;
+                            if body.done() {
+                                debug!(self, "conditional body ({ctx_b}) done: moving to Done");
+                                *state = ConditionState::Done
+                            } else {
+                                *state = ConditionState::Chosen(ctx_b, body);
+                            }
+                            res
+                        }
+                    }
+                }
+                ConditionState::Chosen(ctx, b) => {
+                    let res = Box::pin(self.server_action(b)).await;
+                    if b.done() {
+                        debug!(self, "conditional body ({ctx}) done: moving to Done");
+                        *state = ConditionState::Done
+                    }
+                    res
+                }
+                ConditionState::Done => Ok(()),
+            },
             BlockWithState::Alt(state, ctx, blocks) => match state {
-                BranchState::Init => Ok(()),
+                BranchState::Init => {
+                    for block in blocks.iter_mut() {
+                        Box::pin(self.server_action(block)).await?;
+                        assert!(!block.done())
+                    }
+                    Ok(())
+                }
                 BranchState::InBlock(i) => {
                     let res = Box::pin(self.server_action(&mut blocks[*i])).await;
                     if blocks[*i].done() {
@@ -513,6 +583,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 false => {
                     let mut error = None;
                     for block in blocks.iter_mut() {
+                        block.ensure_branched(self.logging_ctx(), &self.script.script)?;
                         if block.done() {
                             continue;
                         }
@@ -569,7 +640,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
     }
 
-    fn format_script_missmatch(&self, current_block: &BlockWithState<'_>) -> String {
+    fn format_script_mismatch(&self, current_block: &BlockWithState<'_>) -> String {
         let received = match self.peeked_message.as_ref() {
             None => String::from("Nothing? Huh... This shouldn't have happened!"),
             Some(msg) => msg.repr(),
@@ -615,7 +686,13 @@ impl<'a, C: Connection> NetActor<'a, C> {
 
     fn format_possible_verifiers(&self, current_block: &BlockWithState<'_>) -> Vec<String> {
         let possible_verifiers = &mut Vec::new();
-        Self::current_verifiers(current_block, possible_verifiers);
+        if let Err(e) = self.current_verifiers(current_block, possible_verifiers) {
+            error!(
+                self,
+                "Failed to fully resolve currently accepted messages. \
+            The list might be incomplete! {e:#}"
+            )
+        }
         self.script
             .config
             .auto_responses
@@ -636,13 +713,14 @@ impl<'a, C: Connection> NetActor<'a, C> {
     }
 
     fn current_verifiers<'b>(
+        &self,
         block: &BlockWithState<'b>,
         res: &mut Vec<&'b dyn ClientMessageValidator>,
-    ) {
+    ) -> anyhow::Result<()> {
         match block {
             BlockWithState::BlockList(state, _, blocks) => {
                 for block in blocks.iter().skip(state.current_block) {
-                    Self::current_verifiers(block, res);
+                    self.current_verifiers(block, res)?;
                     if !block.can_skip() {
                         break;
                     }
@@ -653,40 +731,53 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     res.push(*validator);
                 }
             }
+            BlockWithState::Condition(state, _) => match state {
+                ConditionState::Init(_) => error!(
+                    self,
+                    "Should have called `server_action` or `ensure_branched` before \
+                    current_verifiers. Did not expect to be in ConditionState::Init. {block:?}",
+                ),
+                ConditionState::Chosen(_, body) => return self.current_verifiers(body, res),
+                ConditionState::Done => {}
+            },
             BlockWithState::Alt(state, _, blocks) => match state {
                 BranchState::Init => {
                     for block in blocks {
-                        Self::current_verifiers(block, res);
+                        self.current_verifiers(block, res)?;
                     }
                 }
                 BranchState::InBlock(i) => {
-                    Self::current_verifiers(&blocks[*i], res);
+                    self.current_verifiers(&blocks[*i], res)?;
                 }
                 BranchState::Done => {}
             },
             BlockWithState::Parallel(state, _, blocks) => {
                 if state.done {
-                    return;
+                    return Ok(());
                 }
                 for block in blocks {
-                    Self::current_verifiers(block, res);
+                    self.current_verifiers(block, res)?;
                 }
             }
             BlockWithState::Optional(state, _, block) => match state {
-                OptionalState::Init | OptionalState::Started => Self::current_verifiers(block, res),
+                OptionalState::Init | OptionalState::Started => {
+                    self.current_verifiers(block, res)?
+                }
                 OptionalState::Done => {}
             },
             BlockWithState::Repeat(state, _, block, _) => {
                 if !state.in_block {
-                    return Self::current_verifiers(block, res);
+                    return self.current_verifiers(block, res);
                 }
                 let mut sub_res = Vec::new();
-                Self::current_verifiers(block, &mut sub_res);
+                self.current_verifiers(block, &mut sub_res)?;
                 if !block.can_skip() {
                     res.extend(sub_res);
-                    return;
+                    return Ok(());
                 }
-                Self::current_verifiers(&state.initial_state, &mut sub_res);
+                let mut state_from_top = state.initial_state.clone();
+                state_from_top.ensure_branched(self.logging_ctx(), &self.script.script)?;
+                self.current_verifiers(&state_from_top, &mut sub_res)?;
                 let mut reported_verifiers = HashSet::with_capacity(sub_res.len());
                 for verifier in sub_res {
                     if reported_verifiers.insert(verifier as *const _) {
@@ -704,6 +795,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
             | BlockWithState::Python(..)
             | BlockWithState::NoOp(..) => {}
         }
+        Ok(())
     }
 
     /// # Returns
@@ -724,6 +816,13 @@ impl<'a, C: Connection> NetActor<'a, C> {
             BlockWithState::ClientMessageValidate(state, _, validator) => {
                 !state.done && validator.validate(message).is_ok()
             }
+            BlockWithState::Condition(state, _) => match state {
+                ConditionState::Init(_) => {
+                    panic!("Should've called server_action before: {block:?}")
+                }
+                ConditionState::Chosen(_, block) => Self::can_consume(block, message),
+                ConditionState::Done => false,
+            },
             BlockWithState::Alt(state, _, child_blocks) => match state {
                 BranchState::Init => child_blocks.iter().any(|b| Self::can_consume(b, message)),
                 BranchState::InBlock(i) => Self::can_consume(&child_blocks[*i], message),
@@ -998,9 +1097,8 @@ enum BlockWithState<'a> {
     ClientMessageValidate(OneShotState, Context, &'a dyn ClientMessageValidator),
     ServerMessageSend(OneShotState, Context, &'a dyn ServerMessageSender),
     ServerActionLine(OneShotState, Context, &'a dyn ServerActionLine),
-    // TODO: bring Python in
-    #[allow(dead_code)]
     Python(OneShotState, Context, &'a str),
+    Condition(ConditionState<'a>, Context),
     Alt(BranchState, Context, Vec<BlockWithState<'a>>),
     Parallel(OneShotState, Context, Vec<BlockWithState<'a>>),
     Optional(OptionalState, Context, Box<BlockWithState<'a>>),
@@ -1023,6 +1121,72 @@ match block {
     BlockWithState::NoOp(ctx) => {},
 }
 */
+
+impl BlockWithState<'_> {
+    fn ensure_branched(&mut self, logging_ctx: LoggingCtx, script: &Script) -> NetActorResult<()> {
+        match self {
+            BlockWithState::BlockList(state, _, blocks) => {
+                for block in blocks.iter_mut().skip(state.current_block) {
+                    block.ensure_branched(logging_ctx, script)?;
+                    if !(block.done() || block.can_skip()) {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            BlockWithState::ClientMessageValidate(_, _, _) => Ok(()),
+            BlockWithState::ServerMessageSend(_, _, _) => Ok(()),
+            BlockWithState::ServerActionLine(_, _, _) => Ok(()),
+            BlockWithState::Python(_, _, _) => Ok(()),
+            BlockWithState::Condition(ConditionState::Init(state), ctx) => {
+                let branch = state.choose_branch(script)?;
+                *self = BlockWithState::Condition(
+                    match branch {
+                        Some((ctx_b, body)) => {
+                            debug!(
+                            logging_ctx,
+                            "conditional block ({ctx}) chose branch ({ctx_b}): moving to Chosen"
+                        );
+                            ConditionState::Chosen(ctx_b, body)
+                        }
+                        None => {
+                            debug!(
+                                logging_ctx,
+                                "conditional block ({ctx}) no branch is True: moving to Done"
+                            );
+                            ConditionState::Done
+                        }
+                    },
+                    *ctx,
+                );
+                Ok(())
+            }
+            BlockWithState::Condition(_, _) => Ok(()),
+            BlockWithState::Alt(state, _, blocks) => match state {
+                BranchState::Init => blocks
+                    .iter_mut()
+                    .try_for_each(|b| b.ensure_branched(logging_ctx, script)),
+                BranchState::InBlock(i) => blocks[*i].ensure_branched(logging_ctx, script),
+                BranchState::Done => Ok(()),
+            },
+            BlockWithState::Parallel(state, _, blocks) => match state.done {
+                true => Ok(()),
+                false => blocks
+                    .iter_mut()
+                    .try_for_each(|b| b.ensure_branched(logging_ctx, script)),
+            },
+            BlockWithState::Optional(state, _, block) => match state {
+                OptionalState::Init | OptionalState::Started => {
+                    block.ensure_branched(logging_ctx, script)
+                }
+                OptionalState::Done => Ok(()),
+            },
+            BlockWithState::Repeat(_, _, block, _) => block.ensure_branched(logging_ctx, script),
+            BlockWithState::AutoMessage(_, _, _) => Ok(()),
+            BlockWithState::NoOp(_) => Ok(()),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 struct ListState {
@@ -1067,6 +1231,41 @@ impl<'a> RepeatState<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+enum ConditionState<'a> {
+    Init(ConditionStateInit<'a>),
+    Chosen(Context, Box<BlockWithState<'a>>),
+    Done,
+}
+
+#[derive(Debug, Clone)]
+struct ConditionStateInit<'a> {
+    if_: (Context, &'a str, Box<BlockWithState<'a>>),
+    else_if: Vec<(Context, &'a str, Box<BlockWithState<'a>>)>,
+    else_: Option<(Context, Box<BlockWithState<'a>>)>,
+}
+
+impl<'a> ConditionStateInit<'a> {
+    fn choose_branch(
+        &self,
+        script: &Script,
+    ) -> NetActorResult<Option<(Context, Box<BlockWithState<'a>>)>> {
+        let (ctx, cond, body) = &self.if_;
+        if condition_python(*ctx, cond, script)? {
+            return Ok(Some((*ctx, body.clone())));
+        }
+        for (ctx, cond, body) in self.else_if.iter() {
+            if condition_python(*ctx, cond, script)? {
+                return Ok(Some((*ctx, body.clone())));
+            }
+        }
+        if let Some((ctx, body)) = self.else_.as_ref() {
+            return Ok(Some((*ctx, body.clone())));
+        }
+        Ok(None)
+    }
+}
+
 impl<'a> BlockWithState<'a> {
     fn new(block: &'a ActorBlock) -> Self {
         match block {
@@ -1085,6 +1284,28 @@ impl<'a> BlockWithState<'a> {
                 Self::ServerActionLine(Default::default(), *ctx, line.as_ref())
             }
             ActorBlock::Python(ctx, command) => Self::Python(Default::default(), *ctx, command),
+            ActorBlock::Condition(ctx, cond) => Self::Condition(
+                ConditionState::Init({
+                    ConditionStateInit {
+                        if_: {
+                            let (ctx, cond, body) = &cond.if_;
+                            (*ctx, cond, Box::new(Self::new(body)))
+                        },
+                        else_if: cond
+                            .else_if
+                            .iter()
+                            .map(|(ctx, cond, body)| {
+                                (*ctx, cond.as_str(), Box::new(Self::new(body)))
+                            })
+                            .collect(),
+                        else_: cond
+                            .else_
+                            .as_ref()
+                            .map(|(ctx, body)| (*ctx, Box::new(Self::new(body)))),
+                    }
+                }),
+                *ctx,
+            ),
             ActorBlock::Alt(ctx, blocks) => Self::Alt(
                 Default::default(),
                 *ctx,
@@ -1114,6 +1335,13 @@ impl<'a> BlockWithState<'a> {
     fn done(&self) -> bool {
         match self {
             BlockWithState::BlockList(state, _, blocks) => state.current_block >= blocks.len(),
+            BlockWithState::Condition(state, _) => match state {
+                ConditionState::Init(_) => {
+                    panic!("Should have called `ensure_branched` before `done` {state:?}")
+                }
+                ConditionState::Chosen(_, b) => b.done(),
+                ConditionState::Done => true,
+            },
             BlockWithState::Alt(state, _, blocks) => match state {
                 BranchState::Init => false,
                 BranchState::InBlock(i) => blocks[*i].done(),
@@ -1138,6 +1366,13 @@ impl<'a> BlockWithState<'a> {
             BlockWithState::BlockList(state, _, blocks) => {
                 blocks.iter().skip(state.current_block).all(Self::can_skip)
             }
+            BlockWithState::Condition(state, _) => match state {
+                ConditionState::Init(_) => {
+                    panic!("Should have called `ensure_branched` before `can_skip` {state:?}")
+                }
+                ConditionState::Chosen(_, b) => b.can_skip(),
+                ConditionState::Done => true,
+            },
             BlockWithState::Alt(state, _, blocks) => match state {
                 BranchState::Init => blocks.iter().any(Self::can_skip),
                 BranchState::InBlock(i) => blocks[*i].can_skip(),
@@ -1214,6 +1449,26 @@ async fn cancelable_io<
             Err(NetActorError::from_cancellation(msg))
         }
     }
+}
+
+fn run_python(ctx: Context, py_script: &str, script: &Script) -> NetActorResult<()> {
+    python::contextualize_res(
+        python::run_python(py_script),
+        ctx,
+        script.name,
+        script.input,
+    )
+    .map_err(NetActorError::from_fatal)
+}
+
+fn condition_python(ctx: Context, py_script: &str, script: &Script) -> NetActorResult<bool> {
+    python::contextualize_res(
+        python::condition_python(py_script),
+        ctx,
+        script.name,
+        script.input,
+    )
+    .map_err(NetActorError::from_fatal)
 }
 
 #[cfg(test)]

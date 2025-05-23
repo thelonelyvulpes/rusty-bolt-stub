@@ -16,7 +16,7 @@ use nom_span::Spanned;
 use crate::bang_line::BangLine;
 use crate::context::Context;
 use crate::error::script_excerpt;
-use crate::types::{ScanBlock, Script};
+use crate::types::{Branch, ScanBlock, Script};
 
 type PError<I> = nom::error::Error<I>;
 type Input<'a> = Spanned<&'a str>;
@@ -53,7 +53,7 @@ pub fn scan_script<'a>(
             anyhow!("Trailing input"),
         )));
     }
-    let body = body.unwrap_or(ScanBlock::List(span.into(), vec![]));
+    let body = body.unwrap_or((span.into(), vec![]));
 
     trace!(
         "Scan output\n\
@@ -223,9 +223,9 @@ fn wrap_block_vec(context: Context, blocks: Vec<ScanBlock>) -> ScanBlock {
     }
 }
 
-fn scan_body(input: Input) -> IResult<ScanBlock> {
+fn scan_body(input: Input) -> IResult<(Context, Vec<ScanBlock>)> {
     let (input, (i, blocks)) = consumed(many1(scan_block))(input)?;
-    Ok((input, ScanBlock::List(i.into(), blocks)))
+    Ok((input, (i.into(), blocks)))
 }
 
 fn scan_block(input: Input) -> IResult<ScanBlock> {
@@ -280,7 +280,24 @@ fn scan_block(input: Input) -> IResult<ScanBlock> {
                 "python lines",
                 message_simple_content(Some("PY:"), ScanBlock::Python),
             ),
-            // TODO: Add IF, ELSE and ELIF blocks
+            context(
+                "IF",
+                message_simple_content_with_block(Some("IF:"), |outer, inner, block| {
+                    ScanBlock::ConditionPart(outer, Branch::If, Some(inner), Box::new(block))
+                }),
+            ),
+            context(
+                "ELIF",
+                message_simple_content_with_block(Some("ELIF:"), |outer, inner, block| {
+                    ScanBlock::ConditionPart(outer, Branch::ElseIf, Some(inner), Box::new(block))
+                }),
+            ),
+            context(
+                "ELSE",
+                message_empty_content_with_block(Some("ELSE:"), |outer, block| {
+                    ScanBlock::ConditionPart(outer, Branch::Else, None, Box::new(block))
+                }),
+            ),
             context(
                 "client lines",
                 multi_message(Some("C:"), ScanBlock::ClientMessage),
@@ -456,14 +473,36 @@ fn message_simple_content<'a>(
     mut block: impl FnMut(Context, (Context, String)) -> ScanBlock,
 ) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
     map(
-        preceded(
-            multispace0,
-            terminated(
-                consumed(prefixed_line_simple_content(tag)),
-                peek(end_of_line),
-            ),
-        ),
+        message_simple_content_matcher(tag),
         move |(ctx, content)| block(ctx.into(), (content.into(), String::from(*content))),
+    )
+}
+
+fn message_simple_content_matcher<'a>(
+    tag: Option<&'static str>,
+) -> impl FnMut(Input<'a>) -> IResult<'a, (Input<'a>, Input<'a>)> {
+    preceded(
+        multispace0,
+        terminated(
+            consumed(prefixed_line_simple_content(tag)),
+            peek(end_of_line),
+        ),
+    )
+}
+
+fn message_simple_content_with_block<'a>(
+    tag: Option<&'static str>,
+    mut block: impl FnMut(Context, (Context, String), ScanBlock) -> ScanBlock,
+) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
+    map(
+        pair(message_simple_content_matcher(tag), scan_block),
+        move |((ctx, content), subsequent)| {
+            block(
+                ctx.into(),
+                (content.into(), String::from(*content)),
+                subsequent,
+            )
+        },
     )
 }
 
@@ -476,6 +515,37 @@ fn prefixed_line_simple_content<'a>(
             terminated(tag(prefix.unwrap_or_default()), space0),
         ),
         preceded(space0, rest_of_line),
+    )
+}
+
+fn message_empty_content_with_block<'a>(
+    tag: Option<&'static str>,
+    mut block: impl FnMut(Context, ScanBlock) -> ScanBlock,
+) -> impl FnMut(Input<'a>) -> IResult<'a, ScanBlock> {
+    map(
+        pair(
+            preceded(
+                multispace0,
+                terminated(
+                    recognize(prefixed_line_empty_content(tag)),
+                    peek(end_of_line),
+                ),
+            ),
+            scan_block,
+        ),
+        move |(ctx, subsequent_block)| block(ctx.into(), subsequent_block),
+    )
+}
+
+fn prefixed_line_empty_content<'a>(
+    prefix: Option<&'static str>,
+) -> impl FnMut(Input<'a>) -> IResult<'a, ()> {
+    preceded(
+        cond(
+            prefix.is_some(),
+            terminated(tag(prefix.unwrap_or_default()), space0),
+        ),
+        void(space0),
     )
 }
 
@@ -714,6 +784,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 mod tests {
     use indoc::indoc;
     use nom_span::Spanned;
@@ -721,19 +792,19 @@ mod tests {
 
     use crate::bang_line::BangLine;
     use crate::context::Context;
-    use crate::types::ScanBlock;
+    use crate::types::{Branch, ScanBlock};
 
     #[test]
     fn test_scan_minimal_script() {
         let input = "!: BOLT 5.5\n";
-        let result = dbg!(super::scan_script(input, "test.script".into()));
+        let result = dbg!(super::scan_script(input, "test.script"));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_failing_scan() {
         let input = "!: BOLT 5.4\n\nF: NOPE foo\n";
-        let result = dbg!(super::scan_script(input, "test.script".into()));
+        let result = dbg!(super::scan_script(input, "test.script"));
         assert!(result.is_err());
         println!("{:}", result.unwrap_err());
     }
@@ -856,7 +927,7 @@ mod tests {
         #[values(1, 3)] repetition: usize,
     ) {
         let input = input.repeat(repetition);
-        let result = dbg!(super::scan_script(input.as_str(), "test.script".into()));
+        let result = dbg!(super::scan_script(input.as_str(), "test.script"));
         let result = result.unwrap();
         let start_bytes = expected.ctx().start_byte;
         let end_bytes = expected.ctx().end_byte;
@@ -873,7 +944,7 @@ mod tests {
     #[test]
     fn test_scan_multiple_bangs() {
         let input = "!: BOLT 5.4\n!: AUTO Nonsense\n!: ALLOW RESTART\n";
-        let result = dbg!(super::scan_script(input, "test.script".into()));
+        let result = dbg!(super::scan_script(input, "test.script"));
         let result = result.unwrap();
         assert_eq!(result.bang_lines.len(), 3);
         assert_eq!(
@@ -911,7 +982,7 @@ mod tests {
         let base = "!: AUTO Nonsense";
         let input = format!("{base}{ending}");
         let bytes = base.len() + ending.find(char::is_whitespace).unwrap_or(ending.len());
-        let result = dbg!(super::scan_script(&input, "test.script".into()));
+        let result = dbg!(super::scan_script(&input, "test.script"));
         let result = result.unwrap();
         assert_eq!(
             result.bang_lines.first(),
@@ -1113,6 +1184,28 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::cond_if("IF: foo == 10", Branch::If, Some("foo == 10"))]
+    #[case::cond_else_if("ELIF: baz == 20", Branch::ElseIf, Some("bay == 20"))]
+    #[case::cond_else("ELSE:", Branch::Else, None)]
+    fn test_conditions(
+        #[case] input: &str,
+        #[case] expected_branch: Branch,
+        #[case] expected_condition: Option<&str>,
+    ) {
+        let result = super::scan_block(wrap_input(input));
+        let (rem, block) = result.unwrap();
+        let ScanBlock::ConditionPart(_, branch, condition, _) = block else {
+            panic!("Expected ConditionPart, found {block:?}");
+        };
+        assert_eq!(branch, expected_branch);
+        assert_eq!(
+            condition.as_ref().map(|(_, cond)| cond.as_str()),
+            expected_condition
+        );
+        assert_eq!(*rem, "");
+    }
+
     // #################
     // Logic/Flow Blocks
     // #################
@@ -1275,7 +1368,7 @@ mod tests {
             ?: GOODBYE"#
         };
 
-        dbg!(super::scan_script(input, "test.script".into())).unwrap();
+        dbg!(super::scan_script(input, "test.script")).unwrap();
     }
 
     #[test]

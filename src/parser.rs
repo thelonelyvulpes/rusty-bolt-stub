@@ -22,10 +22,10 @@ use crate::jolt::JoltSigil;
 use crate::parse_error::ParseError;
 use crate::str_bytes;
 use crate::types::actor_types::{
-    ActorBlock, AutoMessageHandler, ClientMessageValidator, ScriptLine, ServerAction,
-    ServerActionLine, ServerMessageSender,
+    ActorBlock, AutoMessageHandler, ClientMessageValidator, ConditionBlock, ScriptLine,
+    ServerAction, ServerActionLine, ServerMessageSender,
 };
-use crate::types::{Resolvable, ScanBlock, Script};
+use crate::types::{BoolIsh, BoolIsh::*, Branch, Resolvable, ScanBlock, Script};
 use crate::util::opt_res_ret;
 use crate::values::bolt_message::BoltMessage;
 use crate::values::bolt_struct::{
@@ -53,6 +53,7 @@ pub struct ActorConfig {
     pub allow_restart: bool,
     pub allow_concurrent: bool,
     pub auto_responses: IndexMap<u8, AutoBangLineHandler>,
+    pub py_lines: Vec<(Context, String)>,
 }
 
 type Result<T> = StdResult<T, ParseError>;
@@ -75,7 +76,7 @@ pub fn contextualize_res<T>(res: Result<T>, script_name: &str, script: &str) -> 
                     )
                 } else {
                     anyhow::anyhow!(
-                        "Error parsing script on lines ({}-{}): {:?}\n{}",
+                        "Error parsing script on lines ({}-{}): {}\n{}",
                         ctx.start_line_number,
                         ctx.end_line_number,
                         e.message,
@@ -89,7 +90,8 @@ pub fn contextualize_res<T>(res: Result<T>, script_name: &str, script: &str) -> 
 
 pub fn parse(script: Script) -> Result<ActorScript> {
     let config = parse_config(&script.bang_lines)?;
-    let tree = parse_block(&script.body, &config)?;
+    let (body_ctx, body_blocks) = &script.body;
+    let tree = parse_blocks(*body_ctx, body_blocks, &config)?;
 
     trace!(
         "Parser output\n\
@@ -115,6 +117,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
     let mut allow_restart: Option<()> = None;
     let mut allow_concurrent: Option<()> = None;
     let mut auto_responses = IndexMap::new();
+    let mut py_lines: Vec<(Context, String)> = Vec::new();
 
     for bang_line in bang_lines {
         match bang_line {
@@ -218,8 +221,8 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
                 }
                 allow_concurrent = Some(());
             }
-            BangLine::Python(_, _) => {
-                todo!("Python blocks are not yet supported in the actor")
+            BangLine::Python(_, (line_ctx, line)) => {
+                py_lines.push((*line_ctx, line.clone()));
             }
             BangLine::Comment(_) => {}
         }
@@ -305,6 +308,7 @@ fn parse_config(bang_lines: &[BangLine]) -> Result<ActorConfig> {
         allow_restart,
         allow_concurrent,
         auto_responses,
+        py_lines,
     })
 }
 
@@ -371,58 +375,62 @@ fn parse_bolt_version(ctx: Context, s: &str) -> Result<((u8, u8), BoltVersion)> 
     }
 }
 
-fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
+fn parse_blocks(ctx: Context, blocks: &[ScanBlock], config: &ActorConfig) -> Result<ActorBlock> {
+    let mut actor_blocks = condense_actor_blocks(blocks.iter().map(|b| parse_block(b, config)))?;
+    validate_list_children(&actor_blocks)?;
+
+    match actor_blocks.len() {
+        0 => Ok(ActorBlock::NoOp(ctx)),
+        1 => Ok(actor_blocks.remove(0)),
+        _ => Ok(ActorBlock::BlockList(ctx, actor_blocks)),
+    }
+}
+
+fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<IntermediateActorBlock> {
     match block {
         ScanBlock::List(ctx, scan_blocks) => {
-            let mut actor_blocks = condense_actor_blocks(
-                scan_blocks
-                    .iter()
-                    .map(|b| parse_block(b, config))
-                    .collect::<Result<_>>()?,
-            );
-            validate_list_children(&actor_blocks)?;
-
-            match actor_blocks.len() {
-                0 => Ok(ActorBlock::NoOp(*ctx)),
-                1 => Ok(actor_blocks.remove(0)),
-                _ => Ok(ActorBlock::BlockList(*ctx, actor_blocks)),
-            }
+            parse_blocks(*ctx, scan_blocks, config).map(Into::into)
         }
         ScanBlock::Alt(ctx, scan_blocks) => {
             let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
             for block in scan_blocks {
                 let b = parse_block(block, config)?;
+                let b = finalize_intermediate(b)?;
                 validate_alt_child(&b)?;
                 actor_blocks.push(b);
             }
-            Ok(ActorBlock::Alt(*ctx, actor_blocks))
+            Ok(ActorBlock::Alt(*ctx, actor_blocks).into())
         }
         ScanBlock::Parallel(ctx, scan_blocks) => {
             let mut actor_blocks = Vec::with_capacity(scan_blocks.len());
             for block in scan_blocks {
                 let b = parse_block(block, config)?;
+                let b = finalize_intermediate(b)?;
                 validate_parallel_child(&b)?;
                 actor_blocks.push(b);
             }
-            Ok(ActorBlock::Parallel(*ctx, actor_blocks))
+            Ok(ActorBlock::Parallel(*ctx, actor_blocks).into())
         }
         ScanBlock::Optional(ctx, optional_scan_block) => {
             let b = parse_block(optional_scan_block, config)?;
+            let b = finalize_intermediate(b)?;
             validate_non_action(&b, Some("inside an optional block"))?;
             validate_non_empty(&b, Some("inside an optional block"))?;
-            Ok(ActorBlock::Optional(*ctx, Box::new(b)))
+            Ok(ActorBlock::Optional(*ctx, Box::new(b)).into())
         }
         ScanBlock::Repeat0(ctx, b) => {
             let b = parse_block(b, config)?;
+            let b = finalize_intermediate(b)?;
             validate_non_action(&b, Some("inside a repeat block"))?;
             validate_non_empty(&b, Some("inside a repeat block"))?;
-            Ok(ActorBlock::Repeat(*ctx, Box::new(b), 0))
+            Ok(ActorBlock::Repeat(*ctx, Box::new(b), 0).into())
         }
         ScanBlock::Repeat1(ctx, b) => {
             let b = parse_block(b, config)?;
+            let b = finalize_intermediate(b)?;
             validate_non_action(&b, Some("inside a repeat block"))?;
             validate_non_empty(&b, Some("inside a repeat block"))?;
-            Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1))
+            Ok(ActorBlock::Repeat(*ctx, Box::new(b), 1).into())
         }
         ScanBlock::ClientMessage(ctx, (message_name_ctx, message_name), body) => {
             let validator = create_validator(
@@ -435,7 +443,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 e.ctx.get_or_insert(*ctx);
                 e
             })?;
-            Ok(ActorBlock::ClientMessageValidate(*ctx, validator))
+            Ok(ActorBlock::ClientMessageValidate(*ctx, validator).into())
         }
         ScanBlock::ServerMessage(ctx, (message_name_ctx, message_name), body) => {
             let server_message_sender = create_message_sender(
@@ -448,7 +456,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 e.ctx.get_or_insert(*ctx);
                 e
             })?;
-            Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender))
+            Ok(ActorBlock::ServerMessageSend(*ctx, server_message_sender).into())
         }
         ScanBlock::ServerAction(ctx, (action_name_ctx, action_name), body) => {
             let server_action = create_server_action(
@@ -460,7 +468,7 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                 e.ctx.get_or_insert(*ctx);
                 e
             })?;
-            Ok(ActorBlock::ServerActionLine(*ctx, server_action))
+            Ok(ActorBlock::ServerActionLine(*ctx, server_action).into())
         }
         ScanBlock::AutoMessage(
             ctx,
@@ -476,34 +484,136 @@ fn parse_block(block: &ScanBlock, config: &ActorConfig) -> Result<ActorBlock> {
                     .map(|(ctx, body)| (*ctx, body.as_str())),
                 config,
             )?,
-        )),
-        ScanBlock::Comment(ctx) => Ok(ActorBlock::NoOp(*ctx)),
-        ScanBlock::Python(_, _) => {
-            todo!("Python blocks are not yet supported in the actor")
+        )
+        .into()),
+        ScanBlock::Comment(ctx) => Ok(ActorBlock::NoOp(*ctx).into()),
+        ScanBlock::Python(ctx, (_, py)) => {
+            // python can't be validated, so we just assume it will work, if it errors at run time,
+            // the actor can explain error from ctx
+            Ok(ActorBlock::Python(*ctx, py.clone()).into())
         }
-        ScanBlock::Condition(_, _) => {
-            todo!("Python blocks are not yet supported in the actor")
+        ScanBlock::ConditionPart(ctx, branch_type, condition, body) => {
+            let body = parse_block(body, config)?;
+            let body = finalize_intermediate(body)?;
+            match (branch_type, condition) {
+                (Branch::If, condition) => {
+                    let Some((_, condition)) = condition else {
+                        return Err(ParseError::new_ctx(*ctx, "IF condition is missing"));
+                    };
+                    validate_non_empty(&body, Some("as IF body"))?;
+                    Ok(IntermediateActorBlock::PartialCondition(
+                        PartialCondition::If((*ctx, condition.clone(), Box::new(body))),
+                    ))
+                }
+                (Branch::ElseIf, condition) => {
+                    let Some((_, condition)) = condition else {
+                        return Err(ParseError::new_ctx(*ctx, "ELIF condition is missing"));
+                    };
+                    validate_non_empty(&body, Some("as ELIF body"))?;
+                    Ok(IntermediateActorBlock::PartialCondition(
+                        PartialCondition::ElseIf((*ctx, condition.clone(), Box::new(body))),
+                    ))
+                }
+                (Branch::Else, condition) => {
+                    if let Some((ctx, _)) = condition {
+                        return Err(ParseError::new_ctx(*ctx, "ELSE may not have a condition"));
+                    }
+                    validate_non_empty(&body, Some("as ELSE body"))?;
+                    Ok(IntermediateActorBlock::PartialCondition(
+                        PartialCondition::Else((*ctx, Box::new(body))),
+                    ))
+                }
+            }
         }
     }
 }
 
-fn condense_actor_blocks(blocks: Vec<ActorBlock>) -> Vec<ActorBlock> {
-    let mut res = Vec::with_capacity(blocks.len());
-    for block in blocks.into_iter() {
+fn condense_actor_blocks(
+    blocks: impl IntoIterator<Item = Result<IntermediateActorBlock>>,
+) -> Result<Vec<ActorBlock>> {
+    let blocks = blocks.into_iter();
+    let mut res = Vec::with_capacity(blocks.size_hint().1.unwrap_or_default());
+    for block in blocks {
+        let block = block?;
         let last = res.last_mut();
         match (block, last) {
-            (ActorBlock::NoOp(_), _) => continue,
+            (IntermediateActorBlock::Finished(ActorBlock::NoOp(_)), _) => continue,
             (
-                ActorBlock::BlockList(ctx, list),
+                IntermediateActorBlock::Finished(ActorBlock::BlockList(ctx, list)),
                 Some(ActorBlock::BlockList(ctx_last, list_last)),
             ) => {
                 *ctx_last = ctx_last.fuse(&ctx);
                 list_last.extend(list)
             }
-            (block, _) => res.push(block),
+            (IntermediateActorBlock::Finished(block), _) => res.push(block),
+            (
+                IntermediateActorBlock::PartialCondition(PartialCondition::If((ctx, cond, body))),
+                _,
+            ) => {
+                let block = ActorBlock::Condition(
+                    ctx,
+                    ConditionBlock {
+                        if_: (ctx, cond.clone(), body),
+                        else_if: vec![],
+                        else_: None,
+                    },
+                );
+                res.push(block);
+            }
+            (
+                IntermediateActorBlock::PartialCondition(PartialCondition::ElseIf((
+                    ctx,
+                    cond,
+                    body,
+                ))),
+                Some(ActorBlock::Condition(ctx_last, cond_last)),
+            ) => {
+                if cond_last.else_.is_some() {
+                    // previous condition has an ELSE, so we can't add another ELIF
+                    return Err(missing_leading_if(ctx, "ELIF"));
+                }
+                *ctx_last = ctx_last.fuse(&ctx);
+                cond_last.else_if.push((ctx, cond, body));
+            }
+            (IntermediateActorBlock::PartialCondition(PartialCondition::ElseIf((ctx, ..))), _) => {
+                return Err(missing_leading_if(ctx, "ELIF"));
+            }
+            (
+                IntermediateActorBlock::PartialCondition(PartialCondition::Else((ctx, body))),
+                Some(ActorBlock::Condition(ctx_last, cond_last)),
+            ) => {
+                if cond_last.else_.is_some() {
+                    // previous condition has an ELSE, so we can't add another ELSE
+                    return Err(missing_leading_if(ctx, "ELSE"));
+                }
+                *ctx_last = ctx_last.fuse(&ctx);
+                cond_last.else_ = Some((ctx, body));
+            }
+            (IntermediateActorBlock::PartialCondition(PartialCondition::Else((ctx, ..))), _) => {
+                return Err(missing_leading_if(ctx, "ELSE"));
+            }
         }
     }
-    res
+    Ok(res)
+}
+
+#[derive(Debug)]
+enum IntermediateActorBlock {
+    Finished(ActorBlock),
+    PartialCondition(PartialCondition),
+}
+
+impl From<ActorBlock> for IntermediateActorBlock {
+    fn from(value: ActorBlock) -> Self {
+        IntermediateActorBlock::Finished(value)
+    }
+}
+
+#[derive(Debug)]
+enum PartialCondition {
+    If((Context, String, Box<ActorBlock>)),
+    ElseIf((Context, String, Box<ActorBlock>)),
+    Else((Context, Box<ActorBlock>)),
 }
 
 #[derive(Debug)]
@@ -1160,10 +1270,6 @@ fn build_field_validator(field: JsonValue, config: &ActorConfig) -> Result<Valid
             };
 
             build_map_validator(expected, config)?
-            // try to build jolt matcher (incl. Structs like datetime)
-            //   * if has 1 key-value pair
-            //   * && key is known sigil
-            //   * Special string "*" applies: E.g., `C: RUN {"Z": "*"}` will match any integer: `C: RUN 1` and `C: RUN 2`, but not `C: RUN 1.2` or `C: RUN "*"`.
         }
     })
 }
@@ -1290,6 +1396,10 @@ fn build_jolt_validator(
     expected: JsonMap<String, JsonValue>,
     config: &ActorConfig,
 ) -> Result<IsJoltValidator> {
+    // try to build jolt matcher (incl. Structs like datetime)
+    //   * if has 1 key-value pair
+    //   * && key is known sigil
+    //   * Special string "*" applies: E.g., `C: RUN {"Z": "*"}` will match any integer: `C: RUN 1` and `C: RUN 2`, but not `C: RUN 1.2` or `C: RUN "*"`.
     fn is_match_all(value: &JsonValue) -> bool {
         value.as_str().map(|s| s == "*").unwrap_or_default()
     }
@@ -1895,6 +2005,25 @@ fn is_skippable(block: &ActorBlock) -> bool {
         | ActorBlock::ServerActionLine(..)
         | ActorBlock::Python(..)
         | ActorBlock::AutoMessage(..) => false,
+        // For static analysis we consider conditional blocks to be skippable
+        // if either they are non-exhaustive or any branch is skippable.
+        // At runtime we can be more differentiated.
+        ActorBlock::Condition(_, ConditionBlock { else_: None, .. }) => true,
+        ActorBlock::Condition(
+            _,
+            ConditionBlock {
+                if_,
+                else_if,
+                else_: Some(else_),
+            },
+        ) => {
+            let (_, _, if_) = if_;
+            is_skippable(if_)
+                || else_if
+                    .iter()
+                    .any(|(_, _, else_if_block)| is_skippable(else_if_block))
+                || is_skippable(&else_.1)
+        }
     }
 }
 
@@ -1917,6 +2046,19 @@ fn has_deterministic_end(block: &ActorBlock) -> bool {
         ActorBlock::Optional(..) | ActorBlock::Repeat(..) => false,
         ActorBlock::AutoMessage(..) => true,
         ActorBlock::NoOp(..) => true,
+        ActorBlock::Condition(_, condition_block) => {
+            let (_, _, ref if_block) = condition_block.if_;
+            has_deterministic_end(if_block)
+                && condition_block
+                    .else_if
+                    .iter()
+                    .all(|(_, _, else_if_block)| has_deterministic_end(else_if_block))
+                && condition_block
+                    .else_
+                    .as_ref()
+                    .map(|(_, else_block)| has_deterministic_end(else_block))
+                    .unwrap_or(true)
+        }
     }
 }
 
@@ -1939,6 +2081,19 @@ fn is_action_block(block: &ActorBlock) -> bool {
         ActorBlock::Alt(_, blocks) | ActorBlock::Parallel(_, blocks) => {
             blocks.iter().any(is_action_block)
         }
+        ActorBlock::Condition(_, condition_block) => {
+            let (_, _, ref if_block) = condition_block.if_;
+            is_action_block(if_block)
+                || condition_block
+                    .else_if
+                    .iter()
+                    .any(|(_, _, else_if_block)| is_action_block(else_if_block))
+                || condition_block
+                    .else_
+                    .as_ref()
+                    .map(|(_, else_block)| is_action_block(else_block))
+                    .unwrap_or(false)
+        }
         ActorBlock::Optional(_, block) => is_action_block(block),
         ActorBlock::Repeat(_, block, _) => is_action_block(block),
         ActorBlock::ClientMessageValidate(..)
@@ -1946,6 +2101,27 @@ fn is_action_block(block: &ActorBlock) -> bool {
         | ActorBlock::NoOp(..) => false,
     }
 }
+
+/*
+
+TODO: how should IFs work? Eager? What when nested inside alt blocks, etc.
+
+S: BAZ
+IF foo
+    S: BAZ2
+    C: FOO
+ELIF bar
+    C: BAR
+
+{{
+    IF foo
+        C: FOO
+----
+    IF bar
+        C: BAR
+}}
+
+ */
 
 fn validate_non_action(block: &ActorBlock, context: Option<&str>) -> Result<()> {
     if is_action_block(block) {
@@ -1962,13 +2138,61 @@ fn validate_non_action(block: &ActorBlock, context: Option<&str>) -> Result<()> 
 }
 
 fn validate_non_empty(block: &ActorBlock, context: Option<&str>) -> Result<()> {
-    if matches!(block, ActorBlock::NoOp(_)) {
-        Err(ParseError::new_ctx(
+    match is_empty(block) {
+        False => Ok(()),
+        True => Err(ParseError::new_ctx(
             *block.ctx(),
             format!("Cannot have an empty block {}", context.unwrap_or("here")),
-        ))
-    } else {
-        Ok(())
+        )),
+        Maybe => Err(ParseError::new_ctx(
+            *block.ctx(),
+            format!(
+                "Cannot have a potentially empty block {}",
+                context.unwrap_or("here")
+            ),
+        )),
+    }
+}
+
+fn is_empty(block: &ActorBlock) -> BoolIsh {
+    match block {
+        ActorBlock::BlockList(_, blocks) => {
+            let mut res = True;
+            for block in blocks {
+                match is_empty(block) {
+                    True => continue,
+                    False => return False,
+                    Maybe => res = Maybe,
+                }
+            }
+            res
+        }
+        ActorBlock::ClientMessageValidate(_, _) => False,
+        ActorBlock::ServerMessageSend(_, _) => False,
+        ActorBlock::ServerActionLine(_, _) => False,
+        ActorBlock::Python(_, _) => False,
+        ActorBlock::Condition(_, cond) => match cond.else_ {
+            None => Maybe,
+            Some(_) => False,
+        },
+        ActorBlock::Alt(_, blocks) => {
+            debug_assert!(blocks.iter().all(|b| is_empty(b) == False));
+            False
+        }
+        ActorBlock::Parallel(_, blocks) => {
+            debug_assert!(blocks.iter().all(|b| is_empty(b) == False));
+            False
+        }
+        ActorBlock::Optional(_, block) => {
+            debug_assert!(is_empty(block) == False);
+            False
+        }
+        ActorBlock::Repeat(_, block, _) => {
+            debug_assert!(is_empty(block) == False);
+            False
+        }
+        ActorBlock::AutoMessage(_, _) => False,
+        ActorBlock::NoOp(_) => True,
     }
 }
 
@@ -1993,6 +2217,28 @@ fn validate_parallel_child(b: &ActorBlock) -> Result<()> {
     validate_non_empty(b, Some("as an Parallel block branch"))?;
     validate_non_action(b, Some("as an Parallel block branch"))?;
     Ok(())
+}
+
+fn finalize_intermediate(block: IntermediateActorBlock) -> Result<ActorBlock> {
+    Ok(match block {
+        IntermediateActorBlock::Finished(block) => block,
+        IntermediateActorBlock::PartialCondition(block) => match block {
+            PartialCondition::If((ctx, condition, children)) => ActorBlock::Condition(
+                ctx,
+                ConditionBlock {
+                    if_: (ctx, condition, children),
+                    else_if: Vec::new(),
+                    else_: None,
+                },
+            ),
+            PartialCondition::ElseIf((ctx, ..)) => return Err(missing_leading_if(ctx, "ELIF")),
+            PartialCondition::Else((ctx, ..)) => return Err(missing_leading_if(ctx, "ELSE")),
+        },
+    })
+}
+
+fn missing_leading_if(ctx: Context, block_name: &str) -> ParseError {
+    ParseError::new_ctx(ctx, format!("Missing leading IF for {}", block_name))
 }
 
 #[cfg(test)]
@@ -2023,6 +2269,7 @@ mod test {
             allow_restart: false,
             allow_concurrent: false,
             auto_responses: Default::default(),
+            py_lines: Vec::new(),
         };
         let validator = create_validator(ctx, tag, Some((ctx, body)), &cfg).unwrap();
 
@@ -2044,9 +2291,7 @@ mod test {
             panic!("Expected number");
         };
         dbg!(&n);
-        match n {
-            Number { .. } => {}
-        }
+        let Number { .. } = n;
         dbg!(n.as_i64());
     }
 
