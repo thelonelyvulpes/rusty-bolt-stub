@@ -2330,4 +2330,29 @@ mod test {
         let escaped = ParsedMapKey::parse(key);
         assert_eq!(escaped.unescaped, "jeff{}")
     }
+
+    #[test]
+    fn test_parse_path() {
+        let config = ActorConfig {
+            bolt_version: BoltVersion::V4_4,
+            bolt_version_raw: (4, 4),
+            bolt_capabilities: Default::default(),
+            handshake_manifest_version: None,
+            handshake: None,
+            handshake_response: None,
+            handshake_delay: None,
+            allow_restart: false,
+            allow_concurrent: false,
+            auto_responses: Default::default(),
+            py_lines: vec![],
+        };
+        let input = r#"{"..": [{"()": [1, ["l"], {}]}, {"->": [2, 1, "RELATES_TO", 3, {}]}, {"()": [3, ["l"], {}]}, {"->": [4, 3, "RELATES_TO", 1, {}]}, {"()": [1, ["l"], {}]}]}"#;
+        let JsonValue::Object(parsed) = serde_json::from_str::<JsonValue>(input).unwrap() else {
+            panic!("Expected object");
+        };
+        assert!(matches!(
+            transcode_jolt_value(parsed, &config).unwrap(),
+            IsJoltValue::Yes(_)
+        ));
+    }
 }

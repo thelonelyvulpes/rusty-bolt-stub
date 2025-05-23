@@ -3,6 +3,7 @@ use std::hash::Hash;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use itertools::Itertools;
 use serde_json::Value as JsonValue;
 
 use crate::bolt_version::JoltVersion;
@@ -23,7 +24,7 @@ pub(crate) struct JoltPath {
     pub(crate) indices: Vec<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoltUnboundRelationship {
     pub(crate) id: i64,
     pub(crate) rel_type: String,
@@ -169,7 +170,8 @@ impl JoltPath {
 
         let nodes = nodes.into_iter().map(Rc::new).collect::<Vec<_>>();
         let relationships = relationships.into_iter().map(Rc::new).collect::<Vec<_>>();
-        let mut indices = Vec::with_capacity(nodes.len() - 1 + relationships.len());
+        let mut node_indices = Vec::with_capacity(nodes.len() - 1);
+        let mut relationship_indices = Vec::with_capacity(relationships.len());
 
         let mut unique_nodes = IndexMap::with_capacity(nodes.len());
         for (i, node) in nodes.iter().enumerate() {
@@ -183,13 +185,12 @@ impl JoltPath {
                     )));
                 }
             } else {
-                unique_nodes.insert(idx, Rc::clone(node));
+                unique_nodes.insert(idx.clone(), Rc::clone(node));
             }
             if i != 0 {
-                indices.push(unique_nodes.get_index_of(idx).expect("inserted above") as i64);
+                node_indices.push(unique_nodes.get_index_of(idx).expect("inserted above") as i64);
             }
         }
-
         let mut unique_relationships = IndexMap::with_capacity(relationships.len());
         for (i, relationship) in relationships.iter().enumerate() {
             let idx = P::relationship_index(relationship);
@@ -202,7 +203,7 @@ impl JoltPath {
                     )));
                 }
             } else {
-                unique_relationships.insert(idx, Rc::clone(relationship));
+                unique_relationships.insert(idx.clone(), Rc::clone(relationship));
             }
             let prev_node = &nodes[i];
             let prev_node_idx = P::node_index(prev_node);
@@ -215,9 +216,9 @@ impl JoltPath {
                 .expect("inserted above") as i64
                 + 1;
             if (start_node_idx, end_node_idx) == (prev_node_idx, next_node_idx) {
-                indices.push(positive_index);
+                relationship_indices.push(positive_index);
             } else if (start_node_idx, end_node_idx) == (next_node_idx, prev_node_idx) {
-                indices.push(-positive_index);
+                relationship_indices.push(-positive_index);
             } else {
                 return Err(ParseError::new(format!(
                     "Path relationship at position {} does not connect the previous and next nodes",
@@ -226,21 +227,28 @@ impl JoltPath {
             }
         }
 
+        let indices = relationship_indices
+            .into_iter()
+            .interleave(node_indices.into_iter())
+            .collect();
+
+        drop(nodes);
         let nodes = unique_nodes
             .into_values()
             .map(|rc| Rc::into_inner(rc).expect("dropped all other owners"))
             .collect();
+        drop(relationships);
         let relationships = unique_relationships
             .into_values()
             .map(|rc| Rc::into_inner(rc).expect("dropped all other owners"))
             .map(Into::into)
             .collect();
 
-        Ok(Self {
+        Ok(dbg!(Self {
             nodes,
             relationships,
             indices,
-        })
+        }))
     }
 
     pub(crate) fn into_struct(self) -> PackStreamStruct {
@@ -272,7 +280,7 @@ impl JoltPath {
 }
 
 trait PathIndexer {
-    type Index: Hash + Eq + Debug;
+    type Index: Hash + Eq + Debug + Clone;
     fn name() -> &'static str;
     fn node_index(node: &JoltNode) -> &Self::Index;
     fn relationship_index(relationship: &JoltRelationship) -> &Self::Index;
@@ -449,5 +457,71 @@ impl<'a> BoltPath<'a> {
             this: self,
             jolt_version,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bolt_version::BoltVersion;
+
+    #[test]
+    fn test_parse_path() {
+        let config = ActorConfig {
+            bolt_version: BoltVersion::V4_4,
+            bolt_version_raw: (4, 4),
+            bolt_capabilities: Default::default(),
+            handshake_manifest_version: None,
+            handshake: None,
+            handshake_response: None,
+            handshake_delay: None,
+            allow_restart: false,
+            allow_concurrent: false,
+            auto_responses: Default::default(),
+            py_lines: vec![],
+        };
+
+        let input = r#"[{"()": [1, ["l"], {}]}, {"->": [2, 1, "RELATES_TO", 3, {}]}, {"()": [3, ["l"], {}]}, {"->": [4, 3, "RELATES_TO", 1, {}]}, {"()": [1, ["l"], {}]}]"#;
+        let parsed = serde_json::from_str::<JsonValue>(input).unwrap();
+        let JoltPath {
+            nodes,
+            relationships,
+            indices,
+        } = JoltPath::parse(parsed, JoltVersion::V1, &config).unwrap();
+        assert_eq!(
+            nodes,
+            vec![
+                JoltNode {
+                    id: 1,
+                    labels: vec![String::from("l")],
+                    properties: Default::default(),
+                    element_id: None,
+                },
+                JoltNode {
+                    id: 3,
+                    labels: vec![String::from("l")],
+                    properties: Default::default(),
+                    element_id: None,
+                },
+            ]
+        );
+        assert_eq!(
+            relationships,
+            vec![
+                JoltUnboundRelationship {
+                    id: 2,
+                    rel_type: String::from("RELATES_TO"),
+                    properties: Default::default(),
+                    element_id: None,
+                },
+                JoltUnboundRelationship {
+                    id: 4,
+                    rel_type: String::from("RELATES_TO"),
+                    properties: Default::default(),
+                    element_id: None,
+                },
+            ]
+        );
+        assert_eq!(indices, vec![1, 1, 2, 0]);
     }
 }
