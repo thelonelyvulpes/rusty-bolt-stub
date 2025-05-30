@@ -180,16 +180,11 @@ impl Server {
                 let script = self.server_script_cfg;
                 let shutting_down = Arc::clone(&self.shutting_down);
                 let mut actor = NetActor::new(ct.child_token(), shutting_down, conn, script);
-                let handler = {
-                    let ct = ct.clone();
-                    async move {
-                        let res = actor.run_client_connection().await;
-                        if res.is_err() {
-                            debug!("Error on connection {addr}, cancelling other workers: {res:?}");
-                            ct.cancel();
-                        }
-                        res
-                    }
+                let handler = async move {
+                    actor
+                        .run_client_connection()
+                        .await
+                        .inspect_err(|e| debug!("Async handler failed: {e:?}"))
                 };
                 if concurrent {
                     handles.spawn(handler);
@@ -197,7 +192,12 @@ impl Server {
                     return Ok(TakeNewConnection::Yes);
                 }
                 debug!("Spawning new connection handler serially");
-                handler.await?;
+                let res = handler.await;
+                if restarts && res.is_err() {
+                    debug!("Connection handler failed, storing error because restarting script");
+                    handles.spawn(async move { res });
+                    return Ok(TakeNewConnection::Yes);
+                }
                 debug!("Connection handler completed");
                 Ok(if restarts {
                     TakeNewConnection::Yes
