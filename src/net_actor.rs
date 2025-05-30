@@ -676,6 +676,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 true => {
                     let res = Box::pin(self.server_action(block)).await;
                     if block.done() {
+                        *block = state.initial_state.clone();
                         state.in_block = false;
                         state.count += 1;
                         debug!(
