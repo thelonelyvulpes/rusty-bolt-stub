@@ -37,7 +37,8 @@ type NetActorResult<T> = Result<T, NetActorError>;
 #[derive(Debug)]
 enum NetActorError {
     Anyhow(anyhow::Error),
-    Fatal(anyhow::Error),
+    Io(anyhow::Error),
+    Python(anyhow::Error),
     Cancellation(String),
     Exit,
 }
@@ -45,7 +46,9 @@ enum NetActorError {
 impl Display for NetActorError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetActorError::Anyhow(err) | NetActorError::Fatal(err) => err.fmt(f),
+            NetActorError::Anyhow(err) | NetActorError::Python(err) | NetActorError::Io(err) => {
+                err.fmt(f)
+            }
             NetActorError::Cancellation(reason) => reason.fmt(f),
             NetActorError::Exit => write!(f, "<EXIT> signal"),
         }
@@ -59,8 +62,12 @@ impl NetActorError {
         Self::Anyhow(err)
     }
 
+    fn from_io<E: Into<anyhow::Error>>(err: E) -> Self {
+        Self::Io(err.into())
+    }
+
     fn from_fatal(err: anyhow::Error) -> Self {
-        Self::Fatal(err)
+        Self::Python(err)
     }
 
     fn from_cancellation(reason: String) -> Self {
@@ -136,6 +143,8 @@ impl<'a, C: Connection> NetActor<'a, C> {
             Err(NetActorError::Cancellation(reason))
                 if !self.shutting_down.load(atomic::Ordering::Acquire) =>
             {
+                // TODO: potential for refactor: `shutting_down` seems always true when being
+                //       cancelled
                 debug!(
                     self,
                     "Ignoring NetActor error because another connection failed: {reason}",
@@ -151,7 +160,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
                 info!(self, "Script finished");
                 Ok(res)
             }
-            Err(NetActorError::Fatal(err)) => Err(err),
+            Err(NetActorError::Python(err)) => Err(err),
             Err(NetActorError::Exit) => {
                 debug!(
                     self,
@@ -180,6 +189,11 @@ impl<'a, C: Connection> NetActor<'a, C> {
                         info!(self, "Script finished");
                         return Ok(());
                     }
+                    NetActorError::Io(err) => {
+                        info!(self, "S: <BROKEN> {err:#}");
+                        debug!(self, "Script finished with IO error: {err:?}");
+                        return Err(err);
+                    }
                     _ => {}
                 }
                 Err(err.into())
@@ -205,8 +219,19 @@ impl<'a, C: Connection> NetActor<'a, C> {
                     return Err(NetActorError::Anyhow(anyhow::Error::msg(msg)));
                 }
                 Err(err) => {
-                    let msg = self.format_scrip_read_failure(block, &err);
-                    return Err(NetActorError::Anyhow(anyhow::Error::msg(msg)));
+                    return match err {
+                        NetActorError::Anyhow(err) => {
+                            let msg = self.format_consume_failure(block, &err);
+                            Err(NetActorError::Anyhow(anyhow::Error::msg(msg)))
+                        }
+                        NetActorError::Io(err) => {
+                            let msg = self.format_consume_failure(block, &err);
+                            Err(NetActorError::Io(anyhow::Error::msg(msg)))
+                        }
+                        err @ (NetActorError::Python(_)
+                        | NetActorError::Cancellation(_)
+                        | NetActorError::Exit) => Err(err),
+                    }
                 }
             }
         }
@@ -217,7 +242,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
     ///
     /// # Returns
     /// bool indicates if a message could be consumed `true` or there was a script mismatch `false`
-    async fn try_consume(&mut self, block: &mut BlockWithState<'_>) -> anyhow::Result<bool> {
+    async fn try_consume(&mut self, block: &mut BlockWithState<'_>) -> NetActorResult<bool> {
         match block {
             BlockWithState::BlockList(state, ctx, blocks) => {
                 if state.current_block >= blocks.len() {
@@ -464,7 +489,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
         }
     }
 
-    async fn try_auto_bang_handler(&mut self) -> anyhow::Result<bool> {
+    async fn try_auto_bang_handler(&mut self) -> NetActorResult<bool> {
         let peeked_message = Self::peek_message(
             self.logging_ctx(),
             &self.ct,
@@ -692,7 +717,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
         )
     }
 
-    fn format_scrip_read_failure(
+    fn format_consume_failure(
         &self,
         current_block: &BlockWithState<'_>,
         err: &anyhow::Error,
@@ -1466,12 +1491,7 @@ fn parse_message(data: &[u8], bolt_version: BoltVersion) -> NetActorResult<BoltM
     Ok(msg)
 }
 
-async fn cancelable_io<
-    'a,
-    T,
-    E: Error + Send + Sync + 'static,
-    F: Future<Output = Result<T, E>> + 'a,
->(
+async fn cancelable_io<'a, T, F: Future<Output = Result<T, io::Error>> + 'a>(
     ctx: &'static str,
     logging_ctx: LoggingCtx,
     ct: &'a CancellationToken,
@@ -1485,7 +1505,7 @@ async fn cancelable_io<
                     let msg = format!("IO failed {ctx}");
                     debug!(logging_ctx, "{msg}");
                     let err: anyhow::Error = err.into();
-                    Err(NetActorError::from_anyhow(err.context(msg)))
+                    Err(NetActorError::from_io(err.context(msg)))
                 }
             }
         },
