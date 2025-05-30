@@ -1072,7 +1072,7 @@ impl<'a, C: Connection> NetActor<'a, C> {
             ServerAction::Sleep(duration) => {
                 trace!(
                     self,
-                    "On sec, please 🥱... Sleeping for {} seconds",
+                    "One sec, please 🥱... Sleeping for {} seconds",
                     duration.as_secs_f64()
                 );
                 select! {
