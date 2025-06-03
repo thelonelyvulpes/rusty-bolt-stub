@@ -66,7 +66,7 @@ impl JoltPoint {
         Ok(match coords.as_slice() {
             [x, y] => JoltPoint::new(srid, *x, *y, None),
             [x, y, z] => JoltPoint::new(srid, *x, *y, Some(*z)),
-            _ => panic!("Regex asserts exactly 2 or 3 coordinates"),
+            _ => unreachable!("Regex asserts exactly 2 or 3 coordinates"),
         })
     }
 
@@ -77,9 +77,8 @@ impl JoltPoint {
             PackStreamValue::Float(self.x),
             PackStreamValue::Float(self.y),
         ]);
-        match self.z {
-            Some(z) => fields.push(PackStreamValue::Float(z)),
-            None => fields.push(PackStreamValue::Null),
+        if let Some(z) = self.z {
+            fields.push(PackStreamValue::Float(z))
         }
         let tag = match self.z {
             None => TAG_POINT_2D,
