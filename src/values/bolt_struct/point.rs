@@ -50,7 +50,7 @@ impl JoltPoint {
         let srid = i64::from_str(srid).map_err(|e| {
             format!("Spatial string (after sigil \"@\") contained non-i64 srid {srid:?}): {e}")
         })?;
-        let coords = dbg!(&captures[2]);
+        let coords = &captures[2];
         let coords = coords
             .split_whitespace()
             .enumerate()

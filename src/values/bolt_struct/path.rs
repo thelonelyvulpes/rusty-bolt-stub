@@ -244,11 +244,11 @@ impl JoltPath {
             .map(Into::into)
             .collect();
 
-        Ok(dbg!(Self {
+        Ok(Self {
             nodes,
             relationships,
             indices,
-        }))
+        })
     }
 
     pub(crate) fn into_struct(self) -> PackStreamStruct {
