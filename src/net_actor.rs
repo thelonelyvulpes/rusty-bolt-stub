@@ -8,11 +8,12 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{atomic, Arc};
-
+use std::task::Poll;
 use anyhow::{anyhow, Context as AnyhowContext};
 use logging::{debug, error, info};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bolt_version::BoltVersion;
 use crate::context::Context;
 use crate::net_actor::logging::{trace, HasLoggingCtx, LoggingCtx};
+use crate::net_actor::private::Sealed;
 use crate::parser::ActorScript;
 use crate::python;
 use crate::str_bytes::fmt_bytes;
@@ -82,8 +84,11 @@ impl From<anyhow::Error> for NetActorError {
 }
 
 mod private {
+    use crate::web_socket_stream::WebSocketStream;
+
     pub(super) trait Sealed {}
     impl Sealed for tokio::net::TcpStream {}
+    impl Sealed for WebSocketStream {}
 }
 
 #[allow(private_bounds)]
