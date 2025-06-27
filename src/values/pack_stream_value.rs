@@ -844,11 +844,11 @@ pub(crate) fn value_jolt_fmt(
                 }
                 PackStreamValue::Dict(m) => {
                     let (start, end) = match m.keys().next().and_then(|k| JoltSigil::from_str(k)) {
-                        Some(_) => {
+                        Some(_) if m.len() == 1 => {
                             // dict could be confused with Jolt => encode as Jolt Dict
                             (r#"{"{}": {"#, "}}")
                         }
-                        None => ("{", "}"),
+                        _ => ("{", "}"),
                     };
                     f.write_str(start)?;
                     write_joined_entries(f, m.iter(), self.jolt_version)?;
